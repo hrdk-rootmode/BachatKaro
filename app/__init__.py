@@ -1,0 +1,3 @@
+"""
+DealHunt Backend Application
+"""

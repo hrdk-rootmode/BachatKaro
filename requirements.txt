@@ -1,0 +1,70 @@
+# ============================================
+# EXISTING DEPENDENCIES (keep all)
+# ============================================
+
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.25
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+alembic==1.13.1
+
+# Redis
+redis==5.0.1
+hiredis==2.3.2
+
+# Authentication
+firebase-admin==6.4.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Web Scraping
+playwright==1.41.0
+playwright-stealth==1.0.4
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# AI Services
+groq==0.4.1
+google-generativeai==0.3.2
+
+# Payments
+razorpay==1.4.1
+
+# Utilities
+email-validator>=2.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+httpx==0.26.0
+aiohttp==3.9.1
+
+# Monitoring & Logging
+python-json-logger==2.0.7
+sentry-sdk[fastapi]==1.40.0
+
+# Data Processing
+python-dateutil==2.8.2
+
+# ============================================
+# NEW/UPDATED DEPENDENCIES FOR PART 10
+# ============================================
+
+# Job Scheduling
+apscheduler==3.10.4
+pytz==2024.1
+
+# Google Play Billing
+google-auth==2.27.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.116.0
+
+# Notifications
+firebase-admin==6.4.0  # Already listed - uses FCM
+
+# Async email (optional - for future)
+aiosmtplib==3.0.1

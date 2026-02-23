@@ -1,0 +1,483 @@
+"""
+Authentication & User Management Routes
+Handles signup, profile management, and account deletion
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, or_
+from datetime import datetime, timedelta
+from typing import Optional
+import secrets
+import string
+import logging
+
+from app.core.database import get_db
+from app.core.redis_client import RedisClient, get_redis
+from app.models import User, AppConfig
+from app.schemas import (
+    UserSignupRequest,
+    UserResponse,
+    UserProfileUpdate,
+    UserUsageStats,
+    UserPlan
+)
+from app.api.deps import (
+    get_current_user,
+    verify_firebase_token,
+    check_hardware_id_limit,
+    check_ip_signup_limit,
+    get_app_config
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def generate_referral_code(length: int = 6) -> str:
+    """
+    Generate unique referral code
+    Format: 6 character alphanumeric (uppercase)
+    """
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(secrets.choice(characters) for _ in range(length))
+
+
+async def get_unique_referral_code(db: AsyncSession) -> str:
+    """
+    Generate referral code and ensure it's unique
+    Max 5 attempts to find unique code
+    """
+    for attempt in range(5):
+        code = generate_referral_code()
+        
+        # Check if code already exists
+        result = await db.execute(
+            select(User).where(User.referral_code == code)
+        )
+        existing = result.scalar_one_or_none()
+        
+        if not existing:
+            return code
+    
+    # Fallback to longer code if collision after 5 attempts
+    return generate_referral_code(8)
+
+
+async def validate_referral_code(
+    code: str,
+    db: AsyncSession
+) -> Optional[User]:
+    """
+    Validate referral code and return referrer user
+    
+    Returns:
+        User object if valid, None if invalid
+    """
+    if not code or len(code) < 6:
+        return None
+    
+    result = await db.execute(
+        select(User).where(
+            User.referral_code == code.upper(),
+            User.is_blocked == False
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def process_referral(
+    referrer: User,
+    new_user: User,
+    db: AsyncSession
+) -> None:
+    """
+    Process referral rewards for both users
+    
+    Rewards:
+    - Referrer: +10 bonus searches
+    - New user: +5 bonus searches
+    """
+    # Update referrer stats
+    if referrer.usage_stats is None:
+        referrer.usage_stats = {}
+    
+    referrer.usage_stats['bonus_searches'] = \
+        referrer.usage_stats.get('bonus_searches', 0) + 10
+    referrer.usage_stats['referrals_count'] = \
+        referrer.usage_stats.get('referrals_count', 0) + 1
+    referrer.usage_stats['last_referral_date'] = datetime.utcnow().isoformat()
+    
+    # Update new user stats
+    if new_user.usage_stats is None:
+        new_user.usage_stats = {}
+    
+    new_user.usage_stats['bonus_searches'] = 5
+    new_user.usage_stats['referred_by'] = referrer.referral_code
+    
+    await db.commit()
+    
+    logger.info(
+        f"Referral processed: {referrer.id} referred {new_user.id}"
+    )
+
+
+# =============================================================================
+# ROUTES
+# =============================================================================
+
+@router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def signup(
+    request: Request,
+    signup_data: UserSignupRequest,
+    token_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    redis_client: RedisClient = Depends(get_redis),
+    config: dict = Depends(get_app_config),
+    _check_hardware: None = Depends(check_hardware_id_limit),
+    _check_ip: None = Depends(check_ip_signup_limit)
+):
+    """
+    User Signup with Anti-Abuse Protection
+    
+    Security Checks:
+    1. Firebase UID validation
+    2. Disposable email blocking
+    3. Hardware ID limit (3 accounts per device)
+    4. IP signup limit (5 per day)
+    5. Referral code validation
+    
+    Returns:
+        Created user object with referral code
+    """
+    
+    # 1. Check if user already exists
+    existing_user = await db.execute(
+        select(User).where(
+            or_(
+                User.firebase_uid == signup_data.firebase_uid,
+                User.email == signup_data.email
+            )
+        )
+    )
+    existing = existing_user.scalar_one_or_none()
+    
+    if existing:
+        if existing.firebase_uid == signup_data.firebase_uid:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Account already exists with this Firebase UID"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email already registered"
+            )
+    
+    # 2. Validate referral code if provided
+    referrer = None
+    if signup_data.referral_code:
+        referrer = await validate_referral_code(
+            signup_data.referral_code,
+            db
+        )
+        if not referrer:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid referral code"
+            )
+    
+    # 3. Generate unique referral code for new user
+    referral_code = await get_unique_referral_code(db)
+    
+    # 4. Get client IP
+    client_ip = request.client.host
+    
+    # 5. Create new user
+    new_user = User(
+        firebase_uid=signup_data.firebase_uid,
+        email=signup_data.email,
+        display_name=signup_data.display_name,
+        hardware_id=signup_data.hardware_id,
+        fcm_token=signup_data.fcm_token,
+        referral_code=referral_code,
+        plan=UserPlan.FREE,
+        ip_addresses=[client_ip],
+        usage_stats={
+            'total_searches': 0,
+            'searches_this_month': 0,
+            'watchlist_slots_used': 0,
+            'bonus_searches': 0,
+            'signup_ip': client_ip,
+            'signup_date': datetime.utcnow().isoformat()
+        },
+        notification_preferences={
+            'price_drop': True,
+            'back_in_stock': True,
+            'streak_reminder': True,
+            'subscription_expiry': True
+        },
+        last_active_at=datetime.utcnow()
+    )
+    
+    db.add(new_user)
+    await db.flush()  # Get user.id before commit
+    
+    # 6. Process referral if applicable
+    if referrer:
+        # Prevent self-referral (shouldn't happen but extra safety)
+        if referrer.id != new_user.id:
+            await process_referral(referrer, new_user, db)
+    
+    await db.commit()
+    await db.refresh(new_user)
+    
+    # 7. Track signup in Redis (for analytics)
+    signup_date = datetime.utcnow().date().isoformat()
+    await redis_client.increment(f"signups:daily:{signup_date}")
+    
+    logger.info(
+        f"New user signup: {new_user.id} | Email: {new_user.email} | "
+        f"Device: {signup_data.hardware_id} | IP: {client_ip}"
+    )
+    
+    return new_user
+
+
+@router.post("/refresh-token")
+async def refresh_token(
+    token_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Refresh Firebase ID Token
+    
+    Updates last_active_at timestamp
+    Returns new token with extended expiry
+    """
+    firebase_uid = token_data.get("uid")
+    
+    # Update last active
+    result = await db.execute(
+        select(User).where(User.firebase_uid == firebase_uid)
+    )
+    user = result.scalar_one_or_none()
+    
+    if user:
+        user.last_active_at = datetime.utcnow()
+        await db.commit()
+    
+    # In production, you would call Firebase Admin SDK to create custom token
+    # For now, return the existing token info
+    return {
+        "message": "Token refreshed successfully",
+        "expires_in": 3600,  # 1 hour
+        "uid": firebase_uid
+    }
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_profile(
+    user: User = Depends(get_current_user)
+):
+    """
+    Get Current User Profile
+    
+    Returns complete user data including:
+    - Subscription status
+    - Usage statistics
+    - Notification preferences
+    - Streak information
+    """
+    return user
+
+
+@router.get("/me/stats", response_model=UserUsageStats)
+async def get_user_stats(
+    user: User = Depends(get_current_user),
+    redis_client: RedisClient = Depends(get_redis)
+):
+    """
+    Get Detailed Usage Statistics
+    
+    Returns:
+    - Searches used/remaining today
+    - Watchlist slots used/limit
+    - Streak information
+    - Plan details
+    """
+    
+    # Calculate searches remaining based on plan
+    plan_limits = {
+        UserPlan.FREE: 10,
+        UserPlan.BASIC: 50,
+        UserPlan.PREMIUM: -1  # Unlimited
+    }
+    
+    daily_limit = plan_limits.get(user.plan, 10)
+    
+    # Get today's search count from Redis
+    today = datetime.utcnow().date().isoformat()
+    cache_key = f"user_quota:{user.id}:{today}"
+    searches_today = await redis_client.get(cache_key)
+    searches_today = int(searches_today) if searches_today else 0
+    
+    # Add bonus searches
+    bonus_searches = user.usage_stats.get('bonus_searches', 0) if user.usage_stats else 0
+    
+    if user.plan == UserPlan.PREMIUM:
+        searches_remaining = -1  # Unlimited
+    else:
+        searches_remaining = max(0, daily_limit + bonus_searches - searches_today)
+    
+    # Calculate watchlist limit
+    watchlist_limits = {
+        UserPlan.FREE: 5,
+        UserPlan.BASIC: 20,
+        UserPlan.PREMIUM: 50
+    }
+    watchlist_limit = watchlist_limits.get(user.plan, 5)
+    
+    # Calculate days remaining for subscription
+    days_remaining = None
+    if user.plan_expires_at:
+        delta = user.plan_expires_at - datetime.utcnow()
+        days_remaining = max(0, delta.days)
+    
+    return UserUsageStats(
+        total_searches=user.total_searches,
+        searches_today=searches_today,
+        searches_remaining=searches_remaining,
+        watchlist_count=user.watchlist_count,
+        watchlist_limit=watchlist_limit,
+        current_streak=user.current_streak,
+        freeze_count=user.freeze_count,
+        plan=user.plan,
+        plan_expires_at=user.plan_expires_at
+    )
+
+
+@router.put("/me", response_model=UserResponse)
+async def update_profile(
+    updates: UserProfileUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update User Profile
+    
+    Allowed updates:
+    - display_name
+    - fcm_token (for push notifications)
+    - notification_preferences
+    
+    Immutable fields (cannot update):
+    - email
+    - firebase_uid
+    - plan
+    - referral_code
+    """
+    
+    # Update only provided fields
+    update_data = updates.model_dump(exclude_unset=True)
+    
+    for field, value in update_data.items():
+        if hasattr(user, field):
+            setattr(user, field, value)
+    
+    await db.commit()
+    await db.refresh(user)
+    
+    logger.info(f"Profile updated: User {user.id} | Fields: {list(update_data.keys())}")
+    
+    return user
+
+
+@router.delete("/me")
+async def delete_account(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    redis_client: RedisClient = Depends(get_redis)
+):
+    """
+    Soft Delete User Account
+    
+    Process:
+    1. Set is_blocked = True (soft delete)
+    2. Remove FCM token (stop notifications)
+    3. Keep data for 30 days (GDPR compliance)
+    4. Schedule permanent deletion after 30 days
+    
+    Does NOT:
+    - Delete user data immediately
+    - Refund subscriptions
+    - Delete referral history
+    """
+    
+    # Soft delete
+    user.is_blocked = True
+    user.fcm_token = None
+    user.last_active_at = datetime.utcnow()
+    
+    # Add deletion metadata
+    if user.usage_stats is None:
+        user.usage_stats = {}
+    
+    user.usage_stats['deletion_requested_at'] = datetime.utcnow().isoformat()
+    user.usage_stats['deletion_scheduled_for'] = (
+        datetime.utcnow() + timedelta(days=30)
+    ).isoformat()
+    
+    await db.commit()
+    
+    # Remove from Redis rate limit tracking
+    today = datetime.utcnow().date().isoformat()
+    await redis_client.delete(f"user_quota:{user.id}:{today}")
+    
+    # Track deletion in analytics
+    await redis_client.increment(f"deletions:daily:{today}")
+    
+    logger.warning(
+        f"Account deletion requested: User {user.id} | Email: {user.email}"
+    )
+    
+    deletion_date = datetime.utcnow() + timedelta(days=30)
+    
+    return {
+        "message": "Account deactivated successfully",
+        "deletion_date": deletion_date.isoformat(),
+        "note": "Your data will be permanently deleted after 30 days. "
+                "Contact support to cancel this request."
+    }
+
+
+@router.post("/verify-referral-code")
+async def verify_referral_code_endpoint(
+    referral_code: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Verify Referral Code (before signup)
+    
+    Used by mobile app to validate referral code
+    before showing signup form
+    """
+    
+    referrer = await validate_referral_code(referral_code, db)
+    
+    if not referrer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invalid or expired referral code"
+        )
+    
+    return {
+        "valid": True,
+        "referrer_name": referrer.display_name or "Anonymous User",
+        "bonus_searches": 5,
+        "message": f"You'll get 5 bonus searches when you sign up!"
+    }

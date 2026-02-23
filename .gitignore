@@ -1,0 +1,9 @@
+verify_*.py
+.env
+venv/
+__pycache__/
+*.pyc
+alembic/
+scripts/test_*.py
+firebase-adminsdk.json
+test_*.py
