@@ -45,25 +45,32 @@ logger = logging.getLogger(__name__)
 class AmazonScraper(BasePlatformHandler):
     """
     Amazon.in scraper with advanced anti-detection
-    
-    Safety Features:
-    - Human-like delays (4-10 seconds)
-    - Random scroll behavior
-    - Stealth browser fingerprint
-    - Session rotation every 30 requests
-    - Captcha detection
-    - Self-healing selectors
-    
-    Usage:
-        scraper = AmazonScraper(config)
-        
-        # Search
-        results = await scraper.search("iPhone 15 Pro")
-        
-        # Single product
-        product = await scraper.get_product("https://amazon.in/dp/B0CHX3TW6X")
+    ...existing docstring...
     """
     
+    # =========================================================================
+    # PLATFORM METADATA (NEW - For auto-discovery)
+    # =========================================================================
+    PLATFORM_METADATA = {
+        "name": "amazon",
+        "display_name": "Amazon India",
+        "base_url": "https://www.amazon.in",
+        "domains": ["amazon.in", "amazon.com", "amzn.to", "amzn.in"],
+        "categories": ["electronics", "fashion", "home", "beauty", "general"],
+        "product_id_patterns": [
+            r"/dp/([A-Z0-9]{10})",
+            r"/gp/product/([A-Z0-9]{10})",
+            r"/gp/aw/d/([A-Z0-9]{10})",
+        ],
+        "affiliate_param": "tag",
+        "affiliate_value_setting": "AMAZON_AFFILIATE_TAG",
+        "rate_limit_per_minute": 30,
+        "scrape_delay_seconds": 2,
+        "reliability": "high",
+        "support_level": "full"
+    }
+    
+    # ... rest of existing code unchanged ...
     # Base URLs
     BASE_URL = "https://www.amazon.in"
     SEARCH_URL = "https://www.amazon.in/s"
@@ -209,7 +216,7 @@ class AmazonScraper(BasePlatformHandler):
                 selector_result = await self.healing_engine.get_working_selector(
                     "search_results",
                     html_content,
-                    test_func=lambda sel: page_obj.query_selector(sel)
+                    test_func=lambda sel: asyncio.create_task(page_obj.query_selector(sel))
                 )
                 
                 if not selector_result.success:
@@ -442,7 +449,7 @@ class AmazonScraper(BasePlatformHandler):
             title_result = await self.healing_engine.get_working_selector(
                 "product_title",
                 html_content,
-                test_func=lambda sel: page.query_selector(sel)
+                test_func=lambda sel: asyncio.create_task(page.query_selector(sel))
             )
             
             title = None

@@ -47,9 +47,12 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting DealHunt Backend...")
     
     # Connect Redis
-    await redis_client.connect()
-    logger.info("✅ Redis connected")
-    
+    try:
+        await redis_client.connect()
+        logger.info("✅ Redis connected")
+    except Exception as e:
+        logger.error(f"❌ Redis startup failed: {e}")
+        
     # Start background scheduler
     if settings.ENABLE_SCHEDULER:
         try:
@@ -70,6 +73,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"📍 Environment: {settings.ENVIRONMENT}")
     if settings.DEBUG:
         logger.info(f"📚 Docs: http://localhost:{settings.PORT}/docs")
+        logger.info(f"📚 Docs: http://127.0.0.1:{settings.PORT}/docs")
     logger.info("=" * 50)
     
     yield

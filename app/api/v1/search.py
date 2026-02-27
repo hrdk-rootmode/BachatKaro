@@ -1,18 +1,17 @@
 """
-Search API Routes - ENHANCED
-Multi-platform product search with 3-tier caching + URL-based cross-platform search
+Search API Routes - AI Enhanced Edition
+Multi-platform product search with intelligent enrichment and cross-platform matching
 
-New Features:
-- Paste any product URL from supported/unsupported platforms
-- Auto-detect platform from URL
-- Find same product on other platforms
-- Show best price comparison
-- Queue management for concurrent searches
+FLOW:
+1. User Search/URL → 2. Cache Check → 3. Scrape/API → 4. AI Enrich → 5. Save DB → 6. Response
+
+Author: DealHunt
+Updated: Full AI Integration + Duplicate Handling + FIXED TRENDING SORT
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, desc
+from sqlalchemy import select, func, or_, desc, Integer, cast
 from sqlalchemy.orm import selectinload
 from typing import List, Optional
 import hashlib
@@ -36,13 +35,14 @@ from app.schemas import (
 )
 from app.api.deps import get_current_user, check_rate_limit
 
-# New imports for URL search
+# Services
 from app.services.scraper.url_detector import url_detector, URLAnalysis, PlatformSupport
 from app.services.scraper.generic_scraper import GenericAIScraper
 from app.services.scraper.cross_platform_matcher import cross_platform_matcher
 from app.services.scraper.search_queue import get_search_queue
 from app.services.scraper.factory import get_platform_handler
 from app.services.scraper.base import ProductData
+from app.services.ai.groq_client import groq_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -58,6 +58,207 @@ def calculate_search_cache_key(query: str, filters: dict) -> str:
     combined = f"{query.lower().strip()}_{filter_str}"
     return f"search:{hashlib.md5(combined.encode()).hexdigest()}"
 
+
+# =============================================================================
+# AI ENRICHMENT FUNCTIONS (THE KEY ADDITION)
+# =============================================================================
+
+async def _enrich_product_with_ai(product_data: ProductData) -> ProductData:
+    """
+    Enrich product data using AI
+    
+    This modifies product_data in-place, adding:
+    - ai_essence (normalized fingerprint)
+    - ai_tags (searchable keywords)
+    - ai_quality_score (0-100)
+    - category/subcategory
+    - standardized specifications
+    """
+    if product_data.ai_processed:
+        return product_data
+    
+    try:
+        # Call AI for enrichment
+        enriched = await groq_client.process_product(product_data)
+        
+        # Update product with AI data
+        product_data.ai_essence = enriched.get("essence")
+        product_data.ai_tags = enriched.get("tags", [])
+        product_data.ai_quality_score = enriched.get("quality_score", 50)
+        product_data.category = enriched.get("category") or product_data.category
+        product_data.subcategory = enriched.get("subcategory")
+        
+        # Merge specifications
+        if enriched.get("specifications"):
+            product_data.specifications = {
+                **(product_data.specifications or {}),
+                **enriched["specifications"]
+            }
+        
+        product_data.ai_processed = True
+        
+        logger.info(
+            f"AI enriched: {product_data.title[:40]}... → "
+            f"{product_data.ai_essence[:30] if product_data.ai_essence else 'N/A'}"
+        )
+        
+    except Exception as e:
+        logger.error(f"AI enrichment failed (continuing with raw data): {e}")
+        product_data.ai_processed = False
+    
+    return product_data
+
+
+async def save_product_to_database(
+    product_data: ProductData,
+    db: AsyncSession
+) -> Product:
+    """
+    Save scraped AND enriched product to database
+    
+    FIXED: Properly handles duplicate listings
+    """
+    # Use AI fingerprint if available
+    fingerprint = product_data.fingerprint
+    
+    # Check if product exists
+    result = await db.execute(
+        select(Product).where(Product.fingerprint == fingerprint)
+    )
+    existing_product = result.scalar_one_or_none()
+    
+    # Build AI metadata
+    ai_metadata = {
+        "essence": product_data.ai_essence or product_data.title[:100].lower(),
+        "tags": product_data.ai_tags or [],
+        "quality_score": product_data.ai_quality_score or 50,
+        "processed_at": datetime.utcnow().isoformat()
+    }
+    
+    if existing_product:
+        product = existing_product
+        
+        # Update AI metadata if new processing is better
+        old_score = (product.ai_metadata or {}).get("quality_score", 0)
+        if product_data.ai_quality_score and product_data.ai_quality_score > old_score:
+            product.ai_metadata = ai_metadata
+            product.specifications = product_data.specifications or product.specifications
+            product.subcategory = product_data.subcategory or product.subcategory
+        
+        # Increment search count in stats
+        current_stats = product.stats or {}
+        product.stats = {
+            **current_stats,
+            "searches": current_stats.get("searches", 0) + 1,
+            "last_searched": datetime.utcnow().isoformat()
+        }
+    else:
+        # Create new product
+        product = Product(
+            fingerprint=fingerprint,
+            title=product_data.title,
+            brand=product_data.brand,
+            category=product_data.category or "General",
+            subcategory=product_data.subcategory,
+            image_url=product_data.image_url,
+            specifications=product_data.specifications or {},
+            ai_metadata=ai_metadata,
+            stats={
+                "views": 0,
+                "clicks": 0,
+                "watches": 0,
+                "searches": 1,
+                "conversions": 0
+            }
+        )
+        db.add(product)
+        await db.flush()
+    
+    # Get or create platform
+    platform_result = await db.execute(
+        select(PlatformModel).where(PlatformModel.name == product_data.platform_name.lower())
+    )
+    platform = platform_result.scalar_one_or_none()
+    
+    if not platform:
+        platform = PlatformModel(
+            name=product_data.platform_name.lower(),
+            base_url=f"https://www.{product_data.platform_name.lower()}.com",
+            is_active=True,
+            selectors={}
+        )
+        db.add(platform)
+        await db.flush()
+    
+    # =========================================================================
+    # FIX: Check for existing listing BEFORE trying to create
+    # =========================================================================
+    
+    listing_result = await db.execute(
+        select(ProductListing).where(
+            ProductListing.product_id == product.id,
+            ProductListing.platform_id == platform.id
+        )
+    )
+    existing_listing = listing_result.scalar_one_or_none()
+    
+    # ALSO check by external_id to catch duplicates
+    if not existing_listing and product_data.external_id:
+        external_check = await db.execute(
+            select(ProductListing).where(
+                ProductListing.platform_id == platform.id,
+                ProductListing.external_id == product_data.external_id
+            )
+        )
+        existing_listing = external_check.scalar_one_or_none()
+        
+        # If found by external_id but different product_id, update product_id
+        if existing_listing and existing_listing.product_id != product.id:
+            logger.warning(
+                f"Listing {product_data.external_id} exists with different product_id, updating..."
+            )
+            existing_listing.product_id = product.id
+    
+    # Prepare listing data
+    listing_data = {
+        "current_price": float(product_data.current_price),
+        "original_price": float(product_data.original_price) if product_data.original_price else None,
+        "discount_percent": product_data.discount_percent,
+        "rating": product_data.rating,
+        "review_count": product_data.review_count,
+        "in_stock": product_data.in_stock,
+        "last_scraped": datetime.utcnow()
+    }
+    
+    if existing_listing:
+        # UPDATE existing listing
+        for key, value in listing_data.items():
+            setattr(existing_listing, key, value)
+        
+        logger.debug(f"Updated listing: {product_data.external_id}")
+    else:
+        # CREATE new listing
+        listing = ProductListing(
+            product_id=product.id,
+            platform_id=platform.id,
+            external_id=product_data.external_id,
+            product_url=product_data.product_url,
+            affiliate_url=url_detector.get_affiliate_url(product_data.product_url),
+            **listing_data
+        )
+        db.add(listing)
+        
+        logger.debug(f"Created listing: {product_data.external_id}")
+    
+    await db.commit()
+    await db.refresh(product)
+    
+    return product
+
+
+# =============================================================================
+# DATABASE OPERATIONS
+# =============================================================================
 
 async def search_database(
     query: str,
@@ -111,7 +312,6 @@ def format_product_response(
     listings: List[ProductListing]
 ) -> ProductResponse:
     """Format product with listings for API response"""
-    # Get AI metadata
     ai_metadata = product.ai_metadata or {}
     
     # Calculate best price from listings
@@ -120,7 +320,7 @@ def format_product_response(
     if listings:
         best_listing = min(listings, key=lambda x: x.current_price)
         best_price = best_listing.current_price
-        best_platform = "amazon"  # Default, could get from platform_id
+        best_platform = "amazon"  # Default
     
     # Calculate avg price
     avg_price = None
@@ -153,99 +353,8 @@ def format_product_response(
     )
 
 
-async def save_product_to_database(
-    product_data: ProductData,
-    db: AsyncSession
-) -> Product:
-    """Save scraped product to database"""
-    # Check if product exists (by fingerprint)
-    result = await db.execute(
-        select(Product).where(Product.fingerprint == product_data.fingerprint)
-    )
-    existing_product = result.scalar_one_or_none()
-    
-    if existing_product:
-        # Update existing product
-        product = existing_product
-    else:
-        # Create new product
-        product = Product(
-            fingerprint=product_data.fingerprint,
-            title=product_data.title,
-            brand=product_data.brand,
-            category=product_data.category,
-            image_url=product_data.image_url,
-            specifications=product_data.specifications,
-            ai_metadata={
-                "tags": [],
-                "quality_score": 0,
-                "essence": product_data.title[:100]
-            }
-        )
-        db.add(product)
-        await db.flush()
-    
-    # Get or create platform
-    platform_result = await db.execute(
-        select(PlatformModel).where(PlatformModel.name == product_data.platform_name)
-    )
-    platform = platform_result.scalar_one_or_none()
-    
-    if not platform:
-        # Create platform entry
-        platform = PlatformModel(
-            name=product_data.platform_name,
-            base_url=f"https://{product_data.platform_name}.com",
-            is_active=True,
-            selectors={}
-        )
-        db.add(platform)
-        await db.flush()
-    
-    # Create or update listing
-    listing_result = await db.execute(
-        select(ProductListing).where(
-            ProductListing.product_id == product.id,
-            ProductListing.platform_id == platform.id
-        )
-    )
-    existing_listing = listing_result.scalar_one_or_none()
-    
-    if existing_listing:
-        # Update existing listing
-        existing_listing.current_price = float(product_data.current_price)
-        existing_listing.original_price = float(product_data.original_price) if product_data.original_price else None
-        existing_listing.discount_percent = product_data.discount_percent
-        existing_listing.rating = product_data.rating
-        existing_listing.review_count = product_data.review_count
-        existing_listing.in_stock = product_data.in_stock
-        existing_listing.last_scraped = datetime.utcnow()
-    else:
-        # Create new listing
-        listing = ProductListing(
-            product_id=product.id,
-            platform_id=platform.id,
-            external_id=product_data.external_id,
-            product_url=product_data.product_url,
-            affiliate_url=product_data.affiliate_url,
-            current_price=float(product_data.current_price),
-            original_price=float(product_data.original_price) if product_data.original_price else None,
-            discount_percent=product_data.discount_percent,
-            rating=product_data.rating,
-            review_count=product_data.review_count,
-            in_stock=product_data.in_stock,
-            last_scraped=datetime.utcnow()
-        )
-        db.add(listing)
-    
-    await db.commit()
-    await db.refresh(product)
-    
-    return product
-
-
 # =============================================================================
-# URL SEARCH HELPER FUNCTIONS
+# URL SEARCH HELPER FUNCTIONS (UPDATED WITH AI ENRICHMENT)
 # =============================================================================
 
 async def scrape_and_match(
@@ -254,30 +363,33 @@ async def scrape_and_match(
     db: AsyncSession
 ) -> List[ProductData]:
     """
-    Core function to scrape product and find cross-platform alternatives
+    Core function: Scrape → AI Enrich → Save → Find Alternatives
     
-    Flow:
-    1. Scrape source product (platform-specific or generic)
-    2. Find alternatives on other platforms
-    3. Return all options sorted by price
+    UPDATED: Now includes AI enrichment step
     """
     source_product = None
     
     # Step 1: Scrape source product
     if url_analysis.support_level == PlatformSupport.FULL:
-        # Use platform-specific scraper
         try:
             handler = await get_platform_handler(url_analysis.platform_name, db)
             source_product = await handler.get_product(url)
+            
+            if source_product:
+                logger.info(
+                    f"Scraped from {url_analysis.platform_name} "
+                    f"(source: {source_product.data_source.value})"
+                )
         except Exception as e:
             logger.error(f"Platform scraper failed: {e}")
-            # Fall through to generic scraper
     
     if not source_product and url_analysis.support_level in [PlatformSupport.FULL, PlatformSupport.PARTIAL]:
-        # Use generic AI scraper
-        logger.info(f"Using generic AI scraper for {url_analysis.platform_name}")
-        generic_scraper = GenericAIScraper(url_analysis.platform_name)
-        source_product = await generic_scraper.get_product(url)
+        try:
+            logger.info(f"Using generic AI scraper for {url_analysis.platform_name}")
+            generic_scraper = GenericAIScraper(url_analysis.platform_name)
+            source_product = await generic_scraper.get_product(url)
+        except Exception as e:
+            logger.error(f"Generic scraper failed: {e}")
     
     if not source_product:
         logger.error(f"Failed to scrape product from {url}")
@@ -286,10 +398,25 @@ async def scrape_and_match(
     # Add affiliate URL
     source_product.product_url = url_detector.get_affiliate_url(source_product.product_url)
     
-    # Step 2: Save to database
-    await save_product_to_database(source_product, db)
+    # =========================================================================
+    # STEP 2: AI ENRICHMENT (THE KEY STEP)
+    # =========================================================================
     
-    # Step 3: Find alternatives on other platforms
+    source_product = await _enrich_product_with_ai(source_product)
+    
+    # =========================================================================
+    # STEP 3: SAVE TO DATABASE
+    # =========================================================================
+    
+    try:
+        await save_product_to_database(source_product, db)
+    except Exception as e:
+        logger.error(f"Database save failed (continuing): {e}")
+    
+    # =========================================================================
+    # STEP 4: FIND ALTERNATIVES
+    # =========================================================================
+    
     try:
         alternatives = await cross_platform_matcher.find_alternatives(
             source_product,
@@ -301,19 +428,102 @@ async def scrape_and_match(
         logger.error(f"Cross-platform matching failed: {e}")
         alternatives = [source_product]
     
-    # Save alternatives to database
+    # =========================================================================
+    # STEP 5: SAVE ALTERNATIVES (with AI enrichment)
+    # =========================================================================
+    
     for alt in alternatives:
-        if alt.platform_name != source_product.platform_name:
+        if alt.platform_name.lower() != source_product.platform_name.lower():
             try:
+                # Enrich alternatives too
+                if not alt.ai_processed:
+                    alt = await _enrich_product_with_ai(alt)
                 await save_product_to_database(alt, db)
             except Exception as e:
-                logger.warning(f"Failed to save alternative: {e}")
+                logger.debug(f"Failed to save alternative: {e}")
     
     return alternatives
 
 
+async def format_url_search_response(
+    source_url: str,
+    source_platform: str,
+    product: Product,
+    listings: List[ProductListing],
+    db: AsyncSession
+) -> dict:
+    """Format database product for URL search response"""
+    # Find source listing
+    source_listing = None
+    other_listings = []
+    
+    for listing in listings:
+        # Get platform name
+        platform_result = await db.execute(
+            select(PlatformModel).where(PlatformModel.id == listing.platform_id)
+        )
+        platform = platform_result.scalar_one_or_none()
+        listing._platform_name = platform.name if platform else "unknown"
+        
+        if source_platform.lower() in listing._platform_name.lower():
+            source_listing = listing
+        else:
+            other_listings.append(listing)
+    
+    if not source_listing and listings:
+        source_listing = listings[0]
+        other_listings = listings[1:]
+    
+    # Calculate best price
+    all_listings = [source_listing] + other_listings if source_listing else other_listings
+    best_listing = min(all_listings, key=lambda x: x.current_price) if all_listings else None
+    
+    return {
+        "success": True,
+        "source": {
+            "platform": source_platform,
+            "title": product.title,
+            "price": float(source_listing.current_price) if source_listing else 0,
+            "original_price": float(source_listing.original_price) if source_listing and source_listing.original_price else None,
+            "rating": source_listing.rating if source_listing else None,
+            "review_count": source_listing.review_count if source_listing else None,
+            "image_url": product.image_url,
+            "url": url_detector.get_affiliate_url(source_listing.product_url) if source_listing else source_url,
+            "in_stock": source_listing.in_stock if source_listing else True,
+            "brand": product.brand
+        },
+        "alternatives": [
+            {
+                "platform": getattr(listing, '_platform_name', 'unknown'),
+                "title": product.title,
+                "price": float(listing.current_price),
+                "original_price": float(listing.original_price) if listing.original_price else None,
+                "rating": listing.rating,
+                "review_count": listing.review_count,
+                "image_url": product.image_url,
+                "url": url_detector.get_affiliate_url(listing.product_url),
+                "in_stock": listing.in_stock,
+                "savings": float(source_listing.current_price - listing.current_price) if source_listing else 0,
+                "savings_percent": round(
+                    (float(source_listing.current_price - listing.current_price) /
+                     float(source_listing.current_price)) * 100, 1
+                ) if source_listing and listing.current_price < source_listing.current_price else 0
+            }
+            for listing in sorted(other_listings, key=lambda x: x.current_price)
+        ],
+        "best_deal": {
+            "platform": getattr(best_listing, '_platform_name', source_platform) if best_listing else source_platform,
+            "price": float(best_listing.current_price) if best_listing else 0,
+            "savings": float(source_listing.current_price - best_listing.current_price) if source_listing and best_listing else 0,
+            "is_source": getattr(best_listing, '_platform_name', '') == source_platform if best_listing else True
+        },
+        "total_options": len(all_listings),
+        "fingerprint": product.fingerprint
+    }
+
+
 # =============================================================================
-# ROUTES
+# API ROUTES
 # =============================================================================
 
 @router.post("/search", response_model=SearchResponse)
@@ -423,47 +633,9 @@ async def search_by_url(
     _: None = Depends(check_rate_limit)
 ):
     """
-    Search by product URL - Find same product across ALL platforms!
+    Search by product URL - Find same product across ALL platforms
     
-    Features:
-    - Auto-detects platform from URL (Amazon, Flipkart, etc.)
-    - Scrapes product details
-    - Finds same product on other platforms
-    - Returns best prices with savings comparison
-    
-    Supported Platforms (Full):
-    - Amazon.in / Amazon.com
-    - Flipkart.com
-    - Meesho.com
-    - Myntra.com
-    
-    Partial Support (AI Scraping):
-    - Snapdeal, Croma, Reliance Digital, Tata Cliq, Ajio, Nykaa
-    
-    Example Request:
-        POST /api/v1/search/by-url
-        {
-            "url": "https://www.amazon.in/iPhone-15-Pro-Max-256GB/dp/B0CHX3TW6X"
-        }
-    
-    Example Response:
-        {
-            "success": true,
-            "source": {
-                "platform": "amazon",
-                "title": "Apple iPhone 15 Pro Max 256GB",
-                "price": 144900,
-                "url": "https://amazon.in/dp/B0CHX3TW6X?tag=dealhunt-21"
-            },
-            "alternatives": [...],
-            "best_deal": {
-                "platform": "flipkart",
-                "price": 139900,
-                "savings": 5000,
-                "savings_percent": 3.5
-            },
-            "total_options": 3
-        }
+    UPDATED: Now includes AI enrichment for better matching
     """
     start_time = time.time()
     url = request.url.strip()
@@ -480,7 +652,6 @@ async def search_by_url(
     
     # Step 2: Check if platform is supported
     if url_analysis.support_level == PlatformSupport.UNSUPPORTED:
-        # Check if it's even a product URL
         if not url_analysis.domain:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -510,7 +681,6 @@ async def search_by_url(
     
     # Step 4: Check if product exists in database
     if url_analysis.product_id:
-        # Try to find by external_id and platform
         platform_result = await db.execute(
             select(PlatformModel).where(PlatformModel.name == url_analysis.platform_name)
         )
@@ -542,7 +712,7 @@ async def search_by_url(
                 )
                 
                 # Cache result
-                await redis.set_json(cache_key, response, ttl=1800)  # 30 min cache
+                await redis.set_json(cache_key, response, ttl=1800)
                 
                 search_time_ms = int((time.time() - start_time) * 1000)
                 response["cache_hit"] = False
@@ -556,11 +726,10 @@ async def search_by_url(
                 
                 return response
     
-    # Step 5: Need to scrape - use queue manager
+    # Step 5: Need to scrape
     search_queue = get_search_queue(redis)
     
     try:
-        # This handles deduplication and concurrent requests
         alternatives = await search_queue.search_url(
             url=url,
             user=user,
@@ -615,7 +784,10 @@ async def search_by_url(
             "image_url": source_product.image_url,
             "url": url_detector.get_affiliate_url(source_product.product_url),
             "in_stock": source_product.in_stock,
-            "brand": source_product.brand
+            "brand": source_product.brand,
+            "ai_essence": source_product.ai_essence,
+            "ai_tags": source_product.ai_tags,
+            "ai_quality_score": source_product.ai_quality_score
         },
         "alternatives": [
             {
@@ -673,82 +845,9 @@ async def search_by_url(
     return response
 
 
-async def format_url_search_response(
-    source_url: str,
-    source_platform: str,
-    product: Product,
-    listings: List[ProductListing],
-    db: AsyncSession
-) -> dict:
-    """Format database product for URL search response"""
-    # Find source listing
-    source_listing = None
-    other_listings = []
-    
-    for listing in listings:
-        # Get platform name
-        platform_result = await db.execute(
-            select(PlatformModel).where(PlatformModel.id == listing.platform_id)
-        )
-        platform = platform_result.scalar_one_or_none()
-        listing._platform_name = platform.name if platform else "unknown"
-        
-        if source_platform.lower() in listing._platform_name.lower():
-            source_listing = listing
-        else:
-            other_listings.append(listing)
-    
-    if not source_listing and listings:
-        source_listing = listings[0]
-        other_listings = listings[1:]
-    
-    # Calculate best price
-    all_listings = [source_listing] + other_listings if source_listing else other_listings
-    best_listing = min(all_listings, key=lambda x: x.current_price) if all_listings else None
-    
-    return {
-        "success": True,
-        "source": {
-            "platform": source_platform,
-            "title": product.title,
-            "price": float(source_listing.current_price) if source_listing else 0,
-            "original_price": float(source_listing.original_price) if source_listing and source_listing.original_price else None,
-            "rating": source_listing.rating if source_listing else None,
-            "review_count": source_listing.review_count if source_listing else None,
-            "image_url": product.image_url,
-            "url": url_detector.get_affiliate_url(source_listing.product_url) if source_listing else source_url,
-            "in_stock": source_listing.in_stock if source_listing else True,
-            "brand": product.brand
-        },
-        "alternatives": [
-            {
-                "platform": getattr(listing, '_platform_name', 'unknown'),
-                "title": product.title,
-                "price": float(listing.current_price),
-                "original_price": float(listing.original_price) if listing.original_price else None,
-                "rating": listing.rating,
-                "review_count": listing.review_count,
-                "image_url": product.image_url,
-                "url": url_detector.get_affiliate_url(listing.product_url),
-                "in_stock": listing.in_stock,
-                "savings": float(source_listing.current_price - listing.current_price) if source_listing else 0,
-                "savings_percent": round(
-                    (float(source_listing.current_price - listing.current_price) /
-                     float(source_listing.current_price)) * 100, 1
-                ) if source_listing and listing.current_price < source_listing.current_price else 0
-            }
-            for listing in sorted(other_listings, key=lambda x: x.current_price)
-        ],
-        "best_deal": {
-            "platform": getattr(best_listing, '_platform_name', source_platform) if best_listing else source_platform,
-            "price": float(best_listing.current_price) if best_listing else 0,
-            "savings": float(source_listing.current_price - best_listing.current_price) if source_listing and best_listing else 0,
-            "is_source": getattr(best_listing, '_platform_name', '') == source_platform if best_listing else True
-        },
-        "total_options": len(all_listings),
-        "fingerprint": product.fingerprint
-    }
-
+# =============================================================================
+# TRENDING ENDPOINT - FIXED!
+# =============================================================================
 
 @router.get("/trending", response_model=List[TrendingProductResponse])
 async def get_trending_products(
@@ -757,46 +856,131 @@ async def get_trending_products(
     redis: RedisClient = Depends(get_redis),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get trending products (top searched)"""
+    """
+    Get trending products sorted by engagement (views + searches)
+    
+    FIXED: Now sorts by stats['views'] + stats['searches'] instead of listing_count
+    This merges:
+    - User searched items (high searches count)
+    - Seeded trending items (high views count from boost)
+    """
     cache_key = "trending:products:top50"
     
+    # Check Redis cache first
     cached = await redis.get_json(cache_key)
     
     if cached:
         logger.info(f"Trending cache HIT | User: {user.id}")
         return cached
     
-    result = await db.execute(
-        select(Product, func.count(ProductListing.id).label('listing_count'))
-        .join(ProductListing)
-        .group_by(Product.id)
-        .order_by(desc('listing_count'))
-        .limit(limit)
-    )
+    # ==========================================================================
+    # FIXED QUERY: Sort by (views + searches) instead of listing_count
+    # Also fixes N+1 query issue by using a single JOIN with aggregation
+    # ==========================================================================
     
-    trending = []
-    for product, count in result:
-        listing_result = await db.execute(
-            select(ProductListing)
-            .where(ProductListing.product_id == product.id)
-            .order_by(ProductListing.current_price.asc())
-            .limit(1)
+    try:
+        # Build optimized query with proper stats sorting
+        # Using COALESCE to handle NULL stats
+        result = await db.execute(
+            select(
+                Product,
+                func.min(ProductListing.current_price).label('best_price'),
+                func.max(ProductListing.discount_percent).label('best_discount'),
+                func.count(ProductListing.id).label('listing_count')
+            )
+            .join(ProductListing, Product.id == ProductListing.product_id)
+            .where(ProductListing.in_stock == True)
+            .group_by(Product.id)
+            .order_by(
+                desc(
+                    func.coalesce(
+                        func.cast(Product.stats['views'].astext, Integer), 0
+                    ) +
+                    func.coalesce(
+                        func.cast(Product.stats['searches'].astext, Integer), 0
+                    ) +
+                    func.coalesce(
+                        func.cast(Product.stats['seed_score'].astext, Integer), 0
+                    )
+                )
+            )
+            .limit(limit)
         )
-        cheapest_listing = listing_result.scalar_one_or_none()
         
+        rows = result.all()
+        
+    except Exception as e:
+        # Fallback query if JSONB casting fails (older PostgreSQL)
+        logger.warning(f"Optimized trending query failed, using fallback: {e}")
+        
+        result = await db.execute(
+            select(Product)
+            .join(ProductListing)
+            .group_by(Product.id)
+            .order_by(desc(func.count(ProductListing.id)))
+            .limit(limit)
+        )
+        
+        products = result.scalars().all()
+        rows = [(p, None, None, 0) for p in products]
+    
+    # Build response
+    trending = []
+    rank = 1
+    
+    for row in rows:
+        # Handle both tuple and single object results
+        if isinstance(row, tuple):
+            product = row[0]
+            best_price = row[1] if len(row) > 1 else None
+            best_discount = row[2] if len(row) > 2 else None
+        else:
+            product = row
+            best_price = None
+            best_discount = None
+        
+        # Get best price if not from aggregation
+        if best_price is None:
+            listing_result = await db.execute(
+                select(ProductListing)
+                .where(
+                    ProductListing.product_id == product.id,
+                    ProductListing.in_stock == True
+                )
+                .order_by(ProductListing.current_price.asc())
+                .limit(1)
+            )
+            cheapest_listing = listing_result.scalar_one_or_none()
+            best_price = cheapest_listing.current_price if cheapest_listing else 0
+            best_discount = cheapest_listing.discount_percent if cheapest_listing else None
+        
+        # Get AI metadata
         ai_metadata = product.ai_metadata or {}
+        stats = product.stats or {}
+        
+        # Calculate engagement score (for search_count field)
+        engagement_score = (
+            stats.get("views", 0) +
+            stats.get("searches", 0) +
+            stats.get("clicks", 0)
+        )
+        
+        # Determine best platform (simplified - can enhance later)
+        best_platform = "amazon"  # Default, could query for actual best
         
         trending.append(TrendingProductResponse(
             product_id=product.id,
             title=ai_metadata.get("essence", product.title),
-            best_price=cheapest_listing.current_price if cheapest_listing else 0,
-            best_platform="amazon",
-            discount_percentage=cheapest_listing.discount_percent if cheapest_listing else None,
+            best_price=float(best_price) if best_price else 0,
+            best_platform=best_platform,
+            discount_percentage=float(best_discount) if best_discount else None,
             image_url=product.image_url,
-            search_count=count,
-            rank=len(trending) + 1
+            search_count=engagement_score,  # Now represents total engagement
+            rank=rank
         ))
+        rank += 1
     
+    # Cache results for 1 hour
     if trending:
         await redis.set_json(
             cache_key,
@@ -804,7 +988,11 @@ async def get_trending_products(
             ttl=3600
         )
     
-    logger.info(f"Trending calculated from DB | Count: {len(trending)}")
+    logger.info(
+        f"Trending calculated from DB | "
+        f"Count: {len(trending)} | "
+        f"User: {user.id}"
+    )
     
     return trending
 
@@ -815,11 +1003,6 @@ async def get_supported_platforms(
 ):
     """
     Get list of supported platforms for URL search
-    
-    Returns platforms with their support level:
-    - full: Complete scraping with platform-specific selectors
-    - partial: AI-powered generic scraping (lower accuracy)
-    - unsupported: Cannot scrape
     """
     return {
         "platforms": url_detector.get_supported_platforms(),

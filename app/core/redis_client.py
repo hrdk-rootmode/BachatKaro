@@ -1,6 +1,6 @@
 """
-Redis Cache Client
-Singleton pattern for connection pooling
+Redis Cache Client - Auto-Connect Edition
+Singleton pattern for connection pooling with automatic connection management
 """
 import redis.asyncio as redis
 from typing import Optional, Any
@@ -16,11 +16,12 @@ logger = logging.getLogger(__name__)
 class RedisClient:
     """
     Async Redis client with helper methods
-    Implements singleton pattern
+    Implements singleton pattern + AUTO-CONNECT
     """
     
     _instance: Optional['RedisClient'] = None
     _client: Optional[redis.Redis] = None
+    _connecting: bool = False  # Prevent duplicate connection attempts
     
     def __new__(cls):
         """Singleton implementation"""
@@ -30,25 +31,42 @@ class RedisClient:
     
     async def connect(self):
         """Initialize Redis connection pool"""
-        if self._client is None:
-            self._client = await redis.from_url(
-                settings.REDIS_URL,
-                encoding="utf-8",
-                decode_responses=True,
-                max_connections=settings.REDIS_MAX_CONNECTIONS,
-                socket_connect_timeout=5,
-                socket_keepalive=True,
-            )
-            logger.info("✅ Redis connected successfully")
+        if self._client is None and not self._connecting:
+            self._connecting = True
+            try:
+                self._client = await redis.from_url(
+                    settings.REDIS_URL,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    max_connections=settings.REDIS_MAX_CONNECTIONS,
+                    socket_connect_timeout=5,
+                    socket_keepalive=True,
+                )
+                logger.info("✅ Redis connected successfully")
+            except Exception as e:
+                logger.error(f"❌ Redis connection failed: {e}")
+                self._client = None
+            finally:
+                self._connecting = False
     
     async def disconnect(self):
         """Close Redis connection"""
         if self._client:
             await self._client.close()
+            self._client = None
             logger.info("🔌 Redis connection closed")
+    
+    async def _ensure_connected(self):
+        """Auto-connect if not already connected"""
+        if self._client is None:
+            await self.connect()
     
     async def ping(self) -> bool:
         """Health check"""
+        await self._ensure_connected()
+        if self._client is None:
+            return False
+        
         try:
             return await self._client.ping()
         except Exception as e:
@@ -61,6 +79,11 @@ class RedisClient:
     
     async def get(self, key: str) -> Optional[str]:
         """Get value by key"""
+        await self._ensure_connected()
+        if self._client is None:
+            logger.warning("Redis not available")
+            return None
+        
         try:
             return await self._client.get(key)
         except Exception as e:
@@ -81,6 +104,11 @@ class RedisClient:
             value: Value to store
             ttl: Time to live in seconds
         """
+        await self._ensure_connected()
+        if self._client is None:
+            logger.warning("Redis not available")
+            return False
+        
         try:
             if ttl:
                 return await self._client.setex(key, ttl, value)
@@ -92,6 +120,10 @@ class RedisClient:
     
     async def delete(self, key: str) -> bool:
         """Delete key"""
+        await self._ensure_connected()
+        if self._client is None:
+            return False
+        
         try:
             return await self._client.delete(key) > 0
         except Exception as e:
@@ -100,6 +132,10 @@ class RedisClient:
     
     async def exists(self, key: str) -> bool:
         """Check if key exists"""
+        await self._ensure_connected()
+        if self._client is None:
+            return False
+        
         try:
             return await self._client.exists(key) > 0
         except Exception as e:
@@ -112,6 +148,10 @@ class RedisClient:
     
     async def get_json(self, key: str) -> Optional[Any]:
         """Get JSON value and parse"""
+        await self._ensure_connected()
+        if self._client is None:
+            return None
+        
         value = await self.get(key)
         if value:
             try:
@@ -128,6 +168,10 @@ class RedisClient:
         ttl: Optional[int] = None
     ) -> bool:
         """Store Python object as JSON"""
+        await self._ensure_connected()
+        if self._client is None:
+            return False
+        
         try:
             json_value = json.dumps(value)
             return await self.set(key, json_value, ttl)
@@ -141,6 +185,10 @@ class RedisClient:
     
     async def increment(self, key: str, amount: int = 1) -> int:
         """Increment counter"""
+        await self._ensure_connected()
+        if self._client is None:
+            return 0
+        
         try:
             return await self._client.incrby(key, amount)
         except Exception as e:
@@ -149,6 +197,10 @@ class RedisClient:
     
     async def decrement(self, key: str, amount: int = 1) -> int:
         """Decrement counter"""
+        await self._ensure_connected()
+        if self._client is None:
+            return 0
+        
         try:
             return await self._client.decrby(key, amount)
         except Exception as e:
@@ -161,6 +213,10 @@ class RedisClient:
     
     async def push_to_list(self, key: str, *values: str) -> int:
         """Push values to list (left push)"""
+        await self._ensure_connected()
+        if self._client is None:
+            return 0
+        
         try:
             return await self._client.lpush(key, *values)
         except Exception as e:
@@ -169,6 +225,10 @@ class RedisClient:
     
     async def get_list(self, key: str, start: int = 0, end: int = -1) -> list:
         """Get list range"""
+        await self._ensure_connected()
+        if self._client is None:
+            return []
+        
         try:
             return await self._client.lrange(key, start, end)
         except Exception as e:
@@ -181,6 +241,10 @@ class RedisClient:
     
     async def set_hash(self, key: str, field: str, value: str) -> bool:
         """Set hash field"""
+        await self._ensure_connected()
+        if self._client is None:
+            return False
+        
         try:
             return await self._client.hset(key, field, value)
         except Exception as e:
@@ -189,6 +253,10 @@ class RedisClient:
     
     async def get_hash(self, key: str, field: str) -> Optional[str]:
         """Get hash field"""
+        await self._ensure_connected()
+        if self._client is None:
+            return None
+        
         try:
             return await self._client.hget(key, field)
         except Exception as e:
@@ -197,6 +265,10 @@ class RedisClient:
     
     async def get_all_hash(self, key: str) -> dict:
         """Get all hash fields"""
+        await self._ensure_connected()
+        if self._client is None:
+            return {}
+        
         try:
             return await self._client.hgetall(key)
         except Exception as e:
@@ -212,6 +284,10 @@ class RedisClient:
         Delete all keys matching pattern
         WARNING: Use carefully in production
         """
+        await self._ensure_connected()
+        if self._client is None:
+            return 0
+        
         try:
             keys = await self._client.keys(pattern)
             if keys:
@@ -227,6 +303,10 @@ class RedisClient:
     
     async def set_expiry(self, key: str, seconds: int) -> bool:
         """Set expiry on existing key"""
+        await self._ensure_connected()
+        if self._client is None:
+            return False
+        
         try:
             return await self._client.expire(key, seconds)
         except Exception as e:
@@ -235,6 +315,10 @@ class RedisClient:
     
     async def get_ttl(self, key: str) -> int:
         """Get remaining TTL (-1 if no expiry, -2 if key doesn't exist)"""
+        await self._ensure_connected()
+        if self._client is None:
+            return -2
+        
         try:
             return await self._client.ttl(key)
         except Exception as e:
@@ -295,6 +379,7 @@ async def get_user_search_count(user_id: str, date: str) -> int:
     key = f"user_quota:{user_id}:{date}"
     value = await redis_client.get(key)
     return int(value) if value else 0
+
 
 async def get_redis() -> RedisClient:
     """

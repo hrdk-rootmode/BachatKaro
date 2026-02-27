@@ -9,7 +9,7 @@ Features:
 - Manual job triggering
 - Health monitoring
 
-FIXED: APScheduler 3.x compatibility
+UPDATED: Added seed_products job at 3:00 AM IST
 """
 
 import logging
@@ -171,7 +171,34 @@ def register_jobs():
         logger.error(f"  ├── daily_scrape: FAILED - {e}")
     
     # =========================================================================
-    # JOB 2: Load Trending to Redis (5 AM IST)
+    # JOB 2: Seed Trending Products (3 AM IST) - NEW!
+    # =========================================================================
+    try:
+        # Check if seeding is enabled
+        if getattr(settings, 'ENABLE_PRODUCT_SEEDING', True):
+            from jobs.seed_products import run_seed_products
+            
+            scheduler.add_job(
+                job_wrapper('seed_products', run_seed_products),
+                trigger=CronTrigger(
+                    hour=3,  # 3 AM IST (after daily scrape at 2 AM)
+                    minute=0,
+                    timezone=IST
+                ),
+                id='seed_products',
+                name='Seed Trending Products',
+                replace_existing=True
+            )
+            logger.info("  ├── seed_products: 3:00 AM IST ✅")
+        else:
+            logger.info("  ├── seed_products: DISABLED (ENABLE_PRODUCT_SEEDING=False)")
+    except ImportError as e:
+        logger.warning(f"  ├── seed_products: SKIPPED - Module not found ({e})")
+    except Exception as e:
+        logger.error(f"  ├── seed_products: FAILED - {e}")
+    
+    # =========================================================================
+    # JOB 3: Load Trending to Redis (5 AM IST)
     # =========================================================================
     try:
         from jobs.load_trending_redis import run_load_trending
@@ -192,7 +219,7 @@ def register_jobs():
         logger.error(f"  ├── load_trending: FAILED - {e}")
     
     # =========================================================================
-    # JOB 3: Check Price Alerts (Every 6 hours)
+    # JOB 4: Check Price Alerts (Every 6 hours)
     # =========================================================================
     try:
         from jobs.check_price_alerts import run_check_price_alerts
@@ -212,7 +239,7 @@ def register_jobs():
         logger.error(f"  ├── check_price_alerts: FAILED - {e}")
     
     # =========================================================================
-    # JOB 4: Streak Reminders (8 PM IST)
+    # JOB 5: Streak Reminders (8 PM IST)
     # =========================================================================
     try:
         from jobs.send_streak_reminders import run_streak_reminders
@@ -233,7 +260,7 @@ def register_jobs():
         logger.error(f"  ├── streak_reminders: FAILED - {e}")
     
     # =========================================================================
-    # JOB 5: Sync Google Subscriptions (Every 1 hour) - OPTIONAL
+    # JOB 6: Sync Google Subscriptions (Every 1 hour) - OPTIONAL
     # =========================================================================
     try:
         from jobs.sync_subscriptions import run_sync_subscriptions
@@ -255,7 +282,7 @@ def register_jobs():
         logger.error(f"  ├── sync_subscriptions: FAILED - {e}")
     
     # =========================================================================
-    # JOB 6: Monthly Archive (1st of month, 1 AM IST) - OPTIONAL
+    # JOB 7: Monthly Archive (1st of month, 1 AM IST) - OPTIONAL
     # =========================================================================
     try:
         from jobs.monthly_archive import run_monthly_archive
@@ -281,6 +308,7 @@ def register_jobs():
     _scheduler_initialized = True
     job_count = len(scheduler.get_jobs())
     logger.info(f"✅ Registered {job_count} background jobs")
+
 
 # =============================================================================
 # SCHEDULER LIFECYCLE
@@ -329,6 +357,7 @@ def _log_next_run_times():
     
     try:
         jobs = scheduler.get_jobs()
+        logger.info("📆 Next scheduled runs:")
         for job in jobs:
             try:
                 # APScheduler 3.x compatible way to get next run time
@@ -340,7 +369,7 @@ def _log_next_run_times():
                     next_run = job.trigger.get_next_fire_time(None, datetime.now(IST))
                 
                 if next_run:
-                    logger.info(f"  ├── {job.id}: next run at {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    logger.info(f"  ├── {job.id}: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 else:
                     logger.info(f"  ├── {job.id}: scheduled")
             except Exception:

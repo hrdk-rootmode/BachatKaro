@@ -4,6 +4,7 @@ All models use Pydantic v2 with proper type hints
 """
 
 from datetime import datetime
+from uuid import UUID
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
@@ -175,7 +176,7 @@ class TrendingProductResponse(BaseModel):
     """Trending product summary"""
     model_config = ConfigDict(from_attributes=True)
     
-    product_id: int
+    product_id: UUID
     title: str
     best_price: Decimal
     best_platform: Platform

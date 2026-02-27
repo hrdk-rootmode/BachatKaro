@@ -42,43 +42,65 @@ class MyntraScraper(BasePlatformHandler):
     """
     Myntra.com scraper for fashion products
     
-    Myntra specializes in:
-    - Clothing (men, women, kids)
-    - Footwear
-    - Accessories
-    - Beauty products
+    Features:
+    - Fashion product search
+    - Size availability
+    - Color variants
+    - Brand extraction
     
-    Usage:
-        scraper = MyntraScraper(config)
-        results = await scraper.search("men casual shirt")
+    Author: DealHunt
+    Complexity: MEDIUM
     """
+    
+    # =========================================================================
+    # PLATFORM METADATA (For auto-discovery & smart routing)
+    # =========================================================================
+    PLATFORM_METADATA = {
+        "name": "myntra",
+        "display_name": "Myntra",
+        "base_url": "https://www.myntra.com",
+        "domains": ["myntra.com"],
+        "categories": ["fashion", "beauty"],  # Fashion & Beauty ONLY!
+        "product_id_patterns": [
+            r"/(\d{6,10})(?:/|$)",
+            r"/buy/(\d+)",
+        ],
+        "affiliate_param": "utm_source",
+        "rate_limit_per_minute": 40,
+        "reliability": "medium"
+    }
     
     BASE_URL = "https://www.myntra.com"
     
+    # =========================================================================
+    # FIXED SELECTORS (Updated February 2024)
+    # =========================================================================
+    
     DEFAULT_SELECTORS = {
         # Search page
-        "search_results": "li.product-base",
+        "search_results": "li.product-base, li[class*='product-base']",
         "search_title": "h3.product-brand, h4.product-product",
         "search_price": "span.product-discountedPrice, div.product-price span",
         "search_original_price": "span.product-strike",
         "search_discount": "span.product-discountPercentage",
         "search_rating": "div.product-ratingsContainer span",
-        "search_image": "img.img-responsive",
-        "search_link": "a[data-reactid]",
+        "search_image": "img.img-responsive, picture.img-responsive img",
+        "search_link": "a[href]",
         
         # Product page
-        "product_title": "h1.pdp-title, h1.pdp-name",
-        "product_brand": "h1.pdp-title, span.pdp-brand",
-        "product_price": "span.pdp-price strong, span.pdp-discountedPrice",
-        "original_price": "span.pdp-mrp s",
-        "discount_percent": "span.pdp-discount",
-        "product_image": "div.image-grid-image img",
-        "product_rating": "div.index-overallRating",
-        "review_count": "div.index-ratingsCount",
-        "size_options": "div.size-buttons-size-button",
-        "color_options": "div.colors-colorsContainer img",
-        "product_details": "div.pdp-productDescriptorsContainer"
+        "product_brand": "h1.pdp-title, a.pdp-title",
+        "product_name": "h1.pdp-name, p.pdp-name",
+        "product_price": "span.pdp-price strong, p.pdp-price strong, span[class*='pdp-price']",
+        "original_price": "span.pdp-mrp s, p.pdp-mrp s",
+        "discount_percent": "span.pdp-discount, p.pdp-discount",
+        "product_image": "div.image-grid-image img, img[class*='image-grid']",
+        "product_rating": "div.index-overallRating, span[class*='overallRating']",
+        "review_count": "div.index-ratingsCount, span[class*='ratingsCount']",
+        "size_options": "button.size-buttons-size-button, button[class*='size-button']",
+        "color_options": "div.colors-colorsContainer img"
     }
+    
+    # ... rest of __init__ and other methods remain UNCHANGED ...
     
     def __init__(
         self,

@@ -138,7 +138,7 @@ async def get_price_history(
         )
     
     # Get price history from JSONB column
-    price_history_data = listing.price_history or []
+    price_history_data = listing.price_history_json or []
     cutoff_date = datetime.utcnow() - timedelta(days=days)
     
     history_points = []

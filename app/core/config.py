@@ -106,6 +106,13 @@ class Settings(BaseSettings):
             "pro": self.GOOGLE_PLAY_PRO_SKU,
             "premium": self.GOOGLE_PLAY_PREMIUM_SKU
         }
+
+    ENABLE_PRODUCT_SEEDING: bool = True  # New flag
+    SEEDING_CATEGORIES: List[str] = [
+    "Electronics", "Fashion", "Home & Kitchen", "Beauty", "Sports", "Books"
+]
+    SEEDING_PLATFORMS: List[str] = ["amazon", "flipkart"]
+    SEEDING_BOOST_VIEWS: int = 100
     
     # =============================================================================
     # AFFILIATE TAGS
@@ -218,7 +225,7 @@ class Settings(BaseSettings):
     # LEGACY COMPATIBILITY (from old config)
     # =====================================================================
     NODE_ENV: str = "development"
-    PORT: int = 3000
+    PORT: int = 8000
     USE_BROWSER: bool = False
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: bool = True
     

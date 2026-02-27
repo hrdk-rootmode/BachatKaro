@@ -139,7 +139,7 @@ class ProductListing(Base):
     currency = Column(String(3), default="INR")
     
     # Price history (last 120 days only)
-    price_history = Column(JSONB, default=[])  # [{"p": 29999, "d": "2024-01-15"}, ...]
+    price_history_json = Column("price_history", JSONB, default=[])  # [{"p": 29999, "d": "2024-01-15"}, ...]
     
     # Reviews & Ratings
     rating = Column(Float)

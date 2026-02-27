@@ -4,7 +4,7 @@ Abstract class that ALL platform implementations must follow
 Designed for seamless switching between Scraping ↔ API
 
 Author: DealHunt
-Future-Proof: YES - Add API support without changing interface
+Updated: AI-Ready ProductData with Essence Support
 """
 
 import logging
@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 class HandlerType(str, Enum):
     """Type of data source"""
-    SCRAPER = "scraper"      # Web scraping (Playwright)
-    API = "api"              # Official API (future)
-    HYBRID = "hybrid"        # Mix of both
+    SCRAPER = "scraper"
+    API = "api"
+    HYBRID = "hybrid"
 
 
 class ProductCondition(str, Enum):
@@ -48,25 +48,90 @@ class StockStatus(str, Enum):
 
 
 # =============================================================================
+# PRODUCT CATEGORY (For smart platform routing)
+# =============================================================================
+
+class ProductCategory(str, Enum):
+    """Product categories for smart platform routing"""
+    ELECTRONICS = "electronics"
+    FASHION = "fashion"
+    HOME = "home"
+    BEAUTY = "beauty"
+    GROCERY = "grocery"
+    GENERAL = "general"
+    
+    @classmethod
+    def detect_from_query(cls, query: str) -> "ProductCategory":
+        """Auto-detect category from search query"""
+        query_lower = query.lower()
+        
+        electronics_keywords = [
+            "phone", "laptop", "tv", "tablet", "watch", "camera", "speaker",
+            "headphone", "earphone", "computer", "iphone", "samsung", "xbox",
+            "playstation", "console", "keyboard", "mouse", "monitor", "mobile",
+            "smartphone", "macbook", "ipad", "airpods", "pixel", "oneplus",
+            "realme", "redmi", "poco", "asus", "dell", "hp", "lenovo", "acer"
+        ]
+        
+        fashion_keywords = [
+            "shirt", "dress", "kurta", "saree", "jeans", "shoes", "sneakers",
+            "jacket", "t-shirt", "tshirt", "top", "bottom", "ethnic", "western",
+            "kurti", "lehenga", "pant", "trouser", "watch", "bag", "wallet"
+        ]
+        
+        beauty_keywords = [
+            "lipstick", "makeup", "cream", "lotion", "perfume", "shampoo",
+            "skincare", "foundation", "mascara", "serum", "moisturizer",
+            "sunscreen", "face wash", "body lotion", "hair oil"
+        ]
+        
+        home_keywords = [
+            "furniture", "sofa", "bed", "table", "chair", "curtain", "mattress",
+            "pillow", "kitchen", "cookware", "decor", "lamp", "fan", "ac"
+        ]
+        
+        if any(kw in query_lower for kw in electronics_keywords):
+            return cls.ELECTRONICS
+        elif any(kw in query_lower for kw in fashion_keywords):
+            return cls.FASHION
+        elif any(kw in query_lower for kw in beauty_keywords):
+            return cls.BEAUTY
+        elif any(kw in query_lower for kw in home_keywords):
+            return cls.HOME
+        
+        return cls.GENERAL
+    
+    @classmethod
+    def get_platforms_for_category(cls, category: "ProductCategory") -> List[str]:
+        """Get relevant platforms for a category"""
+        platform_map = {
+            cls.ELECTRONICS: ["amazon", "flipkart", "croma", "reliancedigital"],
+            cls.FASHION: ["myntra", "ajio", "amazon", "flipkart", "meesho"],
+            cls.BEAUTY: ["nykaa", "myntra", "amazon", "flipkart"],
+            cls.HOME: ["amazon", "flipkart", "meesho"],
+            cls.GROCERY: ["amazon", "flipkart"],
+            cls.GENERAL: ["amazon", "flipkart"],
+        }
+        return platform_map.get(category, ["amazon", "flipkart"])
+
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
 @dataclass
 class PlatformConfig:
-    """
-    Platform configuration loaded from database
-    Used by both scrapers and API handlers
-    """
+    """Platform configuration loaded from database"""
     id: int
     name: str
     base_url: str
     affiliate_tag: Optional[str] = None
     
-    # Scraper-specific (ignored by API handlers)
+    # Scraper-specific
     selectors: Dict[str, Any] = field(default_factory=dict)
     scrape_delay_seconds: int = 2
     
-    # API-specific (ignored by scrapers)
+    # API-specific
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     api_endpoint: Optional[str] = None
@@ -87,9 +152,14 @@ class ProductData:
     """
     Unified product data structure
     Same format whether from scraping or API
+    
+    NEW FIELDS:
+    - raw_html: Carries page content for AI processing
+    - ai_essence: AI-generated normalized fingerprint
+    - ai_processed: Flag to check if AI has enriched this data
     """
     # Required fields
-    external_id: str                    # Platform's product ID
+    external_id: str
     title: str
     current_price: Decimal
     product_url: str
@@ -116,6 +186,7 @@ class ProductData:
     # Product details
     brand: Optional[str] = None
     category: Optional[str] = None
+    subcategory: Optional[str] = None
     condition: ProductCondition = ProductCondition.NEW
     
     # Additional data
@@ -128,25 +199,50 @@ class ProductData:
     data_source: HandlerType = HandlerType.SCRAPER
     raw_data: Dict[str, Any] = field(default_factory=dict)
     
-    # Fingerprint for deduplication
+    # =========================================================================
+    # NEW: AI Processing Fields
+    # =========================================================================
+    raw_html: Optional[str] = field(default=None, repr=False)  # For AI to analyze
+    ai_essence: Optional[str] = None  # AI-generated clean fingerprint
+    ai_tags: List[str] = field(default_factory=list)
+    ai_quality_score: int = 0  # 0-100
+    ai_processed: bool = False  # Flag to avoid double-processing
+    
+    # Internal fingerprint cache
     _fingerprint: Optional[str] = field(default=None, repr=False)
     
     @property
     def fingerprint(self) -> str:
-        """Generate unique fingerprint for product deduplication"""
+        """
+        Generate unique fingerprint for product deduplication
+        
+        Priority:
+        1. AI-generated essence (most accurate)
+        2. Cached fingerprint
+        3. Regex-based fallback (least accurate)
+        """
+        # Priority 1: AI Essence
+        if self.ai_essence:
+            return hashlib.sha256(self.ai_essence.encode()).hexdigest()[:32]
+        
+        # Priority 2: Cached
         if self._fingerprint:
             return self._fingerprint
         
-        # Normalize title
+        # Priority 3: Fallback (regex-based)
         normalized = self.title.lower()
         normalized = re.sub(r'[^a-z0-9\s]', '', normalized)
         words = sorted(normalized.split())
         
-        # Create fingerprint
-        fp_string = f"{self.brand or 'unknown'}_{' '.join(words[:10])}"
+        fp_string = f"{(self.brand or 'unknown').lower()}_{' '.join(words[:10])}"
         self._fingerprint = hashlib.sha256(fp_string.encode()).hexdigest()[:32]
         
         return self._fingerprint
+    
+    @fingerprint.setter
+    def fingerprint(self, value: str):
+        """Allow setting fingerprint from AI"""
+        self._fingerprint = value
     
     @property
     def affiliate_url(self) -> str:
@@ -157,6 +253,45 @@ class ProductData:
     def has_discount(self) -> bool:
         """Check if product has discount"""
         return self.discount_percent is not None and self.discount_percent > 0
+    
+    def to_ai_context(self, max_length: int = 2000) -> Dict[str, Any]:
+        """
+        Prepare minimal context for AI processing
+        Optimized to save tokens while providing enough data
+        
+        Args:
+            max_length: Max length for raw_html truncation
+        
+        Returns:
+            Dictionary optimized for AI prompt
+        """
+        context = {
+            "title": self.title[:200],  # Truncate long titles
+            "brand": self.brand,
+            "price": float(self.current_price) if self.current_price else 0,
+            "platform": self.platform_name,
+            "category": self.category,
+        }
+        
+        # Add specs if available (limit size)
+        if self.specifications:
+            specs_str = str(self.specifications)
+            if len(specs_str) < 500:
+                context["specs"] = self.specifications
+        
+        # Add raw_data hints (useful metadata from scraper)
+        if self.raw_data:
+            useful_keys = ["is_prime", "seller", "color", "size", "variant"]
+            context["hints"] = {
+                k: v for k, v in self.raw_data.items()
+                if k in useful_keys
+            }
+        
+        # Add truncated HTML only if no specs available
+        if self.raw_html and not self.specifications:
+            context["html_snippet"] = self.raw_html[:max_length]
+        
+        return context
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database storage"""
@@ -176,9 +311,13 @@ class ProductData:
             "delivery_days": self.delivery_days,
             "brand": self.brand,
             "category": self.category,
+            "subcategory": self.subcategory,
             "specifications": self.specifications,
             "platform_name": self.platform_name,
             "fingerprint": self.fingerprint,
+            "ai_essence": self.ai_essence,
+            "ai_tags": self.ai_tags,
+            "ai_quality_score": self.ai_quality_score,
             "scraped_at": self.scraped_at.isoformat(),
             "data_source": self.data_source.value
         }
@@ -186,10 +325,7 @@ class ProductData:
 
 @dataclass
 class SearchResult:
-    """
-    Search operation result
-    Contains products + metadata about the search
-    """
+    """Search operation result"""
     query: str
     platform_name: str
     products: List[ProductData] = field(default_factory=list)
@@ -229,8 +365,8 @@ class HealthStatus:
     last_error: Optional[str] = None
     consecutive_failures: int = 0
     
-    # Selector health (scraper only)
-    selector_status: str = "healthy"  # healthy, healed, degraded, failing
+    # Selector health
+    selector_status: str = "healthy"
     healed_selectors_count: int = 0
 
 
@@ -246,36 +382,10 @@ class BasePlatformHandler(ABC):
     - Web scrapers (AmazonScraper, FlipkartScraper)
     - API clients (AmazonAPI, FlipkartAPI)
     - Hybrid handlers (scrape + API fallback)
-    
-    Benefits:
-    - Swap implementations without changing calling code
-    - Same interface for scraper and API
-    - Easy testing with mock handlers
-    - Future-proof architecture
-    
-    Example:
-        class AmazonScraper(BasePlatformHandler):
-            async def search(self, query: str) -> SearchResult:
-                # Scraping implementation
-                pass
-        
-        class AmazonAPI(BasePlatformHandler):
-            async def search(self, query: str) -> SearchResult:
-                # API implementation
-                pass
-        
-        # Both work the same way:
-        handler = get_handler("amazon")  # Returns scraper or API based on config
-        results = await handler.search("iphone")
     """
     
     def __init__(self, config: PlatformConfig):
-        """
-        Initialize handler with platform configuration
-        
-        Args:
-            config: Platform configuration from database
-        """
+        """Initialize handler with platform configuration"""
         self.config = config
         self.platform_name = config.name
         self.base_url = config.base_url
@@ -290,7 +400,7 @@ class BasePlatformHandler(ABC):
         logger.info(f"Initialized {self.__class__.__name__} for {self.platform_name}")
     
     # =========================================================================
-    # ABSTRACT METHODS - Must implement in child classes
+    # ABSTRACT METHODS
     # =========================================================================
     
     @abstractmethod
@@ -300,87 +410,39 @@ class BasePlatformHandler(ABC):
         page: int = 1,
         filters: Optional[Dict[str, Any]] = None
     ) -> SearchResult:
-        """
-        Search for products on the platform
-        
-        Args:
-            query: Search query string
-            page: Page number (1-indexed)
-            filters: Optional filters (min_price, max_price, category, etc.)
-        
-        Returns:
-            SearchResult with list of products
-        """
+        """Search for products on the platform"""
         pass
     
     @abstractmethod
     async def get_product(self, product_url: str) -> Optional[ProductData]:
-        """
-        Get single product details from URL
-        
-        Args:
-            product_url: Full product URL
-        
-        Returns:
-            ProductData or None if not found
-        """
+        """Get single product details from URL"""
         pass
     
     @abstractmethod
     async def get_product_by_id(self, external_id: str) -> Optional[ProductData]:
-        """
-        Get product by platform's product ID
-        
-        Args:
-            external_id: Platform's product ID (ASIN for Amazon, etc.)
-        
-        Returns:
-            ProductData or None if not found
-        """
+        """Get product by platform's product ID"""
         pass
     
     @property
     @abstractmethod
     def handler_type(self) -> HandlerType:
-        """Return the type of this handler (SCRAPER, API, HYBRID)"""
+        """Return the type of this handler"""
         pass
     
     # =========================================================================
-    # COMMON METHODS - Shared by all handlers
+    # COMMON METHODS
     # =========================================================================
     
     def build_affiliate_url(self, product_url: str) -> str:
-        """
-        Add affiliate tag to product URL
-        
-        Override in child class for platform-specific logic
-        
-        Args:
-            product_url: Original product URL
-        
-        Returns:
-            URL with affiliate tag appended
-        """
+        """Add affiliate tag to product URL"""
         if not self.affiliate_tag:
             return product_url
         
-        # Default implementation - append as query param
         separator = "&" if "?" in product_url else "?"
         return f"{product_url}{separator}tag={self.affiliate_tag}"
     
     def extract_product_id(self, url: str) -> Optional[str]:
-        """
-        Extract product ID from URL
-        
-        Override in child class for platform-specific patterns
-        
-        Args:
-            url: Product URL
-        
-        Returns:
-            Product ID or None
-        """
-        # Default: return last path segment
+        """Extract product ID from URL"""
         try:
             from urllib.parse import urlparse
             path = urlparse(url).path
@@ -390,12 +452,7 @@ class BasePlatformHandler(ABC):
             return None
     
     async def health_check(self) -> HealthStatus:
-        """
-        Check handler health
-        
-        Returns:
-            HealthStatus with current metrics
-        """
+        """Check handler health"""
         success_rate = 0.0
         if self._request_count > 0:
             success_rate = (self._success_count / self._request_count) * 100
@@ -425,15 +482,11 @@ class BasePlatformHandler(ABC):
     
     @property
     def is_healthy(self) -> bool:
-        """Check if handler is healthy (less than 5 consecutive failures)"""
+        """Check if handler is healthy"""
         return self._consecutive_failures < 5
     
     async def close(self) -> None:
-        """
-        Cleanup resources
-        
-        Override in child class to close browser, connections, etc.
-        """
+        """Cleanup resources"""
         pass
     
     # =========================================================================
@@ -441,22 +494,12 @@ class BasePlatformHandler(ABC):
     # =========================================================================
     
     def _clean_price(self, price_str: str) -> Optional[Decimal]:
-        """
-        Clean price string and convert to Decimal
-        
-        Args:
-            price_str: Price string like "₹29,999.00" or "$299.99"
-        
-        Returns:
-            Decimal price or None
-        """
+        """Clean price string and convert to Decimal"""
         if not price_str:
             return None
         
         try:
-            # Remove currency symbols and commas
             cleaned = re.sub(r'[₹$€£,\s]', '', price_str)
-            # Extract number
             match = re.search(r'[\d.]+', cleaned)
             if match:
                 return Decimal(match.group())
@@ -466,15 +509,7 @@ class BasePlatformHandler(ABC):
         return None
     
     def _clean_rating(self, rating_str: str) -> Optional[float]:
-        """
-        Clean rating string and convert to float
-        
-        Args:
-            rating_str: Rating string like "4.5 out of 5" or "4.5"
-        
-        Returns:
-            Float rating or None
-        """
+        """Clean rating string and convert to float"""
         if not rating_str:
             return None
         
@@ -490,20 +525,11 @@ class BasePlatformHandler(ABC):
         return None
     
     def _clean_review_count(self, count_str: str) -> Optional[int]:
-        """
-        Clean review count string
-        
-        Args:
-            count_str: String like "1,234 ratings" or "1.2K reviews"
-        
-        Returns:
-            Integer count or None
-        """
+        """Clean review count string"""
         if not count_str:
             return None
         
         try:
-            # Handle K/M suffixes
             count_str = count_str.upper()
             multiplier = 1
             
@@ -514,7 +540,6 @@ class BasePlatformHandler(ABC):
                 multiplier = 1000000
                 count_str = count_str.replace('M', '')
             
-            # Extract number
             cleaned = re.sub(r'[,\s]', '', count_str)
             match = re.search(r'[\d.]+', cleaned)
             if match:
