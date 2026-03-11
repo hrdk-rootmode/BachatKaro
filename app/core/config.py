@@ -235,6 +235,14 @@ class Settings(BaseSettings):
     DATA_RETENTION_MONTHS: int = 6
     
     # =============================================================================
+    # ✨ AUTO-USER CREATION FROM FIREBASE (Zero-friction authentication)
+    # =============================================================================
+    ENABLE_AUTO_USER_CREATION: bool = True
+    AUTO_USER_DEFAULT_PLAN: str = "free"
+    AUTO_USER_PLAN_EXPIRY_DAYS: int = 365
+    AUTO_USER_DEFAULT_DISPLAY_NAME: str = "DealHunt User"
+    
+    # =============================================================================
     # COMPUTED PROPERTIES
     # =============================================================================
     @property

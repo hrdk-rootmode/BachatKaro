@@ -1,0 +1,61 @@
+{
+  "timestamp": "20260303_111209",
+  "overview": {},
+  "platforms": {
+    "flipkart": {
+      "product_count": 3,
+      "listing_count": 3,
+      "average_price": 299.0,
+      "last_scrape": "2026-03-03T00:04:07.368636+00:00"
+    },
+    "nykaa": {
+      "product_count": 0,
+      "listing_count": 0,
+      "average_price": 0,
+      "last_scrape": null
+    },
+    "meesho": {
+      "product_count": 0,
+      "listing_count": 0,
+      "average_price": 0,
+      "last_scrape": null
+    },
+    "croma": {
+      "product_count": 0,
+      "listing_count": 0,
+      "average_price": 0,
+      "last_scrape": null
+    },
+    "amazon": {
+      "product_count": 0,
+      "listing_count": 0,
+      "average_price": 0,
+      "last_scrape": null
+    },
+    "myntra": {
+      "product_count": 0,
+      "listing_count": 0,
+      "average_price": 0,
+      "last_scrape": null
+    }
+  },
+  "categories": {
+    "Electronics": {
+      "product_count": 3,
+      "average_price": 299.0
+    }
+  },
+  "activity": {},
+  "quality": {
+    "complete_products": 3,
+    "ai_enhanced_products": 0,
+    "priced_listings": 3,
+    "rated_listings": 0,
+    "total_products": 3,
+    "total_listings": 3,
+    "completeness_rate": 100.0,
+    "ai_enhancement_rate": 0.0,
+    "price_coverage": 100.0,
+    "rating_coverage": 0.0
+  }
+}

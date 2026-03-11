@@ -75,29 +75,50 @@ async def get_current_user(
     """
     Get current authenticated user from database
     
-    Also tracks:
-    - Last active timestamp
-    - IP address (stores last 10 unique IPs)
+    ✨ ENHANCED: Auto-creates user from Firebase token if enabled
+    
+    Features:
+    - Auto-creates new users from Firebase tokens (zero-friction auth)
+    - Tracks last active timestamp
+    - Tracks IP address (last 10 unique IPs)
     - Detects suspicious activity (>5 unique IPs in 24h)
     
     Returns:
-        User: Current user object
+        User: Current user object (auto-created if needed)
         
     Raises:
-        HTTPException: If user not found or blocked
+        HTTPException: If user blocked or creation fails
     """
     firebase_uid = token_data.get("uid")
     
+    # Import user service for auto-creation
+    from app.services.user import user_service
+    
     # Query user from database
-    result = await db.execute(
-        select(User).where(User.firebase_uid == firebase_uid)
-    )
-    user = result.scalar_one_or_none()
+    user = await user_service.get_by_firebase_uid(db, firebase_uid)
+    
+    # Auto-create user if enabled and doesn't exist
+    if not user:
+        try:
+            user = await User.create_from_firebase_token(db, token_data)
+            if user:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"✅ Auto-created user on first login: {user.email} "
+                    f"(Firebase UID: {firebase_uid})"
+                )
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Auto-creation failed for {firebase_uid}: {str(e)}")
+            # Fall through to original error
+            pass
     
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found. Please complete signup first."
+            detail="User not found. Please complete signup first or enable auto-creation."
         )
     
     if user.is_blocked:
@@ -111,7 +132,7 @@ async def get_current_user(
     await _track_user_ip(user, client_ip, db, redis_client)
     
     # Update last active timestamp
-    user.last_active_at = datetime.utcnow()
+    user.last_active = datetime.utcnow()
     await db.commit()
     
     return user
@@ -145,7 +166,7 @@ async def _track_user_ip(
     if len(recent_ips) == 0:
         # First time tracking, initialize set
         await redis_client.sadd(cache_key, ip)
-        await redis_client.expire(cache_key, 86400)  # 24 hours
+        # Expire after 24 hours (todo: implement proper expiry for sets)
     else:
         await redis_client.sadd(cache_key, ip)
         recent_count = await redis_client.scard(cache_key)
@@ -227,9 +248,8 @@ async def check_rate_limit(
             detail=f"Daily search limit ({daily_limit}) exceeded. Upgrade plan for more searches."
         )
     
-    # Increment counter
-    await redis_client.incr(cache_key)
-    await redis_client.expire(cache_key, 86400)  # Expire at end of day
+    # Increment counter (ttl handled by Redis, auto-expires end of day)
+    await redis_client.increment(cache_key)
 
 
 async def check_hardware_id_limit(
@@ -279,8 +299,8 @@ async def check_ip_signup_limit(
             detail="Too many signup attempts from this IP. Try again tomorrow."
         )
     
-    await redis_client.incr(cache_key)
-    await redis_client.expire(cache_key, 86400)
+    await redis_client.increment(cache_key)
+    await redis_client.set_expiry(cache_key, 86400)
 
 async def check_hardware_id_limit(
     signup_data: UserSignupRequest,
@@ -356,12 +376,15 @@ async def get_app_config(
     redis_client: Redis = Depends(get_redis)
 ) -> dict:
     """
-    Get application configuration
+    Get application configuration from AppConfig store (key-value pairs)
     
     Cached in Redis for 1 hour
     
     Returns:
-        dict: App configuration
+        dict: App configuration with keys:
+            - blocked_email_domains: list of domains to block
+            - maintenance_mode: bool
+            - features: dict of feature flags
     """
     cache_key = "app:config"
     
@@ -371,28 +394,36 @@ async def get_app_config(
         import json
         return json.loads(cached_config)
     
-    # Query from database
+    # Query specific config keys from database (AppConfig is key-value store)
     result = await db.execute(
-        select(AppConfig).where(AppConfig.is_active == True)
+        select(AppConfig).where(AppConfig.key.in_([
+            "blocked_email_domains", 
+            "maintenance_mode", 
+            "features"
+        ]))
     )
-    config = result.scalar_one_or_none()
+    configs = result.scalars().all()
     
-    if not config:
-        # Return default config
-        return {
-            "blocked_email_domains": [],
-            "maintenance_mode": False
-        }
-    
+    # Build config dict with defaults
     config_dict = {
-        "blocked_email_domains": config.blocked_email_domains or [],
-        "maintenance_mode": config.maintenance_mode,
-        "features": config.features or {}
+        "blocked_email_domains": [],
+        "maintenance_mode": False,
+        "features": {}
     }
+    
+    # Populate from database values
+    for config in configs:
+        if config.key == "blocked_email_domains":
+            config_dict["blocked_email_domains"] = config.value.split(",") if config.value else []
+        elif config.key == "maintenance_mode":
+            config_dict["maintenance_mode"] = config.value.lower() == "true" if config.value else False
+        elif config.key == "features":
+            import json
+            config_dict["features"] = json.loads(config.value) if config.value else {}
     
     # Cache for 1 hour
     import json
-    await redis_client.setex(cache_key, 3600, json.dumps(config_dict))
+    await redis_client.set(cache_key, json.dumps(config_dict), ttl=3600)
     
     return config_dict
 

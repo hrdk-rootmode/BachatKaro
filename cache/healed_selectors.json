@@ -1,1 +1,104 @@
-{}
+{
+  "amazon": {
+    "product_title": {
+      "selector": "#productTitle",
+      "healed_at": "2026-03-02T11:56:32.279416",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 10,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.052210"
+    },
+    "original_price": {
+      "selector": "span[class*=\"price\"]",
+      "healed_at": "2026-03-02T11:56:46.040028",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 10,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.146026"
+    },
+    "product_price": {
+      "selector": "span.a-price-whole",
+      "healed_at": "2026-03-02T12:13:02.181372",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 8,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.095452"
+    },
+    "product_rating": {
+      "selector": "span.a-icon-alt",
+      "healed_at": "2026-03-02T12:13:28.867390",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 8,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.905942"
+    },
+    "review_count": {
+      "selector": "span.a-icon-alt",
+      "healed_at": "2026-03-02T12:13:33.664953",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 8,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.935962"
+    },
+    "in_stock": {
+      "selector": "#availability",
+      "healed_at": "2026-03-02T12:13:48.690125",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 8,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.996693"
+    },
+    "brand": {
+      "selector": "span.a-icon-alt",
+      "healed_at": "2026-03-03T04:00:01.452372",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 6,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:39.966194"
+    },
+    "discount_percent": {
+      "selector": "span.a-offscreen",
+      "healed_at": "2026-03-03T04:00:23.766689",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 6,
+      "fail_count": 0,
+      "promoted": false,
+      "last_success": "2026-03-03T05:17:41.237265"
+    },
+    "search_results": {
+      "selector": "#search",
+      "healed_at": "2026-03-03T05:20:42.866987",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 0,
+      "fail_count": 0,
+      "promoted": false
+    }
+  },
+  "flipkart": {
+    "search_product_container": {
+      "selector": "#container > div:nth-child(2)",
+      "healed_at": "2026-03-03T05:20:56.727259",
+      "method": "ai_generated",
+      "version": 1,
+      "success_count": 0,
+      "fail_count": 0,
+      "promoted": false
+    }
+  }
+}

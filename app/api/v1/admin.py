@@ -8,6 +8,7 @@ Features:
 - Promotion Management (create, update, delete, analytics)
 - System Monitoring (health, stats, logs, config)
 - Live Config Management (no-code changes)
+- ✅ NEW: Working Force-Scrape & Scheduler Status
 
 Security:
 - Firebase custom claims (admin: true)
@@ -23,7 +24,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, update, delete
+from sqlalchemy import select, func, and_, or_, update, delete, text
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
@@ -45,10 +46,15 @@ from app.schemas import (
     # System
     SystemHealthResponse, SystemStatsResponse, ForceScrapeRequest, 
     ForceScrapeResponse, AppConfigUpdateRequest, MaintenanceModeRequest,
+    # Jobs
+    SchedulerStatusResponse, TriggerJobRequest, TriggerJobResponse,
     # Common
     UserPlan
 )
 from app.services.analytics import analytics_service
+
+# ✅ NEW: Import scheduler functions
+from jobs.scheduler import trigger_job_manually, get_scheduler_status
 
 from redis.asyncio import Redis
 
@@ -65,7 +71,6 @@ async def verify_admin_email(user: User) -> None:
     """Double verification: Firebase claims + email whitelist"""
     admin_emails = settings.admin_emails_list
     
-    # If whitelist is configured, check it
     if admin_emails and user.email.lower() not in admin_emails:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -111,18 +116,9 @@ async def list_users(
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    List users with filters
-    
-    Filters:
-    - plan: Filter by subscription plan
-    - is_blocked: Filter blocked/unblocked users
-    - suspicious: Show only users with fraud flags
-    - search: Search by email or display name
-    """
+    """List users with filters"""
     await verify_admin_email(user)
     
-    # Build query
     query = select(User)
     
     if plan:
@@ -140,22 +136,18 @@ async def list_users(
             )
         )
     
-    # Sorting
     sort_column = getattr(User, sort_by, User.created_at)
     if order == "desc":
         query = query.order_by(sort_column.desc())
     else:
         query = query.order_by(sort_column.asc())
     
-    # Pagination
     offset = (page - 1) * limit
     query = query.offset(offset).limit(limit)
     
-    # Execute
     result = await db.execute(query)
     users = result.scalars().all()
     
-    # Get total count
     count_query = select(func.count(User.id))
     if plan:
         count_query = count_query.where(User.plan == plan)
@@ -165,10 +157,8 @@ async def list_users(
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
     
-    # Format response
     user_list = []
     for u in users:
-        # Get account count on same device
         accounts_on_device = 0
         if u.hardware_id:
             hw_result = await db.execute(
@@ -176,7 +166,6 @@ async def list_users(
             )
             accounts_on_device = hw_result.scalar() or 0
         
-        # Get lifetime value
         ltv = await analytics_service.get_user_lifetime_value(db, u.id)
         
         usage = u.usage_stats or {}
@@ -201,7 +190,6 @@ async def list_users(
             "total_spent_inr": ltv
         })
     
-    # If suspicious filter, get suspicious users
     if suspicious:
         suspicious_users = await analytics_service.get_suspicious_users(db, limit=limit)
         return {
@@ -240,7 +228,6 @@ async def get_user_detail(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Get transactions
     tx_result = await db.execute(
         select(Transaction)
         .where(Transaction.user_id == uid)
@@ -249,7 +236,6 @@ async def get_user_detail(
     )
     transactions = tx_result.scalars().all()
     
-    # Get watchlist
     watchlist_result = await db.execute(
         select(UserWatchlist)
         .where(UserWatchlist.user_id == uid)
@@ -257,11 +243,9 @@ async def get_user_detail(
     )
     watchlist_items = watchlist_result.scalars().all()
     
-    # Calculate activity stats
     usage = target_user.usage_stats or {}
     streak = target_user.streak_data or {}
     
-    # Get accounts on same device
     accounts_on_device = 0
     if target_user.hardware_id:
         hw_result = await db.execute(
@@ -270,7 +254,6 @@ async def get_user_detail(
         )
         accounts_on_device = hw_result.scalar() or 0
     
-    # Build flags
     flags = []
     if accounts_on_device >= 3:
         flags.append("max_devices_reached")
@@ -358,11 +341,9 @@ async def ban_user(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Don't allow banning yourself
     if target_user.id == user.id:
         raise HTTPException(status_code=400, detail="Cannot ban yourself")
     
-    # Toggle ban status
     target_user.is_blocked = True
     target_user.block_reason = ban_request.reason
     target_user.blocked_at = datetime.utcnow()
@@ -441,19 +422,16 @@ async def delete_user(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Don't allow deleting yourself
     if target_user.id == user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     
     email = target_user.email
     
     if hard_delete:
-        # Hard delete - remove from database
         await db.execute(delete(User).where(User.id == uid))
         await db.commit()
         action = "hard_deleted_user"
     else:
-        # Soft delete - just block
         target_user.is_blocked = True
         target_user.block_reason = "Account deleted by admin"
         target_user.blocked_at = datetime.utcnow()
@@ -481,10 +459,9 @@ async def grant_bulk_bonus(
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Grant bonuses to multiple users (for promotions, apologies, etc.)"""
+    """Grant bonuses to multiple users"""
     await verify_admin_email(user)
     
-    # Build query based on target
     query = select(User).where(User.is_blocked == False)
     
     if bonus_request.target == "all_free_users":
@@ -511,7 +488,6 @@ async def grant_bulk_bonus(
     for u in users:
         usage = u.usage_stats or {}
         
-        # Apply bonuses
         if bonuses.get("daily_searches", 0) > 0:
             usage["daily_search_bonus"] = usage.get("daily_search_bonus", 0) + bonuses["daily_searches"]
         
@@ -565,15 +541,7 @@ async def get_revenue_overview(
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Complete revenue dashboard
-    
-    Shows:
-    - Today's revenue breakdown
-    - Monthly totals with MRR
-    - User breakdown by plan
-    - Projections including loan payoff date
-    """
+    """Complete revenue dashboard"""
     await verify_admin_email(user)
     
     overview = await analytics_service.get_revenue_overview(db)
@@ -607,14 +575,12 @@ async def list_transactions(
     
     query = query.order_by(Transaction.created_at.desc())
     
-    # Pagination
     offset = (page - 1) * limit
     query = query.offset(offset).limit(limit)
     
     result = await db.execute(query)
     transactions = result.scalars().all()
     
-    # Get total count
     count_query = select(func.count(Transaction.id))
     if type:
         count_query = count_query.where(Transaction.type == type)
@@ -673,14 +639,14 @@ async def get_plan_breakdown(
                 "active_users": user_breakdown.get("pro", 0),
                 "monthly_revenue": user_breakdown.get("pro", 0) * pro_price,
                 "price_per_user": pro_price,
-                "avg_lifetime_value": pro_price * 6  # Assume 6 months avg
+                "avg_lifetime_value": pro_price * 6
             },
             {
                 "plan": "premium",
                 "active_users": user_breakdown.get("premium", 0),
                 "monthly_revenue": user_breakdown.get("premium", 0) * premium_price,
                 "price_per_user": premium_price,
-                "avg_lifetime_value": premium_price * 12  # Assume 12 months avg
+                "avg_lifetime_value": premium_price * 12
             }
         ],
         "total_mrr": mrr,
@@ -722,11 +688,9 @@ async def create_promotion(
     """Create a new brand promotion campaign"""
     await verify_admin_email(user)
     
-    # Validate dates
     if promo_data.end_date <= promo_data.start_date:
         raise HTTPException(status_code=400, detail="end_date must be after start_date")
     
-    # Create promotion
     promotion = Promotion(
         title=promo_data.title,
         description=promo_data.description,
@@ -826,20 +790,17 @@ async def list_promotions(
     
     query = query.order_by(Promotion.created_at.desc())
     
-    # Pagination
     offset = (page - 1) * limit
     query = query.offset(offset).limit(limit)
     
     result = await db.execute(query)
     promotions = result.scalars().all()
     
-    # Get total
     count_result = await db.execute(select(func.count(Promotion.id)))
     total = count_result.scalar() or 0
     
     promo_list = []
     for p in promotions:
-        # Determine current status
         if not p.is_active:
             promo_status = "paused"
         elif p.end_date < now:
@@ -895,13 +856,11 @@ async def get_promotion_detail(
     now = datetime.utcnow()
     stats = promotion.stats or {}
     
-    # Calculate remaining
     remaining_impressions = (promotion.max_impressions or 999999) - stats.get("impressions", 0)
     remaining_clicks = (promotion.max_clicks or 999999) - stats.get("clicks", 0)
     remaining_days = (promotion.end_date - now).days if promotion.end_date > now else 0
     remaining_budget = (promotion.max_budget_inr or 999999) - stats.get("revenue_earned", 0)
     
-    # Calculate CTR
     impressions = stats.get("impressions", 0)
     clicks = stats.get("clicks", 0)
     ctr = (clicks / impressions * 100) if impressions > 0 else 0
@@ -973,7 +932,6 @@ async def update_promotion(
     if not promotion:
         raise HTTPException(status_code=404, detail="Promotion not found")
     
-    # Update fields
     if update_data.title is not None:
         promotion.title = update_data.title
     if update_data.is_active is not None:
@@ -1044,11 +1002,11 @@ async def delete_promotion(
 @router.get("/promotions/revenue/report", response_model=dict)
 async def get_promotion_revenue_report(
     brand_name: Optional[str] = None,
-    month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$"),  # YYYY-MM
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$"),
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get promotion revenue report (for invoicing brands)"""
+    """Get promotion revenue report"""
     await verify_admin_email(user)
     
     query = select(Promotion)
@@ -1074,7 +1032,6 @@ async def get_promotion_revenue_report(
     result = await db.execute(query)
     promotions = result.scalars().all()
     
-    # Group by brand
     brands = {}
     for p in promotions:
         brand = p.brand_name
@@ -1117,7 +1074,7 @@ async def get_promotion_revenue_report(
 
 
 # =============================================================================
-# SYSTEM MONITORING ENDPOINTS (6)
+# SYSTEM MONITORING ENDPOINTS (6) - ✅ UPDATED WITH WORKING FORCE-SCRAPE
 # =============================================================================
 
 @router.get("/system/health", response_model=dict)
@@ -1142,13 +1099,11 @@ async def get_system_health(
         result = await db.execute(text("SELECT 1"))
         result.scalar()
         
-        # Get connection count (approximate)
         pool_result = await db.execute(text(
             "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
         ))
         conn_count = pool_result.scalar() or 0
         
-        # Get database size
         size_result = await db.execute(text(
             "SELECT pg_size_pretty(pg_database_size(current_database()))"
         ))
@@ -1186,14 +1141,13 @@ async def get_system_health(
         scraper_health = await analytics_service.get_scraper_health(db)
         health["scrapers"] = scraper_health
         
-        # Check if any scraper is failing
         for platform, data in scraper_health.items():
             if data.get("status") == "failing":
                 health["overall"] = "degraded"
     except Exception as e:
         health["scrapers"] = {"error": str(e)}
     
-    # Check Groq quota (from Redis if tracked)
+    # Check Groq quota
     try:
         today = date.today().isoformat()
         quota_key = f"groq:usage:{today}"
@@ -1219,21 +1173,16 @@ async def get_system_stats(
     """Get system-wide statistics"""
     await verify_admin_email(user)
     
-    # Active users
     dau = await analytics_service.get_active_users_count(db, "daily")
     wau = await analytics_service.get_active_users_count(db, "weekly")
     mau = await analytics_service.get_active_users_count(db, "monthly")
     
-    # Product stats
     product_stats = await analytics_service.get_product_stats(db)
     
-    # Searches today
     searches_today = await analytics_service.get_searches_today(db)
     
-    # Affiliate clicks
     affiliate_clicks = await analytics_service.get_affiliate_clicks_today(db)
     
-    # Cache stats from Redis
     cache_hit_rate = 0
     try:
         info = await redis_client.info("stats")
@@ -1273,7 +1222,6 @@ async def get_system_logs(
     await verify_admin_email(user)
     
     if log_date:
-        # Get specific date
         target_date = datetime.strptime(log_date, "%Y-%m-%d").date()
         result = await db.execute(
             select(SystemLog).where(SystemLog.log_date == target_date)
@@ -1293,7 +1241,6 @@ async def get_system_logs(
             }]
         }
     
-    # Get last N days
     since_date = date.today() - timedelta(days=days)
     result = await db.execute(
         select(SystemLog)
@@ -1317,6 +1264,10 @@ async def get_system_logs(
     }
 
 
+# =============================================================================
+# ✅ UPDATED: WORKING FORCE-SCRAPE ENDPOINT
+# =============================================================================
+
 @router.post("/system/force-scrape", response_model=dict)
 async def force_scrape(
     request: Request,
@@ -1324,42 +1275,136 @@ async def force_scrape(
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Manually trigger scraper"""
+    """
+    Manually trigger scraper job
+    
+    ✅ NOW WORKING: Actually triggers APScheduler jobs
+    """
     await verify_admin_email(user)
     
-    # For now, return a placeholder response
-    # Actual implementation will come in Part 9 (Scrapers)
+    # Map platform to job_id
+    job_mapping = {
+        "all": "daily_scrape",
+        "amazon": "daily_scrape",
+        "flipkart": "daily_scrape",
+        "myntra": "daily_scrape",
+        "nykaa": "daily_scrape",
+        "croma": "daily_scrape",
+        "meesho": "daily_scrape",
+        "trending": "daily_scrape_trending",
+    }
+    
+    job_id = job_mapping.get(scrape_request.platform, "daily_scrape_trending")
+    
+    # If category is specified, use seed_products job
+    if scrape_request.category:
+        job_id = "seed_products"
     
     await log_action(
         db, user.email, "triggered_scrape",
         details={
             "platform": scrape_request.platform,
+            "job_id": job_id,
             "async": scrape_request.async_mode,
             "category": scrape_request.category
         },
         request=request
     )
     
-    if scrape_request.async_mode:
-        # Would queue background job
-        import uuid
-        job_id = str(uuid.uuid4())
+    # ✅ Actually trigger the job
+    try:
+        result = await trigger_job_manually(job_id)
+        
+        if result.get("success"):
+            return {
+                "success": True,
+                "job_id": job_id,
+                "status": "completed" if not scrape_request.async_mode else "queued",
+                "message": f"Job '{job_id}' triggered successfully",
+                "result": result.get("result"),
+                "triggered_at": result.get("triggered_at")
+            }
+        else:
+            return {
+                "success": False,
+                "job_id": job_id,
+                "status": "failed",
+                "error": result.get("error"),
+                "message": f"Job '{job_id}' failed to trigger"
+            }
+            
+    except Exception as e:
+        logger.error(f"Force scrape failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to trigger job: {str(e)}"
+        )
+
+
+# =============================================================================
+# ✅ NEW: SCHEDULER STATUS ENDPOINT
+# =============================================================================
+
+@router.get("/system/scheduler", response_model=dict)
+async def get_scheduler_health(
+    user: User = Depends(get_current_admin_user)
+):
+    """
+    Get APScheduler status and all job information
+    
+    ✅ NEW: Exposes scheduler status to admin dashboard
+    """
+    await verify_admin_email(user)
+    
+    try:
+        status = get_scheduler_status()
+        return status
+    except Exception as e:
+        logger.error(f"Failed to get scheduler status: {e}")
+        return {
+            "running": False,
+            "error": str(e),
+            "jobs": []
+        }
+
+
+@router.post("/system/trigger-job", response_model=dict)
+async def trigger_job(
+    request: Request,
+    job_request: TriggerJobRequest,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manually trigger any APScheduler job by ID
+    
+    ✅ NEW: Generic job trigger endpoint
+    """
+    await verify_admin_email(user)
+    
+    await log_action(
+        db, user.email, "triggered_job",
+        details={"job_id": job_request.job_id},
+        request=request
+    )
+    
+    try:
+        result = await trigger_job_manually(job_request.job_id)
         
         return {
-            "job_id": job_id,
-            "status": "queued",
-            "message": f"Scraping job queued for {scrape_request.platform}",
-            "note": "Background job system will be implemented in Part 10"
+            "success": result.get("success", False),
+            "job_id": job_request.job_id,
+            "result": result.get("result"),
+            "error": result.get("error"),
+            "triggered_at": result.get("triggered_at")
         }
-    else:
-        # Synchronous - would wait for completion
-        return {
-            "status": "placeholder",
-            "message": f"Scraper for {scrape_request.platform} would run here",
-            "note": "Scraper implementation coming in Part 9",
-            "products_scraped": 0,
-            "duration_seconds": 0
-        }
+        
+    except Exception as e:
+        logger.error(f"Job trigger failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to trigger job: {str(e)}"
+        )
 
 
 @router.put("/system/config", response_model=dict)
@@ -1373,7 +1418,6 @@ async def update_app_config(
     """Update application configuration"""
     await verify_admin_email(user)
     
-    # Get or create config entry
     result = await db.execute(
         select(AppConfig).where(AppConfig.key == config_update.key)
     )
@@ -1401,7 +1445,6 @@ async def update_app_config(
     
     await db.commit()
     
-    # Invalidate config cache
     await redis_client.delete("app:config")
     
     await log_action(
@@ -1463,7 +1506,6 @@ async def toggle_maintenance_mode(
     """Enable/disable maintenance mode"""
     await verify_admin_email(user)
     
-    # Update maintenance_mode config
     result = await db.execute(
         select(AppConfig).where(AppConfig.key == "maintenance_mode")
     )
@@ -1484,7 +1526,6 @@ async def toggle_maintenance_mode(
         )
         db.add(config)
     
-    # Store maintenance message if enabled
     if maintenance_request.enabled and maintenance_request.message:
         msg_result = await db.execute(
             select(AppConfig).where(AppConfig.key == "maintenance_message")
@@ -1506,7 +1547,6 @@ async def toggle_maintenance_mode(
     
     await db.commit()
     
-    # Invalidate cache
     await redis_client.delete("app:config")
     
     await log_action(

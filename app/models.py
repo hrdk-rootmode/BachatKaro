@@ -268,6 +268,31 @@ class User(Base):
     # Relationships
     transactions = relationship("Transaction", back_populates="user")
     
+    # =============================================================================
+    # METHODS FOR AUTO-CREATION
+    # =============================================================================
+    
+    @classmethod
+    async def create_from_firebase_token(
+        cls,
+        db,
+        token_data: dict
+    ) -> "User":
+        """
+        Class method for auto-creating user from Firebase token
+        
+        Delegates to UserService for actual creation logic
+        
+        Args:
+            db: Database session
+            token_data: Verified Firebase token data
+            
+        Returns:
+            New User instance
+        """
+        from app.services.user import user_service
+        return await user_service.create_from_firebase_token(db, token_data)
+    
     __table_args__ = (
         CheckConstraint("plan IN ('free', 'pro', 'premium')", name='check_valid_plan'),
         Index('idx_users_email', 'email'),

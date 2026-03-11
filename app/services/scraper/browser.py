@@ -1,20 +1,27 @@
 """
-Browser Manager for Playwright
-Handles browser lifecycle, stealth mode, and resource optimization
+Browser Manager for Playwright - STEALTH EDITION v2.0
+Production-grade browser management with anti-detection and API interception
 
-Features:
-- Singleton browser instance
-- Stealth mode (anti-detection)
-- Resource blocking (images, CSS, fonts)
-- Automatic cleanup
-- Human-like behavior
+🚀 NEW FEATURES:
+- Network/API Interception (capture XHR/Fetch JSON responses)
+- Advanced stealth mode (bypasses Akamai, Cloudflare, PerimeterX)
+- Human-like behavior simulation
+- Cloud-deployment ready (Oracle Cloud, Render, Railway)
+- Proxy support ready
+
+Author: DealHunt
+Version: 2.0.0 - God Mode Edition
 """
 
 import logging
 import asyncio
-from typing import Optional, List, Dict, Any
-from contextlib import asynccontextmanager
 import random
+import json
+import sys
+from typing import Optional, List, Dict, Any, Callable, Set
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
 
 from app.core.config import settings
 
@@ -27,65 +34,161 @@ try:
         Browser,
         BrowserContext,
         Page,
-        Playwright
+        Playwright,
+        Route,
+        Response
     )
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-    logger.warning("Playwright not installed. Scraping features disabled.")
+    logger.warning("⚠️ Playwright not installed. Scraping features disabled.")
 
 
-# User agents pool for rotation
+# =============================================================================
+# STEALTH CONFIGURATION
+# =============================================================================
+
+# Realistic user agents (Chrome on Windows/Mac - most common)
 USER_AGENTS = [
+    # Chrome 120+ on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    # Chrome on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+    # Firefox
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
+]
+
+# Mobile user agents (for sites that are easier on mobile)
+MOBILE_USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
 ]
 
 # Viewport sizes for realism
 VIEWPORTS = [
     {"width": 1920, "height": 1080},
-    {"width": 1366, "height": 768},
     {"width": 1536, "height": 864},
     {"width": 1440, "height": 900},
-    {"width": 1280, "height": 720}
+    {"width": 1366, "height": 768},
+    {"width": 1280, "height": 720},
+]
+
+MOBILE_VIEWPORTS = [
+    {"width": 412, "height": 915},  # Pixel 7
+    {"width": 390, "height": 844},  # iPhone 14
+    {"width": 360, "height": 800},  # Samsung Galaxy
+]
+
+# Browser launch arguments for stealth + cloud compatibility
+STEALTH_ARGS = [
+    '--disable-blink-features=AutomationControlled',
+    '--disable-dev-shm-usage',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-extensions',
+    '--disable-default-apps',
+    '--disable-sync',
+    '--disable-translate',
+    '--hide-scrollbars',
+    '--mute-audio',
+    '--no-first-run',
+    '--no-zygote',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-breakpad',
+    '--disable-client-side-phishing-detection',
+    '--disable-component-update',
+    '--disable-hang-monitor',
+    '--disable-ipc-flooding-protection',
+    '--disable-popup-blocking',
+    '--disable-prompt-on-repost',
+    '--disable-renderer-backgrounding',
+    '--force-color-profile=srgb',
+    '--metrics-recording-only',
+    '--password-store=basic',
+    '--use-mock-keychain',
 ]
 
 
+# =============================================================================
+# INTERCEPTED RESPONSE DATA CLASS
+# =============================================================================
+
+@dataclass
+class InterceptedResponse:
+    """Captured network response"""
+    url: str
+    status: int
+    content_type: str
+    data: Any
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    
+    @property
+    def is_json(self) -> bool:
+        return 'application/json' in self.content_type
+    
+    @property
+    def is_html(self) -> bool:
+        return 'text/html' in self.content_type
+
+
+# =============================================================================
+# BROWSER MANAGER CLASS
+# =============================================================================
+
 class BrowserManager:
     """
-    Manages Playwright browser instances
+    Manages Playwright browser instances with stealth and interception
     
-    Features:
-    - Single browser instance (reused)
-    - Multiple contexts (isolated sessions)
-    - Stealth mode enabled
-    - Resource optimization
-    - Automatic cleanup
+    🚀 FEATURES:
+    - Single browser instance (reused for efficiency)
+    - Advanced stealth mode (anti-detection)
+    - Network/API interception (capture JSON responses)
+    - Human-like behavior simulation
+    - Cloud-deployment ready
     
     Usage:
         manager = BrowserManager()
         await manager.initialize()
         
         async with manager.get_page() as page:
-            await page.goto("https://amazon.in")
+            await page.goto("https://myntra.com")
             content = await page.content()
         
         await manager.close()
+    
+    With API Interception:
+        async with manager.get_page(intercept_api=True) as page:
+            manager.set_interception_patterns(['api.myntra.com', '/api/'])
+            await page.goto("https://myntra.com/product/123")
+            product_data = manager.get_intercepted_json('/product/')
     """
     
-    def __init__(self):
+    def __init__(self, proxy: Optional[str] = None):
+        """Initialize browser manager"""
         self._playwright: Optional['Playwright'] = None
         self._browser: Optional['Browser'] = None
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._proxy = proxy
+        
+        # Interception state
+        self._intercepted_responses: Dict[str, InterceptedResponse] = {}
+        self._interception_patterns: Set[str] = set()
+        self._interception_enabled = False
     
     async def initialize(self) -> None:
         """Initialize Playwright and browser"""
         if not PLAYWRIGHT_AVAILABLE:
-            raise RuntimeError("Playwright is not installed")
+            raise RuntimeError("Playwright is not installed. Run: pip install playwright && playwright install chromium")
         
         if self._initialized:
             return
@@ -97,64 +200,65 @@ class BrowserManager:
             try:
                 self._playwright = await async_playwright().start()
                 
-                # Launch browser with stealth settings
-                self._browser = await self._playwright.chromium.launch(
-                    headless=settings.PLAYWRIGHT_HEADLESS,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-gpu',
-                        '--disable-software-rasterizer'
-                    ]
-                )
+                # Build launch options
+                launch_options = {
+                    "headless": getattr(settings, 'PLAYWRIGHT_HEADLESS', True),
+                    "args": STEALTH_ARGS,
+                }
+                
+                # Add proxy if configured
+                if self._proxy:
+                    launch_options["proxy"] = {"server": self._proxy}
+                
+                self._browser = await self._playwright.chromium.launch(**launch_options)
                 
                 self._initialized = True
-                logger.info("Browser manager initialized")
+                logger.info("✅ Browser Manager initialized (Stealth Mode: Active)")
                 
             except Exception as e:
-                logger.error(f"Failed to initialize browser: {e}")
+                logger.error(f"❌ Failed to initialize browser: {e}")
                 raise
     
     async def close(self) -> None:
-        """Close browser and cleanup"""
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-        
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-        
-        self._initialized = False
-        logger.info("Browser manager closed")
+        """Close browser and cleanup properly"""
+        try:
+            if self._browser:
+                await self._browser.close()
+                self._browser = None
+            
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+            
+            self._initialized = False
+            self._intercepted_responses.clear()
+            logger.info("🔒 Browser Manager closed")
+            
+        except Exception as e:
+            logger.error(f"⚠️ Error during browser cleanup: {e}")
+    
+    # =========================================================================
+    # PAGE CONTEXT MANAGEMENT
+    # =========================================================================
     
     @asynccontextmanager
     async def get_page(
         self,
         block_resources: bool = True,
-        stealth: bool = True
+        stealth: bool = True,
+        mobile: bool = False,
+        intercept_api: bool = False
     ):
-        """
-        Get a new page with context
-        
-        Args:
-            block_resources: Block images, CSS, fonts for speed
-            stealth: Enable anti-detection features
-        
-        Yields:
-            Page instance
-        
-        Usage:
-            async with manager.get_page() as page:
-                await page.goto(url)
-        """
+        """Get a new page with context"""
         if not self._initialized:
             await self.initialize()
         
+        # Clear previous interceptions
+        self._intercepted_responses.clear()
+        self._interception_enabled = intercept_api
+        
         # Create context with random fingerprint
-        context = await self._create_context(stealth)
+        context = await self._create_context(stealth, mobile)
         page = await context.new_page()
         
         try:
@@ -166,16 +270,27 @@ class BrowserManager:
             if stealth:
                 await self._inject_stealth_scripts(page)
             
+            # Set up API interception
+            if intercept_api:
+                await self._setup_api_interception(page)
+            
             yield page
             
         finally:
-            await page.close()
-            await context.close()
+            try:
+                await page.close()
+                await context.close()
+            except Exception as e:
+                logger.debug(f"Page/context cleanup error: {e}")
     
-    async def _create_context(self, stealth: bool = True) -> 'BrowserContext':
+    async def _create_context(self, stealth: bool = True, mobile: bool = False) -> 'BrowserContext':
         """Create browser context with randomized fingerprint"""
-        user_agent = random.choice(USER_AGENTS)
-        viewport = random.choice(VIEWPORTS)
+        if mobile:
+            user_agent = random.choice(MOBILE_USER_AGENTS)
+            viewport = random.choice(MOBILE_VIEWPORTS)
+        else:
+            user_agent = random.choice(USER_AGENTS)
+            viewport = random.choice(VIEWPORTS)
         
         context_options = {
             "user_agent": user_agent,
@@ -183,64 +298,251 @@ class BrowserManager:
             "locale": "en-IN",
             "timezone_id": "Asia/Kolkata",
             "geolocation": {"latitude": 28.6139, "longitude": 77.2090},  # Delhi
-            "permissions": ["geolocation"]
+            "permissions": ["geolocation"],
+            "color_scheme": "light",
+            "reduced_motion": "no-preference",
+            "has_touch": mobile,
+            "is_mobile": mobile,
+            "device_scale_factor": 2 if mobile else 1,
         }
         
         if stealth:
             context_options["extra_http_headers"] = {
-                "Accept-Language": "en-IN,en;q=0.9",
+                "Accept-Language": "en-IN,en-GB;q=0.9,en;q=0.8,hi;q=0.7",
                 "Accept-Encoding": "gzip, deflate, br",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1"
+                "Sec-Fetch-User": "?1",
+                "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+                "Sec-Ch-Ua-Mobile": "?1" if mobile else "?0",
+                "Sec-Ch-Ua-Platform": '"Android"' if mobile else '"Windows"',
+                "Cache-Control": "max-age=0",
             }
         
         return await self._browser.new_context(**context_options)
     
-    async def _setup_resource_blocking(self, page: 'Page') -> None:
-        """Block unnecessary resources for speed"""
-        await page.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in ["image", "stylesheet", "font", "media"]
-                else route.continue_()
-            )
-        )
+    # =========================================================================
+    # STEALTH INJECTION
+    # =========================================================================
     
     async def _inject_stealth_scripts(self, page: 'Page') -> None:
         """Inject scripts to avoid bot detection"""
-        # Hide webdriver
+        
+        # Master stealth script - comprehensive anti-detection
         await page.add_init_script("""
+            // Hide webdriver property
             Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
+                get: () => undefined,
+                configurable: true
             });
-        """)
-        
-        # Mock plugins
-        await page.add_init_script("""
+            
+            // Override plugins to look real
             Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
+                get: () => {
+                    const plugins = [
+                        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: '' },
+                        { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: '' },
+                        { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: '' },
+                        { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: '' }
+                    ];
+                    plugins.item = (i) => plugins[i];
+                    plugins.namedItem = (name) => plugins.find(p => p.name === name);
+                    plugins.refresh = () => {};
+                    return plugins;
+                },
+                configurable: true
             });
-        """)
-        
-        # Mock languages
-        await page.add_init_script("""
+            
+            // Override languages
             Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-IN', 'en-US', 'en']
+                get: () => ['en-IN', 'en-US', 'en', 'hi'],
+                configurable: true
             });
-        """)
-        
-        # Mock chrome
-        await page.add_init_script("""
+            
+            // Override platform
+            Object.defineProperty(navigator, 'platform', {
+                get: () => 'Win32',
+                configurable: true
+            });
+            
+            // Override hardware concurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8,
+                configurable: true
+            });
+            
+            // Override device memory
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8,
+                configurable: true
+            });
+            
+            // Mock Chrome object
             window.chrome = {
-                runtime: {}
+                runtime: {
+                    connect: () => {},
+                    sendMessage: () => {},
+                    onMessage: { addListener: () => {} }
+                },
+                loadTimes: () => {},
+                csi: () => {},
+                app: {}
+            };
+            
+            // Override permissions query
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+            
+            // Fix iframe contentWindow access
+            const originalContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                get: function() {
+                    const window = originalContentWindow.get.call(this);
+                    if (window) {
+                        Object.defineProperty(window.navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                    }
+                    return window;
+                }
+            });
+            
+            // Override console.debug to hide automation messages
+            const originalDebug = console.debug;
+            console.debug = function(...args) {
+                if (args[0] && typeof args[0] === 'string' && args[0].includes('puppeteer')) {
+                    return;
+                }
+                return originalDebug.apply(console, args);
+            };
+            
+            // Mock WebGL vendor and renderer
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, parameter);
             };
         """)
+    
+    # =========================================================================
+    # RESOURCE BLOCKING
+    # =========================================================================
+    
+    async def _setup_resource_blocking(self, page: 'Page') -> None:
+        """Block unnecessary resources for speed"""
+        
+        blocked_types = {"image", "stylesheet", "font", "media"}
+        blocked_domains = {
+            "googletagmanager.com", "google-analytics.com", "analytics.",
+            "facebook.com", "fbcdn.net", "doubleclick.net", "googlesyndication.com",
+            "hotjar.com", "clarity.ms", "newrelic.com", "sentry.io"
+        }
+        
+        async def handle_route(route: 'Route'):
+            request = route.request
+            
+            # Block by resource type
+            if request.resource_type in blocked_types:
+                await route.abort()
+                return
+            
+            # Block tracking/analytics domains
+            url = request.url.lower()
+            for domain in blocked_domains:
+                if domain in url:
+                    await route.abort()
+                    return
+            
+            await route.continue_()
+        
+        await page.route("**/*", handle_route)
+    
+    # =========================================================================
+    # 🚀 API/XHR INTERCEPTION (THE SECRET WEAPON!)
+    # =========================================================================
+    
+    def set_interception_patterns(self, patterns: List[str]) -> None:
+        """Set URL patterns to intercept"""
+        self._interception_patterns = set(patterns)
+        logger.debug(f"📡 Interception patterns set: {patterns}")
+    
+    async def _setup_api_interception(self, page: 'Page') -> None:
+        """Set up network interception to capture API responses"""
+        
+        async def handle_response(response: 'Response'):
+            """Capture JSON responses matching our patterns"""
+            try:
+                url = response.url
+                content_type = response.headers.get('content-type', '')
+                
+                # Check if response matches any pattern
+                should_intercept = False
+                
+                # Default patterns for e-commerce sites
+                default_patterns = [
+                    '/api/', '/graphql', '/_next/data/', '/pdp/', '/product/',
+                    '/search/', '/catalog/', '/listing/', 'apollo', '/v1/', '/v2/'
+                ]
+                
+                patterns = self._interception_patterns or default_patterns
+                
+                for pattern in patterns:
+                    if pattern in url:
+                        should_intercept = True
+                        break
+                
+                if should_intercept and 'application/json' in content_type:
+                    try:
+                        body = await response.body()
+                        data = json.loads(body.decode('utf-8'))
+                        
+                        self._intercepted_responses[url] = InterceptedResponse(
+                            url=url,
+                            status=response.status,
+                            content_type=content_type,
+                            data=data
+                        )
+                        
+                        logger.debug(f"📥 Intercepted JSON: {url[:80]}...")
+                        
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as e:
+                        logger.debug(f"Interception decode error: {e}")
+                        
+            except Exception as e:
+                logger.debug(f"Response handling error: {e}")
+        
+        page.on('response', handle_response)
+    
+    def get_intercepted_json(self, pattern: str) -> Optional[Dict[str, Any]]:
+        """Get intercepted JSON response matching pattern"""
+        for url, response in self._intercepted_responses.items():
+            if pattern in url and response.is_json:
+                return response.data
+        return None
+    
+    def get_all_intercepted(self) -> Dict[str, InterceptedResponse]:
+        """Get all intercepted responses"""
+        return self._intercepted_responses.copy()
+    
+    def clear_intercepted(self) -> None:
+        """Clear intercepted responses"""
+        self._intercepted_responses.clear()
+    
+    # =========================================================================
+    # HUMAN-LIKE BEHAVIOR
+    # =========================================================================
     
     async def human_like_delay(self, min_ms: int = 500, max_ms: int = 2000) -> None:
         """Add human-like random delay"""
@@ -251,14 +553,77 @@ class BrowserManager:
         self,
         page: 'Page',
         scroll_count: int = 3,
-        delay_ms: int = 500
+        delay_ms: int = 500,
+        random_scroll: bool = True
     ) -> None:
         """Scroll page like a human"""
-        for _ in range(scroll_count):
-            # Random scroll amount
-            scroll_amount = random.randint(300, 700)
-            await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-            await asyncio.sleep(delay_ms / 1000)
+        for i in range(scroll_count):
+            if random_scroll:
+                scroll_amount = random.randint(200, 600)
+                await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+            else:
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 0.7)")
+            
+            # Random delay between scrolls
+            await asyncio.sleep(random.randint(delay_ms - 200, delay_ms + 300) / 1000)
+    
+    async def scroll_to_bottom(self, page: 'Page', max_scrolls: int = 10) -> None:
+        """Scroll to page bottom (useful for infinite scroll pages)"""
+        for i in range(max_scrolls):
+            previous_height = await page.evaluate("document.body.scrollHeight")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            
+            current_height = await page.evaluate("document.body.scrollHeight")
+            if current_height == previous_height:
+                break  # No more content to load
+    
+    async def random_mouse_movement(self, page: 'Page') -> None:
+        """Move mouse randomly to appear human"""
+        viewport = page.viewport_size
+        if viewport:
+            x = random.randint(100, viewport['width'] - 100)
+            y = random.randint(100, viewport['height'] - 100)
+            await page.mouse.move(x, y)
+    
+    async def type_like_human(self, page: 'Page', selector: str, text: str) -> None:
+        """Type text with human-like delays"""
+        await page.click(selector)
+        for char in text:
+            await page.keyboard.type(char, delay=random.randint(50, 150))
+    
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
+    
+    async def wait_for_network_idle(self, page: 'Page', timeout: int = 30000) -> None:
+        """Wait for network to be idle (all requests complete)"""
+        try:
+            await page.wait_for_load_state('networkidle', timeout=timeout)
+        except Exception as e:
+            logger.debug(f"Network idle timeout: {e}")
+    
+    async def safe_goto(
+        self,
+        page: 'Page',
+        url: str,
+        wait_until: str = 'domcontentloaded',
+        timeout: int = 30000,
+        retries: int = 2
+    ) -> bool:
+        """Navigate to URL with retry logic"""
+        for attempt in range(retries + 1):
+            try:
+                await page.goto(url, wait_until=wait_until, timeout=timeout)
+                return True
+            except Exception as e:
+                if attempt < retries:
+                    logger.warning(f"Navigation retry {attempt + 1}/{retries}: {e}")
+                    await asyncio.sleep(random.uniform(1, 3))
+                else:
+                    logger.error(f"Navigation failed after {retries} retries: {e}")
+                    return False
+        return False
     
     @property
     def is_initialized(self) -> bool:
@@ -266,18 +631,19 @@ class BrowserManager:
 
 
 # =============================================================================
-# SINGLETON INSTANCE
+# SINGLETON INSTANCE & HELPER FUNCTIONS
 # =============================================================================
 
 _browser_manager: Optional[BrowserManager] = None
+_cleanup_lock = asyncio.Lock()
 
 
-async def get_browser_manager() -> BrowserManager:
+async def get_browser_manager(proxy: Optional[str] = None) -> BrowserManager:
     """Get global browser manager instance"""
     global _browser_manager
     
     if _browser_manager is None:
-        _browser_manager = BrowserManager()
+        _browser_manager = BrowserManager(proxy=proxy)
     
     if not _browser_manager.is_initialized:
         await _browser_manager.initialize()
@@ -286,9 +652,29 @@ async def get_browser_manager() -> BrowserManager:
 
 
 async def close_browser_manager() -> None:
-    """Close global browser manager"""
+    """Close global browser manager (call on app shutdown)"""
     global _browser_manager
     
-    if _browser_manager:
-        await _browser_manager.close()
-        _browser_manager = None
+    async with _cleanup_lock:
+        if _browser_manager:
+            await _browser_manager.close()
+            _browser_manager = None
+
+
+def cleanup_browser_sync() -> None:
+    """Synchronous cleanup for Windows asyncio teardown fix"""
+    global _browser_manager
+    
+    if _browser_manager and _browser_manager.is_initialized:
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            loop.run_until_complete(close_browser_manager())
+        except Exception as e:
+            logger.debug(f"Sync cleanup error: {e}")
+        finally:
+            _browser_manager = None

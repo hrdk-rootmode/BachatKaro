@@ -6,7 +6,7 @@ FLOW:
 1. User Search/URL → 2. Cache Check → 3. Scrape/API → 4. AI Enrich → 5. Save DB → 6. Response
 
 Author: DealHunt
-Updated: Full AI Integration + Duplicate Handling + FIXED TRENDING SORT
+Updated: Refactored to use centralized services (DRY)
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -42,7 +42,10 @@ from app.services.scraper.cross_platform_matcher import cross_platform_matcher
 from app.services.scraper.search_queue import get_search_queue
 from app.services.scraper.factory import get_platform_handler
 from app.services.scraper.base import ProductData
-from app.services.ai.groq_client import groq_client
+
+# ✅ NEW: Centralized Services (Replaces duplicate code)
+from app.services.ai.enrichment_service import enrichment_service
+from app.services.product_service import product_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -57,203 +60,6 @@ def calculate_search_cache_key(query: str, filters: dict) -> str:
     filter_str = f"{filters.get('platforms', 'all')}_{filters.get('min_price', 0)}_{filters.get('max_price', 999999)}"
     combined = f"{query.lower().strip()}_{filter_str}"
     return f"search:{hashlib.md5(combined.encode()).hexdigest()}"
-
-
-# =============================================================================
-# AI ENRICHMENT FUNCTIONS (THE KEY ADDITION)
-# =============================================================================
-
-async def _enrich_product_with_ai(product_data: ProductData) -> ProductData:
-    """
-    Enrich product data using AI
-    
-    This modifies product_data in-place, adding:
-    - ai_essence (normalized fingerprint)
-    - ai_tags (searchable keywords)
-    - ai_quality_score (0-100)
-    - category/subcategory
-    - standardized specifications
-    """
-    if product_data.ai_processed:
-        return product_data
-    
-    try:
-        # Call AI for enrichment
-        enriched = await groq_client.process_product(product_data)
-        
-        # Update product with AI data
-        product_data.ai_essence = enriched.get("essence")
-        product_data.ai_tags = enriched.get("tags", [])
-        product_data.ai_quality_score = enriched.get("quality_score", 50)
-        product_data.category = enriched.get("category") or product_data.category
-        product_data.subcategory = enriched.get("subcategory")
-        
-        # Merge specifications
-        if enriched.get("specifications"):
-            product_data.specifications = {
-                **(product_data.specifications or {}),
-                **enriched["specifications"]
-            }
-        
-        product_data.ai_processed = True
-        
-        logger.info(
-            f"AI enriched: {product_data.title[:40]}... → "
-            f"{product_data.ai_essence[:30] if product_data.ai_essence else 'N/A'}"
-        )
-        
-    except Exception as e:
-        logger.error(f"AI enrichment failed (continuing with raw data): {e}")
-        product_data.ai_processed = False
-    
-    return product_data
-
-
-async def save_product_to_database(
-    product_data: ProductData,
-    db: AsyncSession
-) -> Product:
-    """
-    Save scraped AND enriched product to database
-    
-    FIXED: Properly handles duplicate listings
-    """
-    # Use AI fingerprint if available
-    fingerprint = product_data.fingerprint
-    
-    # Check if product exists
-    result = await db.execute(
-        select(Product).where(Product.fingerprint == fingerprint)
-    )
-    existing_product = result.scalar_one_or_none()
-    
-    # Build AI metadata
-    ai_metadata = {
-        "essence": product_data.ai_essence or product_data.title[:100].lower(),
-        "tags": product_data.ai_tags or [],
-        "quality_score": product_data.ai_quality_score or 50,
-        "processed_at": datetime.utcnow().isoformat()
-    }
-    
-    if existing_product:
-        product = existing_product
-        
-        # Update AI metadata if new processing is better
-        old_score = (product.ai_metadata or {}).get("quality_score", 0)
-        if product_data.ai_quality_score and product_data.ai_quality_score > old_score:
-            product.ai_metadata = ai_metadata
-            product.specifications = product_data.specifications or product.specifications
-            product.subcategory = product_data.subcategory or product.subcategory
-        
-        # Increment search count in stats
-        current_stats = product.stats or {}
-        product.stats = {
-            **current_stats,
-            "searches": current_stats.get("searches", 0) + 1,
-            "last_searched": datetime.utcnow().isoformat()
-        }
-    else:
-        # Create new product
-        product = Product(
-            fingerprint=fingerprint,
-            title=product_data.title,
-            brand=product_data.brand,
-            category=product_data.category or "General",
-            subcategory=product_data.subcategory,
-            image_url=product_data.image_url,
-            specifications=product_data.specifications or {},
-            ai_metadata=ai_metadata,
-            stats={
-                "views": 0,
-                "clicks": 0,
-                "watches": 0,
-                "searches": 1,
-                "conversions": 0
-            }
-        )
-        db.add(product)
-        await db.flush()
-    
-    # Get or create platform
-    platform_result = await db.execute(
-        select(PlatformModel).where(PlatformModel.name == product_data.platform_name.lower())
-    )
-    platform = platform_result.scalar_one_or_none()
-    
-    if not platform:
-        platform = PlatformModel(
-            name=product_data.platform_name.lower(),
-            base_url=f"https://www.{product_data.platform_name.lower()}.com",
-            is_active=True,
-            selectors={}
-        )
-        db.add(platform)
-        await db.flush()
-    
-    # =========================================================================
-    # FIX: Check for existing listing BEFORE trying to create
-    # =========================================================================
-    
-    listing_result = await db.execute(
-        select(ProductListing).where(
-            ProductListing.product_id == product.id,
-            ProductListing.platform_id == platform.id
-        )
-    )
-    existing_listing = listing_result.scalar_one_or_none()
-    
-    # ALSO check by external_id to catch duplicates
-    if not existing_listing and product_data.external_id:
-        external_check = await db.execute(
-            select(ProductListing).where(
-                ProductListing.platform_id == platform.id,
-                ProductListing.external_id == product_data.external_id
-            )
-        )
-        existing_listing = external_check.scalar_one_or_none()
-        
-        # If found by external_id but different product_id, update product_id
-        if existing_listing and existing_listing.product_id != product.id:
-            logger.warning(
-                f"Listing {product_data.external_id} exists with different product_id, updating..."
-            )
-            existing_listing.product_id = product.id
-    
-    # Prepare listing data
-    listing_data = {
-        "current_price": float(product_data.current_price),
-        "original_price": float(product_data.original_price) if product_data.original_price else None,
-        "discount_percent": product_data.discount_percent,
-        "rating": product_data.rating,
-        "review_count": product_data.review_count,
-        "in_stock": product_data.in_stock,
-        "last_scraped": datetime.utcnow()
-    }
-    
-    if existing_listing:
-        # UPDATE existing listing
-        for key, value in listing_data.items():
-            setattr(existing_listing, key, value)
-        
-        logger.debug(f"Updated listing: {product_data.external_id}")
-    else:
-        # CREATE new listing
-        listing = ProductListing(
-            product_id=product.id,
-            platform_id=platform.id,
-            external_id=product_data.external_id,
-            product_url=product_data.product_url,
-            affiliate_url=url_detector.get_affiliate_url(product_data.product_url),
-            **listing_data
-        )
-        db.add(listing)
-        
-        logger.debug(f"Created listing: {product_data.external_id}")
-    
-    await db.commit()
-    await db.refresh(product)
-    
-    return product
 
 
 # =============================================================================
@@ -354,7 +160,7 @@ def format_product_response(
 
 
 # =============================================================================
-# URL SEARCH HELPER FUNCTIONS (UPDATED WITH AI ENRICHMENT)
+# URL SEARCH HELPER FUNCTIONS (USES CENTRALIZED SERVICES)
 # =============================================================================
 
 async def scrape_and_match(
@@ -365,11 +171,13 @@ async def scrape_and_match(
     """
     Core function: Scrape → AI Enrich → Save → Find Alternatives
     
-    UPDATED: Now includes AI enrichment step
+    ✅ REFACTORED: Uses centralized enrichment_service and product_service
     """
     source_product = None
     
-    # Step 1: Scrape source product
+    # =========================================================================
+    # STEP 1: Scrape source product
+    # =========================================================================
     if url_analysis.support_level == PlatformSupport.FULL:
         try:
             handler = await get_platform_handler(url_analysis.platform_name, db)
@@ -399,24 +207,25 @@ async def scrape_and_match(
     source_product.product_url = url_detector.get_affiliate_url(source_product.product_url)
     
     # =========================================================================
-    # STEP 2: AI ENRICHMENT (THE KEY STEP)
+    # STEP 2: AI ENRICHMENT (✅ USING CENTRALIZED SERVICE)
     # =========================================================================
-    
-    source_product = await _enrich_product_with_ai(source_product)
+    source_product = await enrichment_service.enrich_product(source_product)
     
     # =========================================================================
-    # STEP 3: SAVE TO DATABASE
+    # STEP 3: SAVE TO DATABASE (✅ USING CENTRALIZED SERVICE)
     # =========================================================================
-    
     try:
-        await save_product_to_database(source_product, db)
+        await product_service.save_product(
+            product_data=source_product,
+            db=db,
+            is_user_search=True  # User-initiated search
+        )
     except Exception as e:
         logger.error(f"Database save failed (continuing): {e}")
     
     # =========================================================================
     # STEP 4: FIND ALTERNATIVES
     # =========================================================================
-    
     try:
         alternatives = await cross_platform_matcher.find_alternatives(
             source_product,
@@ -429,16 +238,20 @@ async def scrape_and_match(
         alternatives = [source_product]
     
     # =========================================================================
-    # STEP 5: SAVE ALTERNATIVES (with AI enrichment)
+    # STEP 5: SAVE ALTERNATIVES (✅ USING CENTRALIZED SERVICES)
     # =========================================================================
-    
     for alt in alternatives:
         if alt.platform_name.lower() != source_product.platform_name.lower():
             try:
                 # Enrich alternatives too
                 if not alt.ai_processed:
-                    alt = await _enrich_product_with_ai(alt)
-                await save_product_to_database(alt, db)
+                    alt = await enrichment_service.enrich_product(alt)
+                
+                await product_service.save_product(
+                    product_data=alt,
+                    db=db,
+                    is_user_search=True
+                )
             except Exception as e:
                 logger.debug(f"Failed to save alternative: {e}")
     
@@ -635,7 +448,7 @@ async def search_by_url(
     """
     Search by product URL - Find same product across ALL platforms
     
-    UPDATED: Now includes AI enrichment for better matching
+    ✅ REFACTORED: Uses centralized services for AI enrichment and DB save
     """
     start_time = time.time()
     url = request.url.strip()
@@ -846,7 +659,7 @@ async def search_by_url(
 
 
 # =============================================================================
-# TRENDING ENDPOINT - FIXED!
+# TRENDING ENDPOINT
 # =============================================================================
 
 @router.get("/trending", response_model=List[TrendingProductResponse])
@@ -859,10 +672,7 @@ async def get_trending_products(
     """
     Get trending products sorted by engagement (views + searches)
     
-    FIXED: Now sorts by stats['views'] + stats['searches'] instead of listing_count
-    This merges:
-    - User searched items (high searches count)
-    - Seeded trending items (high views count from boost)
+    Sorts by stats['views'] + stats['searches'] + stats['seed_score']
     """
     cache_key = "trending:products:top50"
     
@@ -873,14 +683,8 @@ async def get_trending_products(
         logger.info(f"Trending cache HIT | User: {user.id}")
         return cached
     
-    # ==========================================================================
-    # FIXED QUERY: Sort by (views + searches) instead of listing_count
-    # Also fixes N+1 query issue by using a single JOIN with aggregation
-    # ==========================================================================
-    
     try:
         # Build optimized query with proper stats sorting
-        # Using COALESCE to handle NULL stats
         result = await db.execute(
             select(
                 Product,
@@ -910,7 +714,7 @@ async def get_trending_products(
         rows = result.all()
         
     except Exception as e:
-        # Fallback query if JSONB casting fails (older PostgreSQL)
+        # Fallback query if JSONB casting fails
         logger.warning(f"Optimized trending query failed, using fallback: {e}")
         
         result = await db.execute(
@@ -958,15 +762,15 @@ async def get_trending_products(
         ai_metadata = product.ai_metadata or {}
         stats = product.stats or {}
         
-        # Calculate engagement score (for search_count field)
+        # Calculate engagement score
         engagement_score = (
             stats.get("views", 0) +
             stats.get("searches", 0) +
             stats.get("clicks", 0)
         )
         
-        # Determine best platform (simplified - can enhance later)
-        best_platform = "amazon"  # Default, could query for actual best
+        # Determine best platform
+        best_platform = "amazon"
         
         trending.append(TrendingProductResponse(
             product_id=product.id,
@@ -975,7 +779,7 @@ async def get_trending_products(
             best_platform=best_platform,
             discount_percentage=float(best_discount) if best_discount else None,
             image_url=product.image_url,
-            search_count=engagement_score,  # Now represents total engagement
+            search_count=engagement_score,
             rank=rank
         ))
         rank += 1

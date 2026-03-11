@@ -12,9 +12,14 @@ FIXED: Redis connection handling for Windows
 """
 
 import logging
+import sys
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 import json
+
+# Add parent directory to Python path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, Integer, text
@@ -123,7 +128,7 @@ async def get_trending_products(db: AsyncSession) -> List[tuple]:
                 .limit(TOP_PRODUCTS_COUNT)
             )
             
-            result = await db.execute(fallback_query)
+            result = await db.execute(text(str(fallback_query)))
             return list(result.fetchall())
         except Exception as e2:
             logger.error(f"Fallback query also failed: {e2}")
@@ -237,3 +242,30 @@ async def cache_by_category(trending: List[tuple]):
         
     except Exception as e:
         logger.warning(f"Category caching error: {e}")
+
+
+# ============================================================================
+# MAIN EXECUTION (for running directly)
+# ============================================================================
+
+if __name__ == "__main__":
+    import asyncio
+    
+    print("🚀 Starting Load Trending to Redis Job...")
+    print("=" * 60)
+    
+    try:
+        result = asyncio.run(run_load_trending())
+        
+        if result.get("success"):
+            print("\n✅ Job completed successfully!")
+            print(f"📊 Results: {result}")
+        else:
+            print(f"\n❌ Job failed: {result.get('error', 'Unknown error')}")
+            
+    except Exception as e:
+        print(f"\n💥 Critical error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n🏁 Load trending to Redis job finished.")

@@ -324,7 +324,18 @@ class RedisClient:
         except Exception as e:
             logger.error(f"Redis TTL error for key {key}: {str(e)}")
             return -2
-
+    
+    async def info(self) -> dict:
+        """Get Redis server information"""
+        await self._ensure_connected()
+        if self._client is None:
+            return {}
+        
+        try:
+            return await self._client.info()
+        except Exception as e:
+            logger.error(f"Redis INFO error: {str(e)}")
+            return {}
 
 # =============================================================================
 # SINGLETON INSTANCE

@@ -1,6 +1,34 @@
 """
 Authentication & User Management Routes
 Handles signup, profile management, and account deletion
+
+✨ AUTO-USER CREATION (Zero-Friction Authentication):
+The system now supports automatic user creation from Firebase tokens!
+
+FLOW 1 - AUTO-CREATION (Simplest, Recommended):
+  1. User logs in with Firebase in frontend
+  2. Frontend gets JWT token
+  3. Frontend calls any protected API endpoint with token
+  4. If ENABLE_AUTO_USER_CREATION=True:
+     - User is automatically created in database
+     - User can immediately use all features
+  5. No signup endpoint needed!
+
+FLOW 2 - MANUAL SIGNUP (Legacy, Still Supported):
+  1. User logs in with Firebase
+  2. Frontend calls /signup endpoint with user details
+  3. User record created with custom preferences
+  4. User can use app
+
+Configuration:
+  - ENABLE_AUTO_USER_CREATION: bool (default=True)
+  - AUTO_USER_DEFAULT_PLAN: str (default="free")
+  - AUTO_USER_PLAN_EXPIRY_DAYS: int (default=365)
+  - AUTO_USER_DEFAULT_DISPLAY_NAME: str (default="DealHunt User")
+
+To switch flows:
+  - Auto-creation enabled: Just use Firebase auth, no signup needed
+  - Auto-creation disabled: Require manual signup endpoint call
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
@@ -14,6 +42,7 @@ import logging
 
 from app.core.database import get_db
 from app.core.redis_client import RedisClient, get_redis
+from app.core.config import settings
 from app.models import User, AppConfig
 from app.schemas import (
     UserSignupRequest,
@@ -129,6 +158,89 @@ async def process_referral(
 # =============================================================================
 # ROUTES
 # =============================================================================
+@router.post("/signup-public", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def public_signup(
+    request: Request,
+    signup_data: UserSignupRequest,
+    db: AsyncSession = Depends(get_db),
+    redis_client: RedisClient = Depends(get_redis),
+    config: dict = Depends(get_app_config),
+    _check_hardware: None = Depends(check_hardware_id_limit),
+    _check_ip: None = Depends(check_ip_signup_limit)
+):
+    """
+    Public Signup - No authentication required
+    """
+    
+    # Check if user already exists
+    existing_user = await db.execute(
+        select(User).where(
+            or_(
+                User.firebase_uid == signup_data.firebase_uid,
+                User.email == signup_data.email
+            )
+        )
+    )
+    existing = existing_user.scalar_one_or_none()
+    
+    if existing:
+        if existing.firebase_uid == signup_data.firebase_uid:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Account already exists with this Firebase UID"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email already registered"
+            )
+    
+    # Generate unique referral code
+    referral_code = await get_unique_referral_code(db)
+    
+    # Get client IP
+    client_ip = request.client.host
+    
+    # Create new user
+    new_user = User(
+        firebase_uid=signup_data.firebase_uid,
+        email=signup_data.email,
+        display_name=signup_data.display_name,
+        hardware_id=signup_data.hardware_id,
+        fcm_token=signup_data.fcm_token,
+        referral_code=referral_code,
+        plan=UserPlan.FREE,
+        ip_addresses=[client_ip],
+        usage_stats={
+            'total_searches': 0,
+            'searches_this_month': 0,
+            'watchlist_slots_used': 0,
+            'bonus_searches': 0,
+            'signup_ip': client_ip,
+            'signup_date': datetime.utcnow().isoformat()
+        },
+        notification_preferences={
+            'price_drop': True,
+            'back_in_stock': True,
+            'streak_reminder': True,
+            'subscription_expiry': True
+        },
+        last_active=datetime.utcnow()
+    )
+    
+    db.add(new_user)
+    await db.flush()
+    await db.commit()
+    await db.refresh(new_user)
+    
+    # Track signup in Redis
+    signup_date = datetime.utcnow().date().isoformat()
+    await redis_client.increment(f"signups:daily:{signup_date}")
+    
+    logger.info(f"New user signup: {new_user.id} | Email: {new_user.email}")
+    
+    return new_user
+
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def signup(
@@ -142,7 +254,14 @@ async def signup(
     _check_ip: None = Depends(check_ip_signup_limit)
 ):
     """
-    User Signup with Anti-Abuse Protection
+    User Signup with Anti-Abuse Protection (Optional - Use if auto-creation is disabled)
+    
+    ✨ NOTE: If ENABLE_AUTO_USER_CREATION=True, this endpoint is optional!
+    - Users are automatically created on first API call with Firebase token
+    - This endpoint is only needed if:
+      1. Auto-creation is disabled
+      2. You want custom user preferences
+      3. You want to process referral codes at signup time
     
     Security Checks:
     1. Firebase UID validation
@@ -221,7 +340,7 @@ async def signup(
             'streak_reminder': True,
             'subscription_expiry': True
         },
-        last_active_at=datetime.utcnow()
+        last_active=datetime.utcnow()
     )
     
     db.add(new_user)
@@ -238,7 +357,10 @@ async def signup(
     
     # 7. Track signup in Redis (for analytics)
     signup_date = datetime.utcnow().date().isoformat()
-    await redis_client.increment(f"signups:daily:{signup_date}")
+    try:
+        await redis_client.increment(f"signups:daily:{signup_date}")
+    except Exception as e:
+        logger.warning(f"Redis signup tracking failed: {e}")
     
     logger.info(
         f"New user signup: {new_user.id} | Email: {new_user.email} | "
@@ -256,10 +378,23 @@ async def refresh_token(
     """
     Refresh Firebase ID Token
     
-    Updates last_active_at timestamp
-    Returns new token with extended expiry
+    ✨ NOTE: This endpoint validates the current token
+    However, token refresh should happen on FRONTEND with Firebase SDK!
+    
+    Frontend should call:
+      ```javascript
+      const newToken = await user.getIdToken(true); // Force refresh
+      ```
+    
+    Backend Usage:
+      If frontend sends an old/expiring token, backend will reject with 401
+      Frontend then calls user.getIdToken(true) and retries
+    
+    Returns:
+        Token info (this validates token is still valid)
     """
     firebase_uid = token_data.get("uid")
+    email = token_data.get("email")
     
     # Update last active
     result = await db.execute(
@@ -267,16 +402,77 @@ async def refresh_token(
     )
     user = result.scalar_one_or_none()
     
-    if user:
-        user.last_active_at = datetime.utcnow()
+    if user and not user.is_blocked:
+        user.last_active = datetime.utcnow()
         await db.commit()
     
-    # In production, you would call Firebase Admin SDK to create custom token
-    # For now, return the existing token info
+    # Return info
     return {
-        "message": "Token refreshed successfully",
-        "expires_in": 3600,  # 1 hour
-        "uid": firebase_uid
+        "status": "valid",
+        "message": "Token is valid. Token refresh should be done on frontend with Firebase SDK.",
+        "uid": firebase_uid,
+        "email": email,
+        "frontend_action": "Call user.getIdToken(true) to get fresh token"
+    }
+
+
+@router.get("/token-status")
+async def get_token_status(
+    token_data: dict = Depends(verify_firebase_token)
+):
+    """
+    Check Token Status (Frontend Debugging)
+    
+    Returns information about the current token:
+    - Whether it's valid
+    - Associated user info
+    - Whether frontend needs to refresh
+    
+    Frontend Usage:
+      ```javascript
+      const response = await api.get('/auth/token-status');
+      if (response.status === 200) {
+        console.log('Token is still valid');
+      }
+      ```
+    """
+    return {
+        "valid": True,
+        "uid": token_data.get("uid"),
+        "email": token_data.get("email"),
+        "email_verified": token_data.get("email_verified", False),
+        "message": "Token is currently valid. It will expire in ~1 hour."
+    }
+
+
+@router.post("/logout")
+async def logout(
+    user: User = Depends(get_current_user),
+    redis_client: RedisClient = Depends(get_redis)
+):
+    """
+    Logout User
+    
+    Frontend should:
+    1. Call this endpoint with valid token
+    2. Remove token from localStorage
+    3. Redirect to login page
+    
+    Backend:
+    - Clears any cached data
+    - Logs the logout
+    
+    Returns: Logout success message
+    """
+    # Optional: Blacklist token (if you want to prevent reuse)
+    # await redis_client.set(f"logout:{user.id}", "true", ttl=3600)
+    
+    logger.info(f"User logged out: {user.email} (ID: {user.id})")
+    
+    return {
+        "status": "success",
+        "message": "Logged out successfully",
+        "action": "Remove token from frontend and redirect to login"
     }
 
 
@@ -421,7 +617,7 @@ async def delete_account(
     # Soft delete
     user.is_blocked = True
     user.fcm_token = None
-    user.last_active_at = datetime.utcnow()
+    user.last_active = datetime.utcnow()
     
     # Add deletion metadata
     if user.usage_stats is None:

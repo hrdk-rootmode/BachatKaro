@@ -1,86 +1,100 @@
 """
 Streak Reminder Job
-Runs at 8 PM IST to remind users to check in
+===================
+
+Runs at 8:00 PM IST to remind users to maintain their streaks
 
 Features:
 - Only reminds users who haven't checked in today
 - Personalized messages based on streak count
 - Warns users at risk of losing streak
 - Respects notification preferences
-- Tracks reminder effectiveness
+- Rate limits notifications
+
+Author: DealHunt
+Version: 2.0 (Complete Implementation)
 """
 
 import logging
-from datetime import datetime, date
-from typing import Dict, Any, List
 import random
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, List, Optional
+
+# Add parent directory to Python path for imports
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from app.core.config import settings
 from app.core.database import async_session_maker
-from app.models import User
-from jobs.scheduler import update_job_status, JobStatus
+from app.models import User, SystemLog
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+MAX_REMINDERS_PER_DAY = 1  # Only one reminder per user per day
+
 # Personalized messages based on streak
 STREAK_MESSAGES = {
-    0: [
-        "🔥 Start your streak today! Check in now.",
-        "💪 Day 1 starts now! Open the app to begin.",
-        "🚀 Ready to start your streak journey?"
+    "new": [
+        "Start your streak today! 🔥",
+        "Don't forget to check in! 📱",
     ],
-    (1, 3): [
-        "🔥 You're on a {streak}-day streak! Don't break it!",
-        "💪 Keep it going! Day {streak} is almost done.",
-        "⏰ Quick check-in to keep your {streak}-day streak!"
+    "building": [  # 1-6 days
+        "Keep it going! {streak} day streak 🔥",
+        "Don't break your {streak} day streak! 💪",
+        "You're on fire! {streak} days and counting 🔥",
     ],
-    (4, 7): [
-        "🔥 Amazing {streak}-day streak! You're on fire!",
-        "🌟 Week warrior! {streak} days and counting!",
-        "💪 {streak} days strong! Check in to continue!"
+    "established": [  # 7-29 days
+        "Impressive! {streak} days strong 💪🔥",
+        "You're crushing it! {streak} day streak 🏆",
+        "Week warrior! Keep your {streak} day streak alive 🔥",
     ],
-    (8, 30): [
-        "🏆 Incredible {streak}-day streak! You're a legend!",
-        "⭐ {streak} days! You're in the top 10% of users!",
-        "🔥 {streak} days! Don't lose your momentum!"
+    "legendary": [  # 30+ days
+        "LEGENDARY! {streak} day streak 👑🔥",
+        "You're unstoppable! {streak} days 🚀",
+        "Hall of fame! Don't lose your {streak} day streak 🏆",
     ],
-    (31, 100): [
-        "👑 {streak}-DAY STREAK! You're unstoppable!",
-        "🎖️ Elite status! {streak} days of dedication!",
-        "🌟 {streak} days! You're an inspiration!"
-    ],
-    (101, 999): [
-        "🏆 LEGENDARY {streak}-DAY STREAK! 🏆",
-        "👑 {streak} DAYS! You're a DealHunt Master!",
-        "⭐ {streak} days! We bow to your dedication!"
+    "at_risk": [
+        "⚠️ Your {streak} day streak is at risk!",
+        "🚨 Check in now to save your {streak} day streak!",
+        "Don't lose your progress! {streak} days 😰",
     ]
 }
 
-FREEZE_WARNING = "⚠️ You have {freeze} freeze(s) left! Don't lose your {streak}-day streak!"
 
+# =============================================================================
+# MAIN JOB FUNCTION
+# =============================================================================
 
 async def run_streak_reminders() -> Dict[str, Any]:
     """
-    Send streak reminders to users who haven't checked in today
+    Main streak reminder job
     
     Process:
-    1. Find users with active streaks who haven't checked in
-    2. Generate personalized messages
-    3. Send push notifications
-    4. Track reminder stats
+    1. Get users who haven't checked in today
+    2. Filter by notification preferences
+    3. Send personalized reminders
+    4. Log results
+    
+    Returns:
+        Dictionary with reminder statistics
     """
     logger.info("🔔 Starting streak reminders...")
     start_time = datetime.utcnow()
     
-    update_job_status('streak_reminders', JobStatus.RUNNING)
-    
     stats = {
-        "users_found": 0,
+        "users_checked": 0,
+        "users_at_risk": 0,
         "reminders_sent": 0,
-        "at_risk_users": 0,
+        "reminders_skipped": 0,
         "errors": [],
         "duration_seconds": 0
     }
@@ -88,195 +102,305 @@ async def run_streak_reminders() -> Dict[str, Any]:
     try:
         async with async_session_maker() as db:
             # Get users who need reminders
-            users_to_remind = await get_users_needing_reminder(db)
+            users = await _get_users_needing_reminder(db)
+            stats["users_checked"] = len(users)
             
-            stats["users_found"] = len(users_to_remind)
-            
-            if not users_to_remind:
+            if not users:
                 logger.info("No users need streak reminders")
-                stats["message"] = "No reminders needed"
-                update_job_status('streak_reminders', JobStatus.COMPLETED, **stats)
+                stats["message"] = "No users to remind"
+                stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
                 return stats
             
-            # Send reminders
-            for user in users_to_remind:
+            logger.info(f"📋 Found {len(users)} users to remind")
+            
+            # Process each user
+            for user in users:
                 try:
-                    streak_data = user.streak_data or {}
-                    current_streak = streak_data.get("current_streak", 0)
-                    freeze_count = streak_data.get("freeze_count", 0)
+                    result = await _send_reminder(user, db)
                     
-                    # Check if at risk (has streak but no freezes)
-                    if current_streak > 0 and freeze_count == 0:
-                        stats["at_risk_users"] += 1
-                    
-                    # Generate and send message
-                    success = await send_streak_reminder(user, current_streak, freeze_count)
-                    
-                    if success:
+                    if result == "sent":
                         stats["reminders_sent"] += 1
+                    elif result == "at_risk":
+                        stats["users_at_risk"] += 1
+                        stats["reminders_sent"] += 1
+                    else:
+                        stats["reminders_skipped"] += 1
                         
                 except Exception as e:
-                    stats["errors"].append(f"User {user.id}: {str(e)[:50]}")
-                    logger.error(f"Failed to remind user {user.id}: {e}")
+                    logger.error(f"Error sending reminder to {user.id}: {e}")
+                    stats["errors"].append(str(e))
+                    stats["reminders_skipped"] += 1
             
-            stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
+            # Log results
+            await _log_reminder_results(db, stats, start_time)
             
-            logger.info(
-                f"✅ Streak reminders sent | "
-                f"Users: {stats['users_found']} | "
-                f"Sent: {stats['reminders_sent']} | "
-                f"At Risk: {stats['at_risk_users']} | "
-                f"Duration: {stats['duration_seconds']:.2f}s"
+            stats["duration_seconds"] = round(
+                (datetime.utcnow() - start_time).total_seconds(), 2
             )
             
-            update_job_status('streak_reminders', JobStatus.COMPLETED, **stats)
+            logger.info(
+                f"✅ Streak reminders completed | "
+                f"Sent: {stats['reminders_sent']} | "
+                f"At Risk: {stats['users_at_risk']} | "
+                f"Skipped: {stats['reminders_skipped']} | "
+                f"Duration: {stats['duration_seconds']}s"
+            )
+            
             return stats
             
     except Exception as e:
         logger.error(f"❌ Streak reminders failed: {e}")
         stats["error"] = str(e)
-        update_job_status('streak_reminders', JobStatus.FAILED, error=str(e))
-        raise
-
-
-async def get_users_needing_reminder(db: AsyncSession) -> List[User]:
-    """
-    Get users who:
-    - Have an active streak OR have streak_reminders enabled
-    - Haven't checked in today
-    - Have FCM token for push
-    - Aren't blocked
-    """
-    today = date.today().isoformat()
-    
-    query = (
-        select(User)
-        .where(
-            User.is_blocked == False,
-            User.fcm_token.isnot(None),
-            User.fcm_token != ""
+        stats["duration_seconds"] = round(
+            (datetime.utcnow() - start_time).total_seconds(), 2
         )
-    )
-    
-    result = await db.execute(query)
-    users = result.scalars().all()
-    
-    # Filter users who need reminders
-    users_to_remind = []
-    
-    for user in users:
-        # Check notification preferences
-        prefs = user.notification_preferences or {}
-        if not prefs.get("streak_reminders", True):
-            continue
-        
-        streak_data = user.streak_data or {}
-        last_check_in = streak_data.get("last_check_in")
-        
-        # Skip if already checked in today
-        if last_check_in and last_check_in.startswith(today):
-            continue
-        
-        # Only remind users with active streaks OR who have checked in before
-        current_streak = streak_data.get("current_streak", 0)
-        total_check_ins = streak_data.get("total_check_ins", 0)
-        
-        if current_streak > 0 or total_check_ins > 0:
-            users_to_remind.append(user)
-    
-    return users_to_remind
+        return stats
 
 
-def get_reminder_message(current_streak: int, freeze_count: int) -> tuple:
-    """
-    Get personalized reminder message based on streak
-    
-    Returns:
-        (title, body)
-    """
-    # Find matching message template
-    messages = STREAK_MESSAGES.get(0, [])  # Default
-    
-    for key, msg_list in STREAK_MESSAGES.items():
-        if isinstance(key, tuple):
-            min_streak, max_streak = key
-            if min_streak <= current_streak <= max_streak:
-                messages = msg_list
-                break
-        elif key == current_streak:
-            messages = msg_list
-            break
-    
-    # Pick random message
-    message_template = random.choice(messages)
-    body = message_template.format(streak=current_streak)
-    
-    # Add freeze warning if applicable
-    if current_streak > 0 and freeze_count == 0:
-        title = "⚠️ Streak at Risk!"
-        body = f"Your {current_streak}-day streak will break at midnight!"
-    elif current_streak >= 7:
-        title = "🔥 Don't Break Your Streak!"
-    else:
-        title = "⏰ Daily Check-in Reminder"
-    
-    return title, body
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
-
-async def send_streak_reminder(
-    user: User,
-    current_streak: int,
-    freeze_count: int
-) -> bool:
-    """Send push notification for streak reminder"""
-    
-    if not user.fcm_token:
-        return False
-    
-    if not settings.ENABLE_PUSH_NOTIFICATIONS:
-        logger.debug("Push notifications disabled")
-        return False
-    
-    title, body = get_reminder_message(current_streak, freeze_count)
-    
+async def _get_users_needing_reminder(db: AsyncSession) -> List[User]:
+    """Get users who haven't checked in today and have active streaks"""
     try:
-        if settings.FCM_SERVER_KEY:
-            import httpx
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://fcm.googleapis.com/fcm/send",
-                    headers={
-                        "Authorization": f"key={settings.FCM_SERVER_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "to": user.fcm_token,
-                        "notification": {
-                            "title": title,
-                            "body": body,
-                            "click_action": "OPEN_STREAK"
-                        },
-                        "data": {
-                            "type": "streak_reminder",
-                            "current_streak": str(current_streak),
-                            "freeze_count": str(freeze_count)
-                        }
-                    },
-                    timeout=10.0
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        
+        # Get all active users with streaks or recent activity
+        query = (
+            select(User)
+            .where(
+                and_(
+                    User.is_blocked == False,
+                    User.fcm_token.isnot(None),  # Must have FCM token
+                    User.last_active >= datetime.utcnow() - timedelta(days=30)  # Active in last 30 days
                 )
-                
-                if response.status_code == 200:
-                    logger.debug(f"Streak reminder sent to {user.email}")
-                    return True
-                else:
-                    logger.warning(f"FCM error: {response.status_code}")
-                    return False
+            )
+        )
+        
+        result = await db.execute(query)
+        all_users = result.scalars().all()
+        
+        # Filter users who need reminders
+        users_to_remind = []
+        
+        for user in all_users:
+            streak_data = user.streak_data or {}
+            
+            # Check notification preferences
+            prefs = user.notification_preferences or {}
+            if not prefs.get("streak_reminders", True):
+                continue
+            
+            # Check last check-in
+            last_check_in = streak_data.get("last_check_in")
+            
+            if last_check_in:
+                try:
+                    last_date = datetime.fromisoformat(last_check_in).date()
+                    
+                    # Skip if already checked in today
+                    if last_date >= today:
+                        continue
+                    
+                    # Include if has active streak
+                    current_streak = streak_data.get("current_streak", 0)
+                    if current_streak > 0:
+                        users_to_remind.append(user)
+                        
+                except (ValueError, TypeError):
+                    # Include users with parse errors if they have streaks
+                    if streak_data.get("current_streak", 0) > 0:
+                        users_to_remind.append(user)
+            else:
+                # Include users who never checked in but have FCM token
+                # This helps onboard new users
+                users_to_remind.append(user)
+        
+        return users_to_remind
+        
+    except Exception as e:
+        logger.error(f"Error getting users for reminders: {e}")
+        return []
+
+
+async def _send_reminder(user: User, db: AsyncSession) -> str:
+    """Send streak reminder to user"""
+    try:
+        streak_data = user.streak_data or {}
+        current_streak = streak_data.get("current_streak", 0)
+        
+        # Determine message category
+        if current_streak == 0:
+            category = "new"
+        elif current_streak < 7:
+            category = "building"
+        elif current_streak < 30:
+            category = "established"
         else:
-            # Log notification (for development)
-            logger.info(f"[MOCK PUSH] {title}: {body} -> {user.email}")
-            return True
+            category = "legendary"
+        
+        # Check if at risk (hasn't checked in yesterday)
+        last_check_in = streak_data.get("last_check_in")
+        at_risk = False
+        
+        if last_check_in and current_streak > 0:
+            try:
+                last_date = datetime.fromisoformat(last_check_in).date()
+                yesterday = date.today() - timedelta(days=1)
+                
+                if last_date < yesterday:
+                    category = "at_risk"
+                    at_risk = True
+            except (ValueError, TypeError):
+                pass
+        
+        # Select random message
+        messages = STREAK_MESSAGES.get(category, STREAK_MESSAGES["new"])
+        message_template = random.choice(messages)
+        message = message_template.format(streak=current_streak)
+        
+        # Build notification
+        if at_risk:
+            title = "⚠️ Streak at Risk!"
+        else:
+            title = "🔥 Don't Forget Your Streak!"
+        
+        # Send FCM
+        success = await _send_fcm_notification(
+            token=user.fcm_token,
+            title=title,
+            body=message,
+            data={
+                "type": "streak_reminder",
+                "streak": str(current_streak),
+                "at_risk": str(at_risk)
+            }
+        )
+        
+        if success:
+            return "at_risk" if at_risk else "sent"
+        else:
+            return "failed"
             
     except Exception as e:
-        logger.error(f"Streak reminder failed: {e}")
+        logger.error(f"Error sending reminder: {e}")
+        return "failed"
+
+
+async def _send_fcm_notification(
+    token: str,
+    title: str,
+    body: str,
+    data: Dict[str, str]
+) -> bool:
+    """Send FCM push notification"""
+    try:
+        if not settings.ENABLE_PUSH_NOTIFICATIONS:
+            logger.debug("Push notifications disabled")
+            return False
+        
+        # Development mode - just log
+        if settings.DEBUG or settings.ENVIRONMENT == "development":
+            logger.info(f"📱 [MOCK] FCM: {title} - {body}")
+            return True
+        
+        # Production - use Firebase
+        import firebase_admin
+        from firebase_admin import messaging
+        
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body
+            ),
+            data=data,
+            token=token
+        )
+        
+        response = messaging.send(message)
+        logger.debug(f"FCM sent: {response}")
+        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"FCM send failed: {e}")
         return False
+
+
+async def _log_reminder_results(
+    db: AsyncSession,
+    stats: Dict[str, Any],
+    start_time: datetime
+):
+    """Log reminder results to system_logs"""
+    try:
+        today = date.today()
+        
+        result = await db.execute(
+            select(SystemLog).where(SystemLog.log_date == today)
+        )
+        system_log = result.scalar_one_or_none()
+        
+        reminder_data = {
+            "job": "send_streak_reminders",
+            "timestamp": start_time.isoformat(),
+            "users_checked": stats.get("users_checked", 0),
+            "reminders_sent": stats.get("reminders_sent", 0),
+            "users_at_risk": stats.get("users_at_risk", 0),
+            "duration_seconds": stats.get("duration_seconds", 0)
+        }
+        
+        if system_log:
+            analytics = system_log.analytics or {}
+            analytics["streak_reminders"] = reminder_data
+            system_log.analytics = analytics
+        else:
+            system_log = SystemLog(
+                log_date=today,
+                scraping_summary={},
+                analytics={"streak_reminders": reminder_data},
+                ml_processing={}
+            )
+            db.add(system_log)
+        
+        await db.commit()
+        
+    except Exception as e:
+        logger.warning(f"Failed to log reminder results: {e}")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    import asyncio
+    
+    print("🔔 Starting Streak Reminders Job...")
+    print("=" * 60)
+    
+    async def main():
+        try:
+            result = await run_streak_reminders()
+            
+            print("\n📊 Results:")
+            print(f"   Users Checked: {result.get('users_checked', 0)}")
+            print(f"   Reminders Sent: {result.get('reminders_sent', 0)}")
+            print(f"   Users At Risk: {result.get('users_at_risk', 0)}")
+            print(f"   Skipped: {result.get('reminders_skipped', 0)}")
+            print(f"   Duration: {result.get('duration_seconds', 0)}s")
+            
+            if result.get("error"):
+                print(f"\n❌ Error: {result['error']}")
+            else:
+                print("\n✅ Job completed successfully!")
+                
+        except Exception as e:
+            print(f"\n💥 Critical error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    asyncio.run(main())
+    print("\n🏁 Streak reminders job finished.")

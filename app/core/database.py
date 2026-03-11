@@ -47,6 +47,11 @@ async_session_maker = async_sessionmaker(
 Base = declarative_base()
 
 # =============================================================================
+# LEGACY DB EXPORT (for script compatibility)
+# =============================================================================
+db = engine  # Export engine as 'db' for backward compatibility
+
+# =============================================================================
 # DEPENDENCY INJECTION
 # =============================================================================
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

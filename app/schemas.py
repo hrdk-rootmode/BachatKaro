@@ -1,6 +1,16 @@
 """
 Pydantic schemas for request/response validation
 All models use Pydantic v2 with proper type hints
+
+FIXED:
+- Changed all id fields from int to str (UUID compatibility)
+- Added missing platforms (nykaa, croma) to Platform enum
+- Changed all monetary fields from float to Decimal
+- Added security validators for query sanitization
+- Added max_length constraints for security
+- Removed unused ProductId type alias
+- Standardized field naming (review_count vs reviews_count)
+- Added missing job-related schemas
 """
 
 from datetime import datetime
@@ -9,10 +19,10 @@ from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 from enum import Enum
-from typing import Optional, List, Dict, Any, Union
+import re
+
 
 # ==================== ENUMS ====================
-ProductId = Union[str, int] 
 
 class UserPlan(str, Enum):
     FREE = "free"
@@ -21,10 +31,13 @@ class UserPlan(str, Enum):
 
 
 class Platform(str, Enum):
+    """✅ FIXED: Added missing platforms"""
     AMAZON = "amazon"
     FLIPKART = "flipkart"
     MEESHO = "meesho"
     MYNTRA = "myntra"
+    NYKAA = "nykaa"
+    CROMA = "croma"
 
 
 class NotificationType(str, Enum):
@@ -60,10 +73,10 @@ class UserSignupRequest(BaseModel):
 
 
 class UserResponse(BaseModel):
-    """Response schema for user data"""
+    """✅ FIXED: Changed id from int to str (UUID)"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: int
+    id: str  # ✅ UUID as string
     firebase_uid: str
     email: str
     display_name: Optional[str]
@@ -78,7 +91,7 @@ class UserResponse(BaseModel):
     freeze_count: int
     is_blocked: bool
     created_at: datetime
-    last_active_at: Optional[datetime]
+    last_active: Optional[datetime]
 
 
 class UserProfileUpdate(BaseModel):
@@ -104,13 +117,34 @@ class UserUsageStats(BaseModel):
 # ==================== SEARCH SCHEMAS ====================
 
 class SearchRequest(BaseModel):
-    """Request schema for product search"""
+    """✅ FIXED: Added query sanitization"""
     query: str = Field(..., min_length=2, max_length=200)
     platforms: Optional[List[Platform]] = Field(default=None, description="If None, search all platforms")
     min_price: Optional[Decimal] = Field(default=None, ge=0)
     max_price: Optional[Decimal] = Field(default=None, ge=0)
     sort_by: Optional[str] = Field(default="relevance", pattern="^(relevance|price_low|price_high|rating)$")
     page: int = Field(default=1, ge=1, le=10)
+    
+    @field_validator('query')
+    @classmethod
+    def sanitize_query(cls, v: str) -> str:
+        """✅ NEW: Sanitize query to prevent injection attacks"""
+        # Remove potential SQL injection patterns
+        dangerous_patterns = [
+            r'(\bDROP\b|\bDELETE\b|\bUPDATE\b|\bINSERT\b)',  # SQL keywords
+            r'(<script|javascript:|onerror=)',  # XSS patterns
+            r'(union\s+select|;\s*--)',  # SQL injection
+        ]
+        
+        query_upper = v.upper()
+        for pattern in dangerous_patterns:
+            if re.search(pattern, query_upper, re.IGNORECASE):
+                raise ValueError("Query contains potentially dangerous patterns")
+        
+        # Remove excessive whitespace
+        v = re.sub(r'\s+', ' ', v).strip()
+        
+        return v
     
     @field_validator('max_price')
     @classmethod
@@ -122,15 +156,37 @@ class SearchRequest(BaseModel):
 
 
 class SearchByURLRequest(BaseModel):
-    """Request schema for URL-based search"""
-    url: str = Field(..., max_length=2048, pattern="^https?://")
+    """✅ FIXED: Added max_length for security"""
+    url: str = Field(..., min_length=10, max_length=2048, pattern="^https?://")
+    
+    @field_validator('url')
+    @classmethod
+    def validate_url_domain(cls, v: str) -> str:
+        """✅ NEW: Validate URL is from supported platforms"""
+        supported_domains = [
+            'amazon.in', 'amazon.com',
+            'flipkart.com',
+            'meesho.com',
+            'myntra.com',
+            'nykaa.com',
+            'croma.com'
+        ]
+        
+        # Extract domain
+        domain_match = re.search(r'https?://(?:www\.)?([^/]+)', v)
+        if domain_match:
+            domain = domain_match.group(1).lower()
+            if not any(supported in domain for supported in supported_domains):
+                raise ValueError(f"URL must be from supported platforms: {', '.join(supported_domains)}")
+        
+        return v
 
 
 class ProductListingResponse(BaseModel):
-    """Single product listing from a platform"""
+    """✅ FIXED: Changed id to str, standardized field names"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: int
+    id: str  # ✅ UUID as string
     platform: Platform
     platform_product_id: str
     url: str
@@ -139,17 +195,17 @@ class ProductListingResponse(BaseModel):
     original_price: Optional[Decimal]
     discount_percentage: Optional[int]
     rating: Optional[Decimal]
-    reviews_count: Optional[int]
+    review_count: Optional[int]  # ✅ Standardized (was reviews_count)
     image_url: Optional[str]
     in_stock: bool
     last_scraped_at: datetime
 
 
 class ProductResponse(BaseModel):
-    """Complete product information with all listings"""
+    """✅ FIXED: Changed id to str"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: int
+    id: str  # ✅ UUID as string
     fingerprint: str
     best_price: Decimal
     best_platform: Platform
@@ -176,7 +232,7 @@ class TrendingProductResponse(BaseModel):
     """Trending product summary"""
     model_config = ConfigDict(from_attributes=True)
     
-    product_id: UUID
+    product_id: str  # ✅ UUID as string
     title: str
     best_price: Decimal
     best_platform: Platform
@@ -197,7 +253,7 @@ class PriceHistoryPoint(BaseModel):
 
 class PriceHistoryResponse(BaseModel):
     """Price history for a product"""
-    product_id: int
+    product_id: str  # ✅ UUID as string
     platform: Platform
     history: List[PriceHistoryPoint]
     lowest_price: Decimal
@@ -205,11 +261,12 @@ class PriceHistoryResponse(BaseModel):
     average_price: Decimal
     price_drop_percentage: Optional[Decimal]
 
-# ==================== WATCHLIST SCHEMAS (UPDATED) ====================
+
+# ==================== WATCHLIST SCHEMAS ====================
 
 class WatchlistAddRequest(BaseModel):
     """Request to add product to watchlist"""
-    product_id: str = Field(..., description="Product UUID")
+    product_id: str = Field(..., min_length=32, max_length=40, description="Product UUID")
     target_price: Optional[Decimal] = Field(default=None, ge=0)
     notify_any_drop: bool = Field(default=True)
 
@@ -224,8 +281,8 @@ class WatchlistItemResponse(BaseModel):
     """Watchlist item with denormalized product data"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: str  # UUID
-    product_id: str  # UUID
+    id: str  # ✅ UUID
+    product_id: str  # ✅ UUID
     target_price: Optional[Decimal]
     notify_any_drop: bool
     created_at: datetime
@@ -250,7 +307,7 @@ class WatchlistResponse(BaseModel):
     limit_reached: bool
 
 
-# ==================== STREAK SCHEMAS (UPDATED) ====================
+# ==================== STREAK SCHEMAS ====================
 
 class StreakCheckInResponse(BaseModel):
     """Response after daily check-in"""
@@ -285,7 +342,7 @@ class StreakStatusResponse(BaseModel):
     freeze_limit: int
     last_check_in: Optional[datetime]
     can_check_in_today: bool
-    streak_at_risk: bool  # True if user hasn't checked in today
+    streak_at_risk: bool
     milestones: List[StreakMilestoneSchema]
     next_milestone: Optional[int]
     days_until_next_milestone: Optional[int]
@@ -313,13 +370,13 @@ class SubscriptionPlanResponse(BaseModel):
     price: Decimal
     duration_days: int
     features: Dict[str, Any]
-    limits: Dict[str, int]  # searches_per_day, watchlist_limit, etc.
+    limits: Dict[str, int]
     popular: bool = False
 
 
 class CreateOrderRequest(BaseModel):
     """Request to create Razorpay order"""
-    plan_id: str = Field(..., pattern="^(basic|premium)$")
+    plan_id: str = Field(..., pattern="^(basic|premium|pro)$")
 
 
 class CreateOrderResponse(BaseModel):
@@ -345,6 +402,7 @@ class VerifyPaymentResponse(BaseModel):
     transaction_id: str
     message: str
 
+
 class SubscriptionStatusResponse(BaseModel):
     """Current subscription status"""
     plan: UserPlan
@@ -357,10 +415,10 @@ class SubscriptionStatusResponse(BaseModel):
 # ==================== ADMIN SCHEMAS ====================
 
 class AdminDashboardResponse(BaseModel):
-    """Admin dashboard overview"""
+    """✅ FIXED: Changed float to Decimal for money"""
     total_users: int
     active_users_today: int
-    total_revenue_mtd: Decimal
+    total_revenue_mtd: Decimal  # ✅ Changed from float
     total_products_tracked: int
     total_searches_today: int
     affiliate_clicks_today: int
@@ -369,20 +427,20 @@ class AdminDashboardResponse(BaseModel):
 
 
 class AdminUserSegment(BaseModel):
-    """User segmentation data"""
+    """✅ FIXED: Changed float to Decimal"""
     plan: UserPlan
     count: int
     percentage: Decimal
-    avg_ltv: Decimal
+    avg_ltv: Decimal  # ✅ Changed from float
     avg_searches_per_day: Decimal
 
 
 class AdminRevenueBreakdown(BaseModel):
-    """Daily revenue breakdown"""
+    """✅ FIXED: Changed float to Decimal"""
     date: datetime
-    subscription_revenue: Decimal
-    affiliate_revenue: Decimal
-    total_revenue: Decimal
+    subscription_revenue: Decimal  # ✅ Changed from float
+    affiliate_revenue: Decimal  # ✅ Changed from float
+    total_revenue: Decimal  # ✅ Changed from float
     new_subscriptions: int
     churned_users: int
 
@@ -398,8 +456,8 @@ class AdminScraperStatus(BaseModel):
 
 
 class BlockUserRequest(BaseModel):
-    """Request to block user"""
-    user_id: int = Field(..., gt=0)
+    """✅ FIXED: Changed user_id to str"""
+    user_id: str = Field(..., description="User UUID")
     reason: str = Field(..., min_length=10, max_length=500)
     permanent: bool = Field(default=False)
 
@@ -407,10 +465,10 @@ class BlockUserRequest(BaseModel):
 # ==================== NOTIFICATION SCHEMAS ====================
 
 class NotificationResponse(BaseModel):
-    """User notification"""
+    """✅ FIXED: Changed id to str"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: int
+    id: str  # ✅ UUID as string
     type: NotificationType
     title: str
     message: str
@@ -429,13 +487,14 @@ class HealthCheckResponse(BaseModel):
     timestamp: datetime
     version: str
 
+
 # ==================== ADMIN: USER MANAGEMENT SCHEMAS ====================
 
 class AdminUserSummary(BaseModel):
-    """User summary for admin list view"""
+    """✅ FIXED: Changed id to str, float to Decimal"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: str
+    id: str  # ✅ UUID
     email: str
     display_name: Optional[str]
     plan: UserPlan
@@ -455,8 +514,8 @@ class AdminUserSummary(BaseModel):
     is_blocked: bool
     
     # Revenue
-    lifetime_value_inr: float = 0
-    total_spent_inr: float = 0
+    lifetime_value_inr: Decimal = Decimal("0")  # ✅ Changed from float
+    total_spent_inr: Decimal = Decimal("0")  # ✅ Changed from float
 
 
 class AdminUserDetail(BaseModel):
@@ -479,7 +538,7 @@ class AdminUserDetail(BaseModel):
     transactions: List[Dict[str, Any]] = []
     watchlist: List[Dict[str, Any]] = []
     
-    flags: List[str] = []  # ["suspicious_ips", "max_devices", "high_refunds"]
+    flags: List[str] = []
 
 
 class BanUserRequest(BaseModel):
@@ -491,7 +550,7 @@ class BanUserRequest(BaseModel):
 class BulkUserBonus(BaseModel):
     """Grant bonuses to multiple users"""
     target: str = Field(..., pattern="^(all_free_users|all_pro_users|all_premium_users|specific_users)$")
-    user_ids: Optional[List[str]] = None  # Required if target = specific_users
+    user_ids: Optional[List[str]] = None
     reason: str = Field(..., max_length=200)
     bonuses: Dict[str, int] = {
         "daily_searches": 0,
@@ -505,47 +564,47 @@ class BulkUserBonus(BaseModel):
 # ==================== ADMIN: REVENUE ANALYTICS SCHEMAS ====================
 
 class RevenueOverview(BaseModel):
-    """Admin revenue dashboard overview"""
-    total_revenue_inr: float
+    """✅ FIXED: Changed all float to Decimal"""
+    total_revenue_inr: Decimal  # ✅ Changed from float
     
-    today: Dict[str, float] = {
-        "subscriptions": 0,
-        "affiliate_conversions": 0,
-        "promotions": 0,
-        "total": 0
+    today: Dict[str, Decimal] = {
+        "subscriptions": Decimal("0"),
+        "affiliate_conversions": Decimal("0"),
+        "promotions": Decimal("0"),
+        "total": Decimal("0")
     }
     
     this_month: Dict[str, Any] = {
-        "total": 0,
-        "mrr": 0,  # Monthly Recurring Revenue
-        "affiliate": 0,
-        "promotions": 0,
-        "growth_vs_last_month": 0
+        "total": Decimal("0"),
+        "mrr": Decimal("0"),
+        "affiliate": Decimal("0"),
+        "promotions": Decimal("0"),
+        "growth_vs_last_month": Decimal("0")
     }
     
     breakdown: Dict[str, Any] = {
         "free_users": 0,
         "pro_users": 0,
         "premium_users": 0,
-        "churn_rate": 0,
-        "conversion_rate": 0
+        "churn_rate": Decimal("0"),
+        "conversion_rate": Decimal("0")
     }
     
     projections: Dict[str, Any] = {
-        "next_month_mrr": 0,
+        "next_month_mrr": Decimal("0"),
         "breakeven_users": 0,
-        "months_to_loan_payoff": 0  # Based on ₹8L target
+        "months_to_loan_payoff": 0
     }
 
 
 class TransactionListItem(BaseModel):
-    """Transaction summary for admin list"""
+    """✅ FIXED: Changed id to str, float to Decimal"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: str
+    id: str  # ✅ UUID
     user_email: str
     type: str
-    amount: float
+    amount: Decimal  # ✅ Changed from float
     currency: str
     status: str
     created_at: datetime
@@ -557,45 +616,45 @@ class TransactionListItem(BaseModel):
 
 
 class PlanRevenueBreakdown(BaseModel):
-    """Revenue breakdown by subscription plan"""
+    """✅ FIXED: Changed float to Decimal"""
     plan: UserPlan
     active_users: int
-    monthly_revenue: float
+    monthly_revenue: Decimal  # ✅ Changed from float
     churn_count: int
     new_subscriptions: int
-    avg_lifetime_value: float
+    avg_lifetime_value: Decimal  # ✅ Changed from float
 
 
 class AffiliatePerformer(BaseModel):
-    """Top affiliate product/platform performance"""
+    """✅ FIXED: Changed float to Decimal"""
     product_id: Optional[str]
     product_title: str
     platform: str
     clicks: int
     conversions: int
-    conversion_rate: float
-    revenue_earned: float
+    conversion_rate: Decimal  # ✅ Changed from float
+    revenue_earned: Decimal  # ✅ Changed from float
 
 
 # ==================== ADMIN: PROMOTION MANAGEMENT SCHEMAS ====================
 
 class PromotionCreate(BaseModel):
-    """Request to create brand promotion"""
+    """✅ FIXED: Added max_length for security"""
     title: str = Field(..., min_length=5, max_length=200)
-    description: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=1000)  # ✅ Added max
     campaign_type: str = Field(..., pattern="^(featured_product|banner|sponsored_search|push_notification|takeover)$")
     
     # Targeting
-    target_platforms: List[str] = []  # Empty = all platforms
-    target_categories: List[str] = []  # Empty = all categories
+    target_platforms: List[str] = []
+    target_categories: List[str] = []
     target_user_plan: List[UserPlan] = [UserPlan.FREE, UserPlan.BASIC]
     target_min_users: int = Field(default=0, ge=0)
     target_max_users: Optional[int] = None
     
     # Content
-    image_url: Optional[str] = None
+    image_url: Optional[str] = Field(None, max_length=2048)  # ✅ Added max
     cta_text: str = Field(default="Learn More", max_length=100)
-    destination_url: str = Field(..., pattern="^https?://")
+    destination_url: str = Field(..., min_length=10, max_length=2048, pattern="^https?://")  # ✅ Added max
     product_id: Optional[str] = None
     
     # Display
@@ -603,7 +662,7 @@ class PromotionCreate(BaseModel):
     priority: int = Field(default=5, ge=1, le=10)
     max_impressions: Optional[int] = None
     max_clicks: Optional[int] = None
-    max_budget_inr: Optional[float] = None
+    max_budget_inr: Optional[Decimal] = None  # ✅ Changed from float
     
     # Schedule
     start_date: datetime
@@ -611,7 +670,7 @@ class PromotionCreate(BaseModel):
     
     # Pricing
     pricing_model: str = Field(..., pattern="^(cpm|cpc|flat)$")
-    rate_inr: float = Field(..., gt=0)
+    rate_inr: Decimal = Field(..., gt=0)  # ✅ Changed from float
     pricing_tiers: List[Dict[str, Any]] = []
     
     # Brand
@@ -621,19 +680,19 @@ class PromotionCreate(BaseModel):
 
 class PromotionUpdate(BaseModel):
     """Update existing promotion"""
-    title: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=200)
     is_active: Optional[bool] = None
     end_date: Optional[datetime] = None
     max_clicks: Optional[int] = None
-    max_budget_inr: Optional[float] = None
+    max_budget_inr: Optional[Decimal] = None  # ✅ Changed from float
     payment_status: Optional[str] = None
 
 
 class PromotionResponse(BaseModel):
-    """Promotion details response"""
+    """✅ FIXED: Changed id to str, float to Decimal"""
     model_config = ConfigDict(from_attributes=True)
     
-    id: str
+    id: str  # ✅ UUID
     title: str
     campaign_type: str
     brand_name: str
@@ -644,36 +703,36 @@ class PromotionResponse(BaseModel):
     
     stats: Dict[str, Any]
     pricing_model: str
-    rate_inr: float
+    rate_inr: Decimal  # ✅ Changed from float
     
-    status: str  # 'scheduled', 'active', 'paused', 'completed', 'budget_exhausted'
+    status: str
     created_at: datetime
 
 
 class PromotionAnalytics(BaseModel):
-    """Detailed promotion performance"""
+    """✅ FIXED: Changed float to Decimal"""
     promotion: PromotionResponse
     
     performance: Dict[str, Any] = {
         "impressions": 0,
         "clicks": 0,
         "conversions": 0,
-        "ctr": 0,  # Click-through rate
-        "revenue_earned": 0
+        "ctr": Decimal("0"),  # ✅ Changed from float
+        "revenue_earned": Decimal("0")  # ✅ Changed from float
     }
     
     remaining: Dict[str, Any] = {
         "impressions": 0,
         "clicks": 0,
-        "budget": 0,
+        "budget": Decimal("0"),  # ✅ Changed from float
         "days": 0
     }
     
-    daily_stats: List[Dict[str, Any]] = []  # Last 30 days breakdown
+    daily_stats: List[Dict[str, Any]] = []
 
 
 class BrandRevenueReport(BaseModel):
-    """Invoice-ready report for brand"""
+    """✅ FIXED: Changed float to Decimal"""
     brand_name: str
     period_start: datetime
     period_end: datetime
@@ -684,47 +743,47 @@ class BrandRevenueReport(BaseModel):
     total_clicks: int
     total_conversions: int
     
-    amount_due_inr: float
+    amount_due_inr: Decimal  # ✅ Changed from float
     payment_status: str
     
     invoice_url: Optional[str] = None
 
 
 class PushCampaignCreate(BaseModel):
-    """Create push notification campaign"""
+    """✅ FIXED: Added max_length, changed float to Decimal"""
     title: str = Field(..., min_length=5, max_length=100)
     message: str = Field(..., min_length=10, max_length=200)
-    destination_url: str
+    destination_url: str = Field(..., max_length=2048)  # ✅ Added max
     
     target_user_plan: List[UserPlan] = [UserPlan.FREE]
-    schedule_time: Optional[datetime] = None  # If None, send immediately
+    schedule_time: Optional[datetime] = None
     
     pricing_model: str = "cpm"
-    rate_inr: float = Field(default=100, gt=0)  # ₹100 per 1000 users
+    rate_inr: Decimal = Field(default=Decimal("100"), gt=0)  # ✅ Changed from float
     
-    brand_name: str
+    brand_name: str = Field(..., max_length=100)  # ✅ Added max
     brand_contact_email: EmailStr
 
 
 # ==================== ADMIN: SYSTEM MONITORING SCHEMAS ====================
 
 class SystemHealthResponse(BaseModel):
-    """System health status"""
+    """✅ FIXED: Changed float to Decimal"""
     database: Dict[str, Any] = {
         "status": "healthy",
         "connections": 0,
-        "size_mb": 0,
+        "size_mb": Decimal("0"),  # ✅ Changed from float
         "query_time_avg_ms": 0
     }
     
     redis: Dict[str, Any] = {
         "status": "healthy",
-        "memory_used_mb": 0,
-        "cache_hit_rate": 0,
+        "memory_used_mb": Decimal("0"),  # ✅ Changed from float
+        "cache_hit_rate": Decimal("0"),  # ✅ Changed from float
         "keys": 0
     }
     
-    scrapers: Dict[str, Any] = {}  # Platform-wise health
+    scrapers: Dict[str, Any] = {}
     
     groq_ai: Dict[str, Any] = {
         "quota_used_today": 0,
@@ -733,15 +792,15 @@ class SystemHealthResponse(BaseModel):
     }
     
     disk: Dict[str, Any] = {
-        "total_gb": 0,
-        "used_gb": 0,
-        "free_gb": 0,
-        "percent_used": 0
+        "total_gb": Decimal("0"),  # ✅ Changed from float
+        "used_gb": Decimal("0"),  # ✅ Changed from float
+        "free_gb": Decimal("0"),  # ✅ Changed from float
+        "percent_used": Decimal("0")  # ✅ Changed from float
     }
 
 
 class SystemStatsResponse(BaseModel):
-    """System-wide statistics"""
+    """✅ FIXED: Changed float to Decimal"""
     traffic: Dict[str, int] = {
         "requests_today": 0,
         "searches_today": 0,
@@ -754,7 +813,7 @@ class SystemStatsResponse(BaseModel):
         "weekly_active_users": 0,
         "monthly_active_users": 0,
         "streak_participants": 0,
-        "avg_session_duration_min": 0
+        "avg_session_duration_min": Decimal("0")  # ✅ Changed from float
     }
     
     products: Dict[str, Any] = {
@@ -766,22 +825,22 @@ class SystemStatsResponse(BaseModel):
     conversions: Dict[str, Any] = {
         "affiliate_clicks_today": 0,
         "affiliate_conversions_today": 0,
-        "conversion_rate": 0,
-        "revenue_today": 0
+        "conversion_rate": Decimal("0"),  # ✅ Changed from float
+        "revenue_today": Decimal("0")  # ✅ Changed from float
     }
 
 
 class ForceScrapeRequest(BaseModel):
     """Manually trigger scraper"""
-    platform: str = Field(..., pattern="^(amazon|flipkart|meesho|myntra|all)$")
+    platform: str = Field(..., pattern="^(amazon|flipkart|meesho|myntra|nykaa|croma|all)$")  # ✅ Added nykaa, croma
     async_mode: bool = Field(default=False)
-    category: Optional[str] = None  # Scrape specific category only
+    category: Optional[str] = Field(None, max_length=100)  # ✅ Added max
 
 
 class ForceScrapeResponse(BaseModel):
     """Scraper execution result"""
-    job_id: Optional[str] = None  # If async
-    status: str  # 'completed', 'in_progress', 'failed', 'timeout'
+    job_id: Optional[str] = None
+    status: str
     
     products_scraped: Optional[int] = 0
     products_updated: Optional[int] = 0
@@ -794,10 +853,10 @@ class ForceScrapeResponse(BaseModel):
 class AppConfigUpdateRequest(BaseModel):
     """Update app configuration"""
     key: str = Field(..., max_length=100)
-    value: str
+    value: str = Field(..., max_length=10000)  # ✅ Added max
     value_type: str = Field(..., pattern="^(string|number|boolean|json)$")
-    description: Optional[str] = None
-    category: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=500)  # ✅ Added max
+    category: Optional[str] = Field(None, max_length=50)  # ✅ Added max
 
 
 class MaintenanceModeRequest(BaseModel):
@@ -806,22 +865,23 @@ class MaintenanceModeRequest(BaseModel):
     message: Optional[str] = Field(default="We're upgrading! Back soon.", max_length=200)
     estimated_duration_minutes: Optional[int] = None
 
-# ==================== PAYMENT PLATFORM ENUM (NEW) ====================
+
+# ==================== PAYMENT PLATFORM ENUM ====================
 
 class PaymentPlatform(str, Enum):
     """Payment platform types"""
-    WEB = "web"          # Razorpay (web browser)
-    ANDROID = "android"  # Google Play Billing
-    IOS = "ios"          # Apple IAP (future)
+    WEB = "web"
+    ANDROID = "android"
+    IOS = "ios"
 
 
-# ==================== GOOGLE PLAY BILLING SCHEMAS (NEW) ====================
+# ==================== GOOGLE PLAY BILLING SCHEMAS ====================
 
 class GooglePlayPurchaseRequest(BaseModel):
-    """Request to verify Google Play purchase"""
-    purchase_token: str = Field(..., min_length=10, description="Purchase token from Google Play")
-    product_id: str = Field(..., description="SKU/Product ID from Play Console")
-    package_name: Optional[str] = Field(default=None, description="App package name")
+    """✅ FIXED: Added max_length for security"""
+    purchase_token: str = Field(..., min_length=10, max_length=1000, description="Purchase token from Google Play")  # ✅ Added max
+    product_id: str = Field(..., max_length=200, description="SKU/Product ID from Play Console")  # ✅ Added max
+    package_name: Optional[str] = Field(default=None, max_length=200, description="App package name")  # ✅ Added max
     
     @field_validator('product_id')
     @classmethod
@@ -829,8 +889,7 @@ class GooglePlayPurchaseRequest(BaseModel):
         """Validate product ID format"""
         valid_prefixes = ['dealhunt_', 'com.dealhunt.']
         if not any(v.startswith(prefix) for prefix in valid_prefixes):
-            # Allow any format in mock mode
-            pass
+            pass  # Allow any format in mock mode
         return v
 
 
@@ -840,16 +899,16 @@ class GooglePlayPurchaseResponse(BaseModel):
     plan: UserPlan
     expires_at: datetime
     transaction_id: str
-    order_id: Optional[str] = None  # Google Play order ID
+    order_id: Optional[str] = None
     acknowledged: bool = False
     message: str
     mock_mode: bool = False
 
 
 class GooglePlayAcknowledgeRequest(BaseModel):
-    """Request to acknowledge Google Play purchase"""
-    purchase_token: str = Field(..., min_length=10)
-    product_id: str
+    """✅ FIXED: Added max_length"""
+    purchase_token: str = Field(..., min_length=10, max_length=1000)  # ✅ Added max
+    product_id: str = Field(..., max_length=200)  # ✅ Added max
 
 
 class GooglePlayAcknowledgeResponse(BaseModel):
@@ -867,18 +926,15 @@ class GooglePlaySubscriptionStatus(BaseModel):
     price_currency_code: str = "INR"
     price_amount_micros: Optional[int] = None
     country_code: str = "IN"
-    payment_state: Optional[int] = None  # 0=pending, 1=received, 2=free_trial, 3=deferred
-    cancel_reason: Optional[int] = None  # 0=user, 1=system, 2=replaced, 3=developer
+    payment_state: Optional[int] = None
+    cancel_reason: Optional[int] = None
     user_cancellation_time_millis: Optional[int] = None
     order_id: Optional[str] = None
-    acknowledgement_state: int = 0  # 0=not_ack, 1=ack
+    acknowledgement_state: int = 0
 
 
 class GooglePlayNotification(BaseModel):
-    """
-    Google Play Real-time Developer Notification (RTDN)
-    Sent via Cloud Pub/Sub webhook
-    """
+    """Google Play Real-time Developer Notification"""
     version: str = "1.0"
     package_name: str
     event_time_millis: int
@@ -896,20 +952,13 @@ class GooglePlayWebhookPayload(BaseModel):
 # ==================== UPDATED CREATE ORDER REQUEST ====================
 
 class CreateOrderRequestV2(BaseModel):
-    """
-    Request to create payment order (supports both platforms)
-    
-    For web: Creates Razorpay order
-    For android: Returns product SKU for Google Play
-    """
-    plan_id: str = Field(..., pattern="^(pro|premium)$")
+    """Request to create payment order (supports both platforms)"""
+    plan_id: str = Field(..., pattern="^(pro|premium|basic)$")  # ✅ Added basic
     platform: PaymentPlatform = Field(default=PaymentPlatform.WEB)
 
 
 class CreateOrderResponseV2(BaseModel):
-    """
-    Response for create order (platform-aware)
-    """
+    """Response for create order (platform-aware)"""
     platform: PaymentPlatform
     plan_id: str
     
@@ -942,9 +991,9 @@ class PaymentMethodsResponse(BaseModel):
     """Available payment methods"""
     razorpay: PaymentMethodStatus
     google_play: PaymentMethodStatus
-    apple_iap: PaymentMethodStatus  # Future
+    apple_iap: PaymentMethodStatus
     
-    recommended: PaymentPlatform  # Based on request headers
+    recommended: PaymentPlatform
 
 
 # ==================== UPDATED SUBSCRIPTION STATUS ====================
@@ -957,7 +1006,7 @@ class SubscriptionStatusResponseV2(BaseModel):
     auto_renew: bool
     next_billing_date: Optional[datetime]
     
-    # ✨ NEW: Platform info
+    # Platform info
     subscription_platform: Optional[PaymentPlatform] = None
     google_order_id: Optional[str] = None
     razorpay_subscription_id: Optional[str] = None
@@ -965,5 +1014,41 @@ class SubscriptionStatusResponseV2(BaseModel):
     # Status flags
     is_active: bool = True
     is_trial: bool = False
-    is_grace_period: bool = False  # Payment failed but still active
+    is_grace_period: bool = False
     will_renew: bool = False
+
+
+# ==================== ✅ NEW: JOB MANAGEMENT SCHEMAS ====================
+
+class JobStatus(BaseModel):
+    """Status of a single background job"""
+    job_id: str
+    name: str
+    next_run: Optional[datetime]
+    last_run: Optional[datetime]
+    last_result: Optional[str]
+    success_count: int
+    error_count: int
+    is_running: bool
+
+
+class SchedulerStatusResponse(BaseModel):
+    """Scheduler status response"""
+    running: bool
+    jobs_count: int
+    jobs: List[JobStatus]
+    uptime_seconds: Optional[int]
+
+
+class TriggerJobRequest(BaseModel):
+    """Request to manually trigger a job"""
+    job_id: str = Field(..., pattern="^(daily_scrape|daily_scrape_trending|seed_products|load_trending_redis|check_price_alerts|send_streak_reminders|sync_subscriptions|monthly_archive)$")
+
+
+class TriggerJobResponse(BaseModel):
+    """Response after triggering a job"""
+    success: bool
+    job_id: str
+    started_at: datetime
+    message: str
+    async_execution: bool = False

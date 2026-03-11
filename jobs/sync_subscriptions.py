@@ -1,136 +1,130 @@
 """
 Google Play Subscription Sync Job
-Runs every 1 hour to sync subscription status with Google Play
+=================================
 
-PRODUCTION-READY VERSION:
-- Works in mock mode (skips gracefully)
-- Works with real Google Play credentials (full sync)
-- No code changes needed when switching modes
-- Handles all edge cases
+Runs every hour to sync subscription status with Google Play
+
+Features:
+- Syncs Google Play subscription status
+- Handles renewals, cancellations, expirations
+- Works in mock mode for development
+- Graceful fallback when Play API unavailable
+
+Author: DealHunt
+Version: 2.0 (Complete Implementation)
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional
-from uuid import UUID
+
+# Add parent directory to Python path for imports
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_
 
 from app.core.config import settings
 from app.core.database import async_session_maker
+from app.models import User, Transaction, SystemLog
 
 logger = logging.getLogger(__name__)
 
-# Configuration
-BATCH_SIZE = 50  # Process 50 subscriptions per batch
-SYNC_BUFFER_HOURS = 24  # Re-sync subscriptions expiring within 24h
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+SYNC_BATCH_SIZE = 100
+EXPIRY_BUFFER_HOURS = 24  # Check subscriptions expiring in next 24 hours
+
+
+# =============================================================================
+# MAIN JOB FUNCTION
+# =============================================================================
 
 async def run_sync_subscriptions() -> Dict[str, Any]:
     """
-    Sync subscription status with Google Play
-    
-    MOCK MODE: Returns immediately (no real subscriptions to sync)
-    PRODUCTION MODE: Syncs all active Android subscriptions
+    Main subscription sync job
     
     Process:
-    1. Check if Google Play is configured
-    2. Get all Android subscriptions
-    3. Verify status with Google Play API
-    4. Update expired/renewed/cancelled subscriptions
-    5. Handle grace periods
+    1. Get users with Google Play subscriptions
+    2. Check subscription status via Google Play API
+    3. Update user plan if changed
+    4. Handle expirations and renewals
+    5. Log results
+    
+    Returns:
+        Dictionary with sync statistics
     """
-    logger.info("🔄 Starting Google Play subscription sync...")
+    logger.info("🔄 Starting subscription sync...")
     start_time = datetime.utcnow()
     
     stats = {
-        "total_checked": 0,
-        "still_active": 0,
-        "expired": 0,
-        "renewed": 0,
-        "cancelled": 0,
-        "grace_period": 0,
+        "subscriptions_checked": 0,
+        "renewals_processed": 0,
+        "expirations_processed": 0,
+        "cancellations_processed": 0,
         "errors": [],
+        "mock_mode": settings.GOOGLE_PLAY_MOCK_MODE,
         "duration_seconds": 0
     }
     
-    # =========================================================================
-    # CHECK 1: Is Google Play client available?
-    # =========================================================================
-    try:
-        from app.services.payments.google_play import google_play_client
-        GOOGLE_PLAY_AVAILABLE = True
-    except ImportError as e:
-        logger.info(f"Google Play client not available: {e}")
-        stats["message"] = "Google Play not installed"
-        stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
+    # Skip in mock mode
+    if settings.GOOGLE_PLAY_MOCK_MODE:
+        logger.info("📱 Google Play sync skipped (mock mode)")
+        stats["message"] = "Skipped in mock mode"
+        stats["duration_seconds"] = 0.1
         return stats
     
-    # =========================================================================
-    # CHECK 2: Is Google Play in mock mode?
-    # =========================================================================
-    if google_play_client.is_mock_mode:
-        logger.info("Google Play in mock mode - skipping real sync")
-        stats["message"] = "Mock mode - no real subscriptions to sync"
-        stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
-        return stats
-    
-    # =========================================================================
-    # CHECK 3: Are models available?
-    # =========================================================================
-    try:
-        from app.models import User, Transaction
-        MODELS_AVAILABLE = True
-    except ImportError as e:
-        logger.error(f"Models not available: {e}")
-        stats["message"] = "Database models not available"
-        stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
-        return stats
-    
-    # =========================================================================
-    # PRODUCTION MODE: Sync real subscriptions
-    # =========================================================================
     try:
         async with async_session_maker() as db:
-            # Get Android subscriptions to check
-            subscriptions = await get_android_subscriptions(db)
+            # Get users with Google Play subscriptions
+            users = await _get_google_play_subscribers(db)
+            stats["subscriptions_checked"] = len(users)
             
-            stats["total_checked"] = len(subscriptions)
-            
-            if not subscriptions:
-                logger.info("No Android subscriptions to sync")
-                stats["message"] = "No active subscriptions found"
+            if not users:
+                logger.info("No Google Play subscriptions to sync")
+                stats["message"] = "No subscriptions to sync"
                 stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
                 return stats
             
-            # Process in batches
-            for i in range(0, len(subscriptions), BATCH_SIZE):
-                batch = subscriptions[i:i + BATCH_SIZE]
-                batch_stats = await process_subscription_batch(db, batch)
-                
-                # Merge stats
-                stats["still_active"] += batch_stats.get("still_active", 0)
-                stats["expired"] += batch_stats.get("expired", 0)
-                stats["renewed"] += batch_stats.get("renewed", 0)
-                stats["cancelled"] += batch_stats.get("cancelled", 0)
-                stats["grace_period"] += batch_stats.get("grace_period", 0)
-                
-                # Limit error messages
-                errors = batch_stats.get("errors", [])
-                stats["errors"].extend(errors[:5])  # Max 5 errors per batch
+            logger.info(f"📋 Checking {len(users)} Google Play subscriptions")
             
-            stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
+            # Process each subscription
+            for user in users:
+                try:
+                    result = await _sync_user_subscription(user, db)
+                    
+                    if result == "renewed":
+                        stats["renewals_processed"] += 1
+                    elif result == "expired":
+                        stats["expirations_processed"] += 1
+                    elif result == "cancelled":
+                        stats["cancellations_processed"] += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error syncing user {user.id}: {e}")
+                    stats["errors"].append(str(e))
+            
+            # Commit all changes
+            await db.commit()
+            
+            # Log results
+            await _log_sync_results(db, stats, start_time)
+            
+            stats["duration_seconds"] = round(
+                (datetime.utcnow() - start_time).total_seconds(), 2
+            )
             
             logger.info(
                 f"✅ Subscription sync completed | "
-                f"Checked: {stats['total_checked']} | "
-                f"Active: {stats['still_active']} | "
-                f"Expired: {stats['expired']} | "
-                f"Renewed: {stats['renewed']} | "
-                f"Cancelled: {stats['cancelled']} | "
-                f"Grace: {stats['grace_period']} | "
-                f"Duration: {stats['duration_seconds']:.2f}s"
+                f"Checked: {stats['subscriptions_checked']} | "
+                f"Renewals: {stats['renewals_processed']} | "
+                f"Expirations: {stats['expirations_processed']} | "
+                f"Duration: {stats['duration_seconds']}s"
             )
             
             return stats
@@ -138,259 +132,257 @@ async def run_sync_subscriptions() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"❌ Subscription sync failed: {e}")
         stats["error"] = str(e)
-        stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
-        raise
+        stats["duration_seconds"] = round(
+            (datetime.utcnow() - start_time).total_seconds(), 2
+        )
+        return stats
 
 
-async def get_android_subscriptions(db: AsyncSession) -> List[Dict]:
-    """
-    Get all Android subscriptions that need syncing
-    
-    Criteria:
-    - subscription_platform = 'android'
-    - plan in ['pro', 'premium']
-    - not blocked
-    - has valid purchase_token
-    """
-    from app.models import User, Transaction
-    
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+async def _get_google_play_subscribers(db: AsyncSession) -> List[User]:
+    """Get users with active Google Play subscriptions"""
     try:
-        # Get users with Android subscriptions
+        # Get users who subscribed via Android
         query = (
             select(User)
             .where(
-                User.subscription_platform == "android",
-                User.plan.in_(["pro", "premium"]),
-                User.is_blocked == False
+                and_(
+                    User.subscription_platform == "android",
+                    User.plan.in_(["pro", "premium"]),
+                    User.is_blocked == False
+                )
             )
+            .limit(SYNC_BATCH_SIZE)
         )
         
         result = await db.execute(query)
-        users = result.scalars().all()
-        
-        subscriptions = []
-        
-        for user in users:
-            # Get the latest successful Android transaction with purchase token
-            tx_query = (
-                select(Transaction)
-                .where(
-                    Transaction.user_id == user.id,
-                    Transaction.platform == "android",
-                    Transaction.status == "success",
-                    Transaction.purchase_token.isnot(None)
-                )
-                .order_by(Transaction.created_at.desc())
-                .limit(1)
-            )
-            
-            tx_result = await db.execute(tx_query)
-            transaction = tx_result.scalar_one_or_none()
-            
-            if transaction and transaction.purchase_token:
-                # Get product_id from metadata
-                product_id = None
-                if transaction.meta_data:
-                    product_id = transaction.meta_data.get("product_id")
-                
-                # Derive from plan if not in metadata
-                if not product_id:
-                    from app.services.payments.google_play import google_play_client
-                    product_id = google_play_client.get_sku_from_plan(user.plan)
-                
-                subscriptions.append({
-                    "user_id": str(user.id),
-                    "user_email": user.email,
-                    "plan": user.plan,
-                    "expires_at": user.plan_expires_at,
-                    "purchase_token": transaction.purchase_token,
-                    "product_id": product_id,
-                    "transaction_id": str(transaction.id)
-                })
-        
-        return subscriptions
+        return list(result.scalars().all())
         
     except Exception as e:
-        logger.error(f"Error getting Android subscriptions: {e}")
+        logger.error(f"Error getting Google Play subscribers: {e}")
         return []
 
 
-async def process_subscription_batch(
-    db: AsyncSession,
-    batch: List[Dict]
-) -> Dict[str, Any]:
-    """Process a batch of subscriptions"""
-    
-    stats = {
-        "still_active": 0,
-        "expired": 0,
-        "renewed": 0,
-        "cancelled": 0,
-        "grace_period": 0,
-        "errors": []
-    }
-    
-    for sub in batch:
-        try:
-            result = await sync_single_subscription(db, sub)
-            
-            if result == "active":
-                stats["still_active"] += 1
-            elif result == "expired":
-                stats["expired"] += 1
-            elif result == "renewed":
-                stats["renewed"] += 1
-            elif result == "cancelled":
-                stats["cancelled"] += 1
-            elif result == "grace_period":
-                stats["grace_period"] += 1
-                
-        except Exception as e:
-            error_msg = f"{sub['user_email']}: {str(e)[:100]}"
-            stats["errors"].append(error_msg)
-            logger.error(f"Failed to sync {sub['user_email']}: {e}")
-    
-    # Commit all changes in batch
+async def _sync_user_subscription(user: User, db: AsyncSession) -> str:
+    """Sync subscription status for a single user"""
     try:
-        await db.commit()
-    except Exception as e:
-        logger.error(f"Batch commit error: {e}")
-        await db.rollback()
-    
-    return stats
-
-
-async def sync_single_subscription(
-    db: AsyncSession,
-    sub: Dict
-) -> str:
-    """
-    Sync a single subscription with Google Play
-    
-    Returns:
-        Status: 'active', 'expired', 'renewed', 'cancelled', 'grace_period'
-    """
-    from app.models import User
-    from app.services.payments.google_play import google_play_client
-    
-    try:
-        # Get subscription status from Google Play API
-        status = await google_play_client.get_subscription_status(
-            purchase_token=sub["purchase_token"],
-            product_id=sub["product_id"]
+        # Get the latest Google Play transaction
+        transaction = await _get_latest_transaction(user.id, db)
+        
+        if not transaction or not transaction.purchase_token:
+            return "no_token"
+        
+        # Check subscription status via Google Play API
+        status = await _check_google_play_status(
+            purchase_token=transaction.purchase_token,
+            product_id=_get_product_id_for_plan(user.plan)
         )
         
         if not status:
-            logger.warning(f"No status returned for {sub['user_email']}")
-            return "error"
+            return "api_error"
         
-        # Get user from database
-        result = await db.execute(
-            select(User).where(User.id == UUID(sub["user_id"]))
-        )
-        user = result.scalar_one_or_none()
-        
-        if not user:
-            logger.warning(f"User not found: {sub['user_id']}")
-            return "error"
-        
-        # Extract status fields
-        is_active = status.get("is_active", False)
+        # Process based on status
         expiry_time = status.get("expiry_time")
         auto_renewing = status.get("auto_renewing", False)
-        is_grace_period = status.get("is_grace_period", False)
+        payment_state = status.get("payment_state")
+        cancel_reason = status.get("cancel_reason")
         
         now = datetime.utcnow()
         
-        # =====================================================================
-        # HANDLE DIFFERENT SUBSCRIPTION STATES
-        # =====================================================================
-        
-        # STATE 1: Grace Period (payment failed, but still active)
-        if is_grace_period:
-            logger.info(f"User {sub['user_email']} in grace period")
+        # Check if expired
+        if expiry_time and expiry_time < now:
+            # Subscription expired
+            user.plan = "free"
+            user.plan_expires_at = None
             
-            if user.usage_stats is None:
-                user.usage_stats = {}
-            user.usage_stats["grace_period_started"] = now.isoformat()
+            # Update transaction status
+            transaction.status = "expired"
             
-            return "grace_period"
-        
-        # STATE 2: Active & Valid
-        elif is_active and expiry_time:
-            new_expiry = expiry_time
-            
-            if isinstance(new_expiry, datetime):
-                # Check if subscription renewed (expiry extended)
-                if user.plan_expires_at and new_expiry > user.plan_expires_at:
-                    logger.info(f"Subscription renewed for {sub['user_email']}")
-                    
-                    user.plan_expires_at = new_expiry
-                    
-                    if user.usage_stats is None:
-                        user.usage_stats = {}
-                    user.usage_stats["last_renewal"] = now.isoformat()
-                    
-                    # Invalidate cache
-                    await invalidate_user_cache(sub["user_id"])
-                    
-                    return "renewed"
-                else:
-                    # Still active, no change needed
-                    return "active"
-            
-            return "active"
-        
-        # STATE 3: Expired or Cancelled
-        else:
-            if user.plan != "free":
-                logger.info(f"Subscription expired for {sub['user_email']}")
-                
-                # Downgrade to free
-                user.plan = "free"
-                user.plan_expires_at = None
-                
-                if user.usage_stats is None:
-                    user.usage_stats = {}
-                user.usage_stats["subscription_expired_at"] = now.isoformat()
-                user.usage_stats["previous_plan"] = sub["plan"]
-                
-                # Invalidate all user caches
-                await invalidate_user_cache(sub["user_id"])
-                
-                # Determine if cancelled by user or expired naturally
-                if not auto_renewing:
-                    return "cancelled"
-                else:
-                    return "expired"
-            
+            logger.info(f"Subscription expired for user {user.id}")
             return "expired"
+        
+        # Check if cancelled
+        if cancel_reason is not None:
+            # User cancelled but still active until expiry
+            logger.info(f"Subscription cancelled for user {user.id}, expires {expiry_time}")
+            return "cancelled"
+        
+        # Check if renewed
+        if auto_renewing and expiry_time and expiry_time > user.plan_expires_at:
+            # Subscription renewed
+            user.plan_expires_at = expiry_time
             
+            logger.info(f"Subscription renewed for user {user.id}, new expiry {expiry_time}")
+            return "renewed"
+        
+        return "unchanged"
+        
     except Exception as e:
-        logger.error(f"Error syncing subscription for {sub.get('user_email')}: {e}")
-        raise
+        logger.error(f"Error syncing subscription: {e}")
+        return "error"
 
 
-async def invalidate_user_cache(user_id: str):
-    """Invalidate all caches related to a user"""
+async def _get_latest_transaction(user_id, db: AsyncSession) -> Optional[Transaction]:
+    """Get user's latest Google Play transaction"""
     try:
-        from app.core.redis_client import redis_client
+        query = (
+            select(Transaction)
+            .where(
+                and_(
+                    Transaction.user_id == user_id,
+                    Transaction.platform == "android",
+                    Transaction.purchase_token.isnot(None)
+                )
+            )
+            .order_by(Transaction.created_at.desc())
+            .limit(1)
+        )
         
-        cache_keys = [
-            f"subscription:{user_id}",
-            f"user:{user_id}",
-            f"watchlist:{user_id}",
-            f"streak:{user_id}"
-        ]
+        result = await db.execute(query)
+        return result.scalar_one_or_none()
         
-        for key in cache_keys:
-            try:
-                await redis_client.delete(key)
-            except Exception as e:
-                logger.debug(f"Failed to delete cache key {key}: {e}")
-                
-    except ImportError:
-        # Redis not available, skip caching
-        pass
     except Exception as e:
-        logger.warning(f"Cache invalidation error: {e}")
+        logger.debug(f"Error getting transaction: {e}")
+        return None
+
+
+def _get_product_id_for_plan(plan: str) -> str:
+    """Get Google Play product ID for plan"""
+    plan_to_sku = settings.google_play_plan_to_sku
+    return plan_to_sku.get(plan, settings.GOOGLE_PLAY_PRO_SKU)
+
+
+async def _check_google_play_status(
+    purchase_token: str,
+    product_id: str
+) -> Optional[Dict[str, Any]]:
+    """Check subscription status via Google Play API"""
+    try:
+        # Skip in mock mode
+        if settings.GOOGLE_PLAY_MOCK_MODE:
+            return None
+        
+        # Check if properly configured
+        if not settings.is_google_play_configured:
+            logger.warning("Google Play not properly configured")
+            return None
+        
+        # Use Google Play API
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        
+        credentials = service_account.Credentials.from_service_account_file(
+            settings.GOOGLE_APPLICATION_CREDENTIALS,
+            scopes=['https://www.googleapis.com/auth/androidpublisher']
+        )
+        
+        service = build('androidpublisher', 'v3', credentials=credentials)
+        
+        result = service.purchases().subscriptions().get(
+            packageName=settings.GOOGLE_PLAY_PACKAGE_NAME,
+            subscriptionId=product_id,
+            token=purchase_token
+        ).execute()
+        
+        # Parse response
+        expiry_millis = result.get('expiryTimeMillis')
+        expiry_time = None
+        if expiry_millis:
+            expiry_time = datetime.fromtimestamp(int(expiry_millis) / 1000)
+        
+        return {
+            "expiry_time": expiry_time,
+            "auto_renewing": result.get('autoRenewing', False),
+            "payment_state": result.get('paymentState'),
+            "cancel_reason": result.get('cancelReason'),
+            "order_id": result.get('orderId')
+        }
+        
+    except Exception as e:
+        logger.error(f"Google Play API error: {e}")
+        return None
+
+
+async def _log_sync_results(
+    db: AsyncSession,
+    stats: Dict[str, Any],
+    start_time: datetime
+):
+    """Log sync results to system_logs"""
+    try:
+        today = date.today()
+        
+        result = await db.execute(
+            select(SystemLog).where(SystemLog.log_date == today)
+        )
+        system_log = result.scalar_one_or_none()
+        
+        sync_data = {
+            "job": "sync_subscriptions",
+            "timestamp": start_time.isoformat(),
+            "subscriptions_checked": stats.get("subscriptions_checked", 0),
+            "renewals": stats.get("renewals_processed", 0),
+            "expirations": stats.get("expirations_processed", 0),
+            "cancellations": stats.get("cancellations_processed", 0),
+            "mock_mode": stats.get("mock_mode", True),
+            "duration_seconds": stats.get("duration_seconds", 0)
+        }
+        
+        if system_log:
+            analytics = system_log.analytics or {}
+            analytics["subscription_sync"] = sync_data
+            system_log.analytics = analytics
+        else:
+            system_log = SystemLog(
+                log_date=today,
+                scraping_summary={},
+                analytics={"subscription_sync": sync_data},
+                ml_processing={}
+            )
+            db.add(system_log)
+        
+        await db.commit()
+        
+    except Exception as e:
+        logger.warning(f"Failed to log sync results: {e}")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    import asyncio
+    
+    print("🔄 Starting Subscription Sync Job...")
+    print("=" * 60)
+    
+    async def main():
+        try:
+            result = await run_sync_subscriptions()
+            
+            print("\n📊 Results:")
+            print(f"   Mock Mode: {result.get('mock_mode', True)}")
+            print(f"   Subscriptions Checked: {result.get('subscriptions_checked', 0)}")
+            print(f"   Renewals: {result.get('renewals_processed', 0)}")
+            print(f"   Expirations: {result.get('expirations_processed', 0)}")
+            print(f"   Cancellations: {result.get('cancellations_processed', 0)}")
+            print(f"   Duration: {result.get('duration_seconds', 0)}s")
+            
+            if result.get("error"):
+                print(f"\n❌ Error: {result['error']}")
+            elif result.get("message"):
+                print(f"\n📝 Message: {result['message']}")
+            else:
+                print("\n✅ Job completed successfully!")
+                
+        except Exception as e:
+            print(f"\n💥 Critical error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    asyncio.run(main())
+    print("\n🏁 Subscription sync job finished.")

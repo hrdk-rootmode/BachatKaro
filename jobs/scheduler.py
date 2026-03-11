@@ -1,50 +1,102 @@
 """
 APScheduler Configuration
-Central scheduler for all background jobs
+=========================
 
-Features:
+Central scheduler for all background jobs with:
 - Timezone-aware scheduling (IST)
-- Job persistence (survives restarts)
+- Job persistence (memory-based)
 - Graceful shutdown
 - Manual job triggering
 - Health monitoring
+- Error recovery
 
-UPDATED: Added seed_products job at 3:00 AM IST
+Schedule Overview:
+├─ 2:00 AM  - daily_scrape (price updates)
+├─ 2:30 AM  - daily_scrape_trending (trending products)
+├─ 3:00 AM  - seed_products (rotation seeding)
+├─ 5:00 AM  - load_trending_redis (cache refresh)
+├─ 6h cycle - check_price_alerts (6AM, 12PM, 6PM, 12AM)
+├─ 8:00 PM  - send_streak_reminders
+├─ Hourly   - sync_subscriptions (Google Play)
+└─ Monthly  - monthly_archive (1st of month, 1AM)
+
+Author: DealHunt
+Version: 2.0 (Cleaned & Enhanced)
 """
 
 import logging
-from datetime import datetime
-from typing import Optional, Dict, Any, List
-from enum import Enum
 import asyncio
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Callable
+from enum import Enum
+from dataclasses import dataclass, field
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.executors.asyncio import AsyncIOExecutor
+from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 import pytz
+
+# Add parent directory to Python path for imports
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Timezone for India
-IST = pytz.timezone('Asia/Kolkata')
 
+# =============================================================================
+# ENUMS & DATA CLASSES
+# =============================================================================
 
 class JobStatus(str, Enum):
     """Job execution status"""
     PENDING = "pending"
     RUNNING = "running"
-    COMPLETED = "completed"
+    SUCCESS = "success"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+@dataclass
+class JobResult:
+    """Result of a job execution"""
+    job_id: str
+    status: JobStatus
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    duration_seconds: float = 0
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class JobInfo:
+    """Job information and statistics"""
+    job_id: str
+    name: str
+    description: str
+    schedule: str
+    last_run: Optional[datetime] = None
+    next_run: Optional[datetime] = None
+    success_count: int = 0
+    error_count: int = 0
+    last_status: JobStatus = JobStatus.PENDING
+    last_error: Optional[str] = None
+    last_result: Optional[Dict[str, Any]] = None
+    is_running: bool = False
 
 
 # =============================================================================
 # SCHEDULER CONFIGURATION
 # =============================================================================
+
+# IST Timezone
+IST = pytz.timezone('Asia/Kolkata')
 
 # Job stores configuration
 jobstores = {
@@ -58,381 +110,411 @@ executors = {
 
 # Job defaults
 job_defaults = {
-    'coalesce': True,           # Combine multiple missed runs into one
-    'max_instances': 1,         # Only one instance of each job at a time
-    'misfire_grace_time': 3600  # 1 hour grace period for missed jobs
+    'coalesce': True,  # Combine multiple pending executions
+    'max_instances': 1,  # Only one instance at a time
+    'misfire_grace_time': 3600  # 1 hour grace time
 }
 
-# Create scheduler instance (but don't start yet)
-scheduler: Optional[AsyncIOScheduler] = None
+# Initialize scheduler
+scheduler = AsyncIOScheduler(
+    jobstores=jobstores,
+    executors=executors,
+    job_defaults=job_defaults,
+    timezone=IST
+)
 
-# Track job status
-_job_status: Dict[str, Dict[str, Any]] = {}
-
-# Track if scheduler is initialized
-_scheduler_initialized = False
-
-
-def _create_scheduler() -> AsyncIOScheduler:
-    """Create a new scheduler instance"""
-    return AsyncIOScheduler(
-        jobstores=jobstores,
-        executors=executors,
-        job_defaults=job_defaults,
-        timezone=IST
-    )
+# Scheduler start time
+_scheduler_start_time: Optional[datetime] = None
 
 
 # =============================================================================
-# JOB WRAPPER FOR ERROR HANDLING
+# JOB STATUS TRACKING
 # =============================================================================
 
-def job_wrapper(job_id: str, job_func):
-    """Wrap async job function with error handling"""
-    async def wrapped():
-        start_time = datetime.now(IST)
-        _job_status[job_id] = {
-            "status": JobStatus.RUNNING.value,
-            "started_at": start_time.isoformat()
-        }
+_job_registry: Dict[str, JobInfo] = {
+    'daily_scrape': JobInfo(
+        job_id='daily_scrape',
+        name='Daily Price Scrape',
+        description='Update prices for all tracked products',
+        schedule='2:00 AM IST'
+    ),
+    'daily_scrape_trending': JobInfo(
+        job_id='daily_scrape_trending',
+        name='Daily Trending Products',
+        description='Fetch trending products from all platforms',
+        schedule='2:30 AM IST'
+    ),
+    'seed_products': JobInfo(
+        job_id='seed_products',
+        name='Seed Products',
+        description='Add new products via rotation system',
+        schedule='3:00 AM IST'
+    ),
+    'load_trending_redis': JobInfo(
+        job_id='load_trending_redis',
+        name='Load Trending to Redis',
+        description='Cache trending products in Redis',
+        schedule='5:00 AM IST'
+    ),
+    'check_price_alerts': JobInfo(
+        job_id='check_price_alerts',
+        name='Check Price Alerts',
+        description='Send notifications for price drops',
+        schedule='Every 6 hours'
+    ),
+    'send_streak_reminders': JobInfo(
+        job_id='send_streak_reminders',
+        name='Send Streak Reminders',
+        description='Remind users to maintain streaks',
+        schedule='8:00 PM IST'
+    ),
+    'sync_subscriptions': JobInfo(
+        job_id='sync_subscriptions',
+        name='Sync Subscriptions',
+        description='Sync Google Play subscription status',
+        schedule='Every hour'
+    ),
+    'monthly_archive': JobInfo(
+        job_id='monthly_archive',
+        name='Monthly Archive',
+        description='Archive old data and cleanup',
+        schedule='1st of month, 1:00 AM IST'
+    ),
+}
+
+
+# =============================================================================
+# JOB WRAPPER (Error Handling & Tracking)
+# =============================================================================
+
+def create_job_wrapper(job_id: str, job_func: Callable) -> Callable:
+    """
+    Create a wrapper for job functions with:
+    - Error handling
+    - Status tracking
+    - Duration logging
+    - Result capture
+    """
+    async def wrapped_job():
+        job_info = _job_registry.get(job_id)
+        if not job_info:
+            logger.error(f"Unknown job: {job_id}")
+            return
+        
+        # Mark as running
+        job_info.is_running = True
+        job_info.last_run = datetime.now(IST)
+        started_at = datetime.utcnow()
+        
+        logger.info(f"🚀 Starting job: {job_id} ({job_info.name})")
         
         try:
-            logger.info(f"🔄 Starting job: {job_id}")
+            # Execute job
             result = await job_func()
             
-            end_time = datetime.now(IST)
-            duration = (end_time - start_time).total_seconds()
+            # Calculate duration
+            finished_at = datetime.utcnow()
+            duration = (finished_at - started_at).total_seconds()
             
-            _job_status[job_id] = {
-                "status": JobStatus.COMPLETED.value,
-                "last_run": end_time.isoformat(),
-                "duration": duration,
-                "error": None,
-                "result": result if isinstance(result, dict) else {"success": True}
-            }
+            # Update status
+            job_info.success_count += 1
+            job_info.last_status = JobStatus.SUCCESS
+            job_info.last_error = None
+            job_info.last_result = result if isinstance(result, dict) else {"result": str(result)}
             
-            logger.info(f"✅ Job {job_id} completed in {duration:.2f}s")
+            logger.info(
+                f"✅ Job completed: {job_id} | "
+                f"Duration: {duration:.2f}s | "
+                f"Result: {result}"
+            )
+            
             return result
             
         except Exception as e:
-            end_time = datetime.now(IST)
-            duration = (end_time - start_time).total_seconds()
+            # Calculate duration
+            finished_at = datetime.utcnow()
+            duration = (finished_at - started_at).total_seconds()
             
-            _job_status[job_id] = {
-                "status": JobStatus.FAILED.value,
-                "last_run": end_time.isoformat(),
-                "duration": duration,
-                "error": str(e)
-            }
+            # Update status
+            job_info.error_count += 1
+            job_info.last_status = JobStatus.FAILED
+            job_info.last_error = str(e)
             
-            logger.error(f"❌ Job {job_id} failed: {e}")
-            # Don't re-raise - let scheduler continue
-            
-    return wrapped
-
-
-# =============================================================================
-# JOB REGISTRATION
-# =============================================================================
-
-def register_jobs():
-    """Register all scheduled jobs"""
-    global scheduler, _scheduler_initialized
-    
-    if not settings.ENABLE_SCHEDULER:
-        logger.warning("⚠️ Scheduler is DISABLED in settings")
-        return
-    
-    if scheduler is None:
-        logger.error("Scheduler not initialized")
-        return
-    
-    logger.info("📅 Registering background jobs...")
-    
-    # =========================================================================
-    # JOB 1: Daily Price Scrape (2 AM IST)
-    # =========================================================================
-    try:
-        from jobs.daily_scrape import run_daily_scrape
-        
-        scheduler.add_job(
-            job_wrapper('daily_scrape', run_daily_scrape),
-            trigger=CronTrigger(
-                hour=settings.DAILY_SCRAPE_HOUR,
-                minute=0,
-                timezone=IST
-            ),
-            id='daily_scrape',
-            name='Daily Price Scrape',
-            replace_existing=True
-        )
-        logger.info(f"  ├── daily_scrape: {settings.DAILY_SCRAPE_HOUR}:00 AM IST ✅")
-    except Exception as e:
-        logger.error(f"  ├── daily_scrape: FAILED - {e}")
-    
-    # =========================================================================
-    # JOB 2: Seed Trending Products (3 AM IST) - NEW!
-    # =========================================================================
-    try:
-        # Check if seeding is enabled
-        if getattr(settings, 'ENABLE_PRODUCT_SEEDING', True):
-            from jobs.seed_products import run_seed_products
-            
-            scheduler.add_job(
-                job_wrapper('seed_products', run_seed_products),
-                trigger=CronTrigger(
-                    hour=3,  # 3 AM IST (after daily scrape at 2 AM)
-                    minute=0,
-                    timezone=IST
-                ),
-                id='seed_products',
-                name='Seed Trending Products',
-                replace_existing=True
+            logger.error(
+                f"❌ Job failed: {job_id} | "
+                f"Duration: {duration:.2f}s | "
+                f"Error: {e}"
             )
-            logger.info("  ├── seed_products: 3:00 AM IST ✅")
-        else:
-            logger.info("  ├── seed_products: DISABLED (ENABLE_PRODUCT_SEEDING=False)")
-    except ImportError as e:
-        logger.warning(f"  ├── seed_products: SKIPPED - Module not found ({e})")
-    except Exception as e:
-        logger.error(f"  ├── seed_products: FAILED - {e}")
+            
+            # Don't raise - let scheduler continue
+            return {"success": False, "error": str(e)}
+            
+        finally:
+            job_info.is_running = False
+            
+            # Update next run time
+            job = scheduler.get_job(job_id)
+            if job:
+                job_info.next_run = job.next_run_time
     
-    # =========================================================================
-    # JOB 3: Load Trending to Redis (5 AM IST)
-    # =========================================================================
-    try:
-        from jobs.load_trending_redis import run_load_trending
-        
-        scheduler.add_job(
-            job_wrapper('load_trending', run_load_trending),
-            trigger=CronTrigger(
-                hour=settings.TRENDING_CACHE_HOUR,
-                minute=0,
-                timezone=IST
-            ),
-            id='load_trending',
-            name='Load Trending Products',
-            replace_existing=True
-        )
-        logger.info(f"  ├── load_trending: {settings.TRENDING_CACHE_HOUR}:00 AM IST ✅")
-    except Exception as e:
-        logger.error(f"  ├── load_trending: FAILED - {e}")
-    
-    # =========================================================================
-    # JOB 4: Check Price Alerts (Every 6 hours)
-    # =========================================================================
-    try:
-        from jobs.check_price_alerts import run_check_price_alerts
-        
-        scheduler.add_job(
-            job_wrapper('check_price_alerts', run_check_price_alerts),
-            trigger=IntervalTrigger(
-                hours=settings.ALERT_CHECK_INTERVAL_HOURS,
-                timezone=IST
-            ),
-            id='check_price_alerts',
-            name='Check Price Alerts',
-            replace_existing=True
-        )
-        logger.info(f"  ├── check_price_alerts: every {settings.ALERT_CHECK_INTERVAL_HOURS}h ✅")
-    except Exception as e:
-        logger.error(f"  ├── check_price_alerts: FAILED - {e}")
-    
-    # =========================================================================
-    # JOB 5: Streak Reminders (8 PM IST)
-    # =========================================================================
-    try:
-        from jobs.send_streak_reminders import run_streak_reminders
-        
-        scheduler.add_job(
-            job_wrapper('streak_reminders', run_streak_reminders),
-            trigger=CronTrigger(
-                hour=20,
-                minute=0,
-                timezone=IST
-            ),
-            id='streak_reminders',
-            name='Send Streak Reminders',
-            replace_existing=True
-        )
-        logger.info("  ├── streak_reminders: 8:00 PM IST ✅")
-    except Exception as e:
-        logger.error(f"  ├── streak_reminders: FAILED - {e}")
-    
-    # =========================================================================
-    # JOB 6: Sync Google Subscriptions (Every 1 hour) - OPTIONAL
-    # =========================================================================
-    try:
-        from jobs.sync_subscriptions import run_sync_subscriptions
-        
-        scheduler.add_job(
-            job_wrapper('sync_subscriptions', run_sync_subscriptions),
-            trigger=IntervalTrigger(
-                hours=1,
-                timezone=IST
-            ),
-            id='sync_subscriptions',
-            name='Sync Google Subscriptions',
-            replace_existing=True
-        )
-        logger.info("  ├── sync_subscriptions: every 1h ✅")
-    except ImportError as e:
-        logger.warning(f"  ├── sync_subscriptions: SKIPPED - Module not found ({e})")
-    except Exception as e:
-        logger.error(f"  ├── sync_subscriptions: FAILED - {e}")
-    
-    # =========================================================================
-    # JOB 7: Monthly Archive (1st of month, 1 AM IST) - OPTIONAL
-    # =========================================================================
-    try:
-        from jobs.monthly_archive import run_monthly_archive
-        
-        scheduler.add_job(
-            job_wrapper('monthly_archive', run_monthly_archive),
-            trigger=CronTrigger(
-                day=1,
-                hour=1,
-                minute=0,
-                timezone=IST
-            ),
-            id='monthly_archive',
-            name='Monthly Data Archive',
-            replace_existing=True
-        )
-        logger.info("  └── monthly_archive: 1st of month, 1:00 AM IST ✅")
-    except ImportError as e:
-        logger.warning(f"  └── monthly_archive: SKIPPED - Module not found ({e})")
-    except Exception as e:
-        logger.error(f"  └── monthly_archive: FAILED - {e}")
-    
-    _scheduler_initialized = True
-    job_count = len(scheduler.get_jobs())
-    logger.info(f"✅ Registered {job_count} background jobs")
+    return wrapped_job
 
 
 # =============================================================================
-# SCHEDULER LIFECYCLE
+# JOB IMPORT FUNCTIONS
+# =============================================================================
+
+async def _run_daily_scrape():
+    """Import and run daily scrape"""
+    from jobs.daily_scrape import run_daily_scrape
+    return await run_daily_scrape()
+
+
+async def _run_daily_scrape_trending():
+    """Import and run trending scrape"""
+    from jobs.daily_scrape_trending import run_daily_trending_products
+    return await run_daily_trending_products()
+
+
+async def _run_seed_products():
+    """Import and run seed products"""
+    from jobs.seed_products import run_seed_products
+    return await run_seed_products()
+
+
+async def _run_load_trending_redis():
+    """Import and run trending cache refresh"""
+    from jobs.load_trending_redis import run_load_trending
+    return await run_load_trending()
+
+
+async def _run_check_price_alerts():
+    """Import and run price alerts check"""
+    from jobs.check_price_alerts import run_check_price_alerts
+    return await run_check_price_alerts()
+
+
+async def _run_send_streak_reminders():
+    """Import and run streak reminders"""
+    from jobs.send_streak_reminders import run_streak_reminders
+    return await run_streak_reminders()
+
+
+async def _run_sync_subscriptions():
+    """Import and run subscription sync"""
+    from jobs.sync_subscriptions import run_sync_subscriptions
+    return await run_sync_subscriptions()
+
+
+async def _run_monthly_archive():
+    """Import and run monthly archive"""
+    from jobs.monthly_archive import run_monthly_archive
+    return await run_monthly_archive()
+
+
+# =============================================================================
+# SCHEDULER EVENT LISTENERS
+# =============================================================================
+
+def job_executed_listener(event):
+    """Handle successful job execution"""
+    logger.debug(f"Job executed: {event.job_id}")
+
+
+def job_error_listener(event):
+    """Handle job execution errors"""
+    logger.error(f"Job error: {event.job_id} - {event.exception}")
+
+
+# =============================================================================
+# SCHEDULER MANAGEMENT
 # =============================================================================
 
 def start_scheduler():
-    """Start the scheduler"""
-    global scheduler
+    """
+    Start the scheduler with all jobs registered
     
-    if not settings.ENABLE_SCHEDULER:
-        logger.warning("⚠️ Scheduler disabled - skipping start")
+    Call this in FastAPI lifespan startup
+    """
+    global _scheduler_start_time
+    
+    if scheduler.running:
+        logger.warning("Scheduler is already running")
         return
     
     try:
-        # Create new scheduler
-        scheduler = _create_scheduler()
+        # Add event listeners
+        scheduler.add_listener(job_executed_listener, EVENT_JOB_EXECUTED)
+        scheduler.add_listener(job_error_listener, EVENT_JOB_ERROR)
         
-        # Register jobs
-        register_jobs()
+        # Register all jobs
+        _register_all_jobs()
         
         # Start scheduler
         scheduler.start()
-        logger.info("🚀 Background scheduler started")
+        _scheduler_start_time = datetime.now(IST)
         
-        # Log next run times
-        _log_next_run_times()
-                
+        logger.info("🚀 Scheduler started successfully")
+        
+        # Log all registered jobs
+        jobs = scheduler.get_jobs()
+        logger.info(f"📅 Registered {len(jobs)} jobs:")
+        for job in jobs:
+            next_run = "N/A"
+            if hasattr(job, 'next_run_time') and job.next_run_time:
+                next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+            logger.info(f"   • {job.id}: {job.name} → Next: {next_run}")
+        
     except Exception as e:
         logger.error(f"❌ Failed to start scheduler: {e}")
         raise
 
 
 def shutdown_scheduler():
-    """Gracefully shutdown the scheduler"""
-    global scheduler
+    """
+    Gracefully shutdown the scheduler
     
-    if scheduler is not None and scheduler.running:
-        scheduler.shutdown(wait=True)
-        logger.info("🛑 Background scheduler stopped")
-
-
-def _log_next_run_times():
-    """Log next run times for all jobs"""
-    if scheduler is None:
+    Call this in FastAPI lifespan shutdown
+    """
+    global _scheduler_start_time
+    
+    if not scheduler.running:
+        logger.warning("Scheduler is not running")
         return
     
     try:
-        jobs = scheduler.get_jobs()
-        logger.info("📆 Next scheduled runs:")
-        for job in jobs:
-            try:
-                # APScheduler 3.x compatible way to get next run time
-                next_run = None
-                if hasattr(job, 'next_run_time') and job.next_run_time:
-                    next_run = job.next_run_time
-                elif hasattr(job, 'trigger'):
-                    # Try to get from trigger
-                    next_run = job.trigger.get_next_fire_time(None, datetime.now(IST))
-                
-                if next_run:
-                    logger.info(f"  ├── {job.id}: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                else:
-                    logger.info(f"  ├── {job.id}: scheduled")
-            except Exception:
-                logger.info(f"  ├── {job.id}: scheduled")
+        scheduler.shutdown(wait=True)
+        _scheduler_start_time = None
+        logger.info("🛑 Scheduler shutdown successfully")
+        
     except Exception as e:
-        logger.debug(f"Could not log next run times: {e}")
+        logger.error(f"❌ Error shutting down scheduler: {e}")
+
+
+def _register_all_jobs():
+    """Register all scheduled jobs"""
+    
+    # 2:00 AM - Daily Price Scrape
+    scheduler.add_job(
+        create_job_wrapper('daily_scrape', _run_daily_scrape),
+        CronTrigger(hour=2, minute=0, timezone=IST),
+        id='daily_scrape',
+        name='Daily Price Scrape',
+        replace_existing=True
+    )
+    
+    # 2:30 AM - Daily Trending Products
+    scheduler.add_job(
+        create_job_wrapper('daily_scrape_trending', _run_daily_scrape_trending),
+        CronTrigger(hour=2, minute=30, timezone=IST),
+        id='daily_scrape_trending',
+        name='Daily Trending Products',
+        replace_existing=True
+    )
+    
+    # 3:00 AM - Seed Products
+    scheduler.add_job(
+        create_job_wrapper('seed_products', _run_seed_products),
+        CronTrigger(hour=3, minute=0, timezone=IST),
+        id='seed_products',
+        name='Seed Products',
+        replace_existing=True
+    )
+    
+    # 5:00 AM - Load Trending to Redis
+    scheduler.add_job(
+        create_job_wrapper('load_trending_redis', _run_load_trending_redis),
+        CronTrigger(hour=5, minute=0, timezone=IST),
+        id='load_trending_redis',
+        name='Load Trending to Redis',
+        replace_existing=True
+    )
+    
+    # Every 6 hours - Check Price Alerts (6AM, 12PM, 6PM, 12AM)
+    scheduler.add_job(
+        create_job_wrapper('check_price_alerts', _run_check_price_alerts),
+        CronTrigger(hour='0,6,12,18', minute=0, timezone=IST),
+        id='check_price_alerts',
+        name='Check Price Alerts',
+        replace_existing=True
+    )
+    
+    # 8:00 PM - Send Streak Reminders
+    scheduler.add_job(
+        create_job_wrapper('send_streak_reminders', _run_send_streak_reminders),
+        CronTrigger(hour=20, minute=0, timezone=IST),
+        id='send_streak_reminders',
+        name='Send Streak Reminders',
+        replace_existing=True
+    )
+    
+    # Every hour - Sync Subscriptions
+    scheduler.add_job(
+        create_job_wrapper('sync_subscriptions', _run_sync_subscriptions),
+        CronTrigger(minute=0, timezone=IST),
+        id='sync_subscriptions',
+        name='Sync Subscriptions',
+        replace_existing=True
+    )
+    
+    # 1st of month, 1:00 AM - Monthly Archive
+    scheduler.add_job(
+        create_job_wrapper('monthly_archive', _run_monthly_archive),
+        CronTrigger(day=1, hour=1, minute=0, timezone=IST),
+        id='monthly_archive',
+        name='Monthly Archive',
+        replace_existing=True
+    )
+    
+    # Update next run times
+    for job in scheduler.get_jobs():
+        if job.id in _job_registry:
+            if hasattr(job, 'next_run_time'):
+                _job_registry[job.id].next_run = job.next_run_time
 
 
 # =============================================================================
-# JOB MANAGEMENT
+# STATUS & MANUAL TRIGGERING
 # =============================================================================
 
 def get_scheduler_status() -> Dict[str, Any]:
-    """Get scheduler status and job information"""
-    global scheduler, _scheduler_initialized
+    """
+    Get comprehensive scheduler status
     
-    if scheduler is None:
-        return {
-            "running": False,
-            "enabled": settings.ENABLE_SCHEDULER,
-            "jobs_count": 0,
-            "jobs": [],
-            "message": "Scheduler not initialized"
-        }
+    Returns:
+        Dictionary with scheduler state and all job statuses
+    """
+    uptime = None
+    if _scheduler_start_time:
+        uptime = int((datetime.now(IST) - _scheduler_start_time).total_seconds())
     
-    jobs_info = []
+    # Update next run times
+    for job in scheduler.get_jobs():
+        if job.id in _job_registry:
+            _job_registry[job.id].next_run = job.next_run_time
     
-    try:
-        jobs = scheduler.get_jobs()
-        
-        for job in jobs:
-            job_data = {
-                "id": job.id,
-                "name": getattr(job, 'name', job.id),
-                "next_run": None,
-                "status": _job_status.get(job.id, {}).get("status", "pending"),
-                "last_run": _job_status.get(job.id, {}).get("last_run"),
-                "last_duration": _job_status.get(job.id, {}).get("duration"),
-                "last_error": _job_status.get(job.id, {}).get("error")
-            }
-            
-            # Get next run time safely
-            try:
-                if hasattr(job, 'next_run_time') and job.next_run_time:
-                    job_data["next_run"] = job.next_run_time.isoformat()
-                elif hasattr(job, 'trigger'):
-                    next_fire = job.trigger.get_next_fire_time(None, datetime.now(IST))
-                    if next_fire:
-                        job_data["next_run"] = next_fire.isoformat()
-            except Exception:
-                pass
-            
-            jobs_info.append(job_data)
-            
-    except Exception as e:
-        logger.error(f"Error getting job info: {e}")
+    jobs_list = []
+    for job_id, job_info in _job_registry.items():
+        jobs_list.append({
+            "job_id": job_info.job_id,
+            "name": job_info.name,
+            "description": job_info.description,
+            "schedule": job_info.schedule,
+            "last_run": job_info.last_run.isoformat() if job_info.last_run else None,
+            "next_run": job_info.next_run.isoformat() if job_info.next_run else None,
+            "success_count": job_info.success_count,
+            "error_count": job_info.error_count,
+            "last_status": job_info.last_status.value,
+            "last_error": job_info.last_error,
+            "is_running": job_info.is_running
+        })
     
     return {
-        "running": scheduler.running if scheduler else False,
-        "timezone": str(IST),
-        "jobs_count": len(jobs_info),
-        "jobs": jobs_info,
-        "enabled": settings.ENABLE_SCHEDULER
+        "running": scheduler.running,
+        "uptime_seconds": uptime,
+        "jobs_count": len(_job_registry),
+        "jobs": jobs_list,
+        "timezone": str(IST)
     }
 
 
@@ -446,88 +528,101 @@ async def run_job_now(job_id: str) -> Dict[str, Any]:
     Returns:
         Job execution result
     """
-    global scheduler
+    return await trigger_job_manually(job_id)
+
+
+async def trigger_job_manually(job_id: str) -> Dict[str, Any]:
+    """
+    Manually trigger a job
     
-    if scheduler is None:
+    Args:
+        job_id: ID of the job to run
+        
+    Returns:
+        Dictionary with execution result
+    """
+    job_functions = {
+        'daily_scrape': _run_daily_scrape,
+        'daily_scrape_trending': _run_daily_scrape_trending,
+        'seed_products': _run_seed_products,
+        'load_trending_redis': _run_load_trending_redis,
+        'check_price_alerts': _run_check_price_alerts,
+        'send_streak_reminders': _run_send_streak_reminders,
+        'sync_subscriptions': _run_sync_subscriptions,
+        'monthly_archive': _run_monthly_archive,
+    }
+    
+    if job_id not in job_functions:
         return {
             "success": False,
-            "error": "Scheduler not initialized"
+            "job_id": job_id,
+            "error": f"Unknown job: {job_id}. Available: {list(job_functions.keys())}"
         }
     
-    job = scheduler.get_job(job_id)
+    job_info = _job_registry.get(job_id)
     
-    if not job:
+    if job_info and job_info.is_running:
         return {
             "success": False,
-            "error": f"Job not found: {job_id}",
-            "available_jobs": [j.id for j in scheduler.get_jobs()]
+            "job_id": job_id,
+            "error": "Job is already running"
         }
     
     logger.info(f"🔧 Manually triggering job: {job_id}")
     
-    start_time = datetime.now(IST)
-    _job_status[job_id] = {
-        "status": JobStatus.RUNNING.value,
-        "started_at": start_time.isoformat()
-    }
-    
     try:
-        # Get the actual job function from the wrapper
-        job_func = job.func
-        
-        # Run the job
-        if asyncio.iscoroutinefunction(job_func):
-            result = await job_func()
-        else:
-            result = job_func()
-            # If it's a coroutine (wrapped function returns coroutine)
-            if asyncio.iscoroutine(result):
-                result = await result
-        
-        end_time = datetime.now(IST)
-        duration = (end_time - start_time).total_seconds()
-        
-        _job_status[job_id] = {
-            "status": JobStatus.COMPLETED.value,
-            "last_run": end_time.isoformat(),
-            "duration": duration,
-            "error": None
-        }
-        
-        logger.info(f"✅ Manual job {job_id} completed in {duration:.2f}s")
+        # Run the wrapped job
+        wrapped = create_job_wrapper(job_id, job_functions[job_id])
+        result = await wrapped()
         
         return {
             "success": True,
             "job_id": job_id,
-            "duration_seconds": duration,
-            "result": result if isinstance(result, dict) else {"completed": True}
+            "result": result,
+            "triggered_at": datetime.now(IST).isoformat()
         }
         
     except Exception as e:
-        end_time = datetime.now(IST)
-        duration = (end_time - start_time).total_seconds()
-        
-        _job_status[job_id] = {
-            "status": JobStatus.FAILED.value,
-            "last_run": end_time.isoformat(),
-            "duration": duration,
-            "error": str(e)
-        }
-        
-        logger.error(f"❌ Manual job {job_id} failed: {e}")
-        
+        logger.error(f"❌ Manual job trigger failed: {job_id} - {e}")
         return {
             "success": False,
             "job_id": job_id,
-            "duration_seconds": duration,
-            "error": str(e)
+            "error": str(e),
+            "triggered_at": datetime.now(IST).isoformat()
         }
 
 
-def update_job_status(job_id: str, status: JobStatus, **kwargs):
-    """Update job status (called by individual jobs)"""
-    _job_status[job_id] = {
-        "status": status.value,
-        "last_run": datetime.now(IST).isoformat(),
-        **kwargs
-    }
+# =============================================================================
+# MAIN (for testing)
+# =============================================================================
+
+if __name__ == "__main__":
+    import asyncio
+    
+    print("🧪 Testing Scheduler...")
+    print("=" * 60)
+    
+    # Start scheduler
+    start_scheduler()
+    
+    # Print status
+    status = get_scheduler_status()
+    print(f"\n📊 Scheduler Status:")
+    print(f"   Running: {status['running']}")
+    print(f"   Jobs: {status['jobs_count']}")
+    
+    print("\n📅 Registered Jobs:")
+    for job in status['jobs']:
+        print(f"   • {job['job_id']}: {job['name']}")
+        print(f"     Schedule: {job['schedule']}")
+        print(f"     Next Run: {job['next_run']}")
+    
+    # Keep running for a bit
+    print("\n⏳ Scheduler running (Ctrl+C to stop)...")
+    
+    try:
+        asyncio.get_event_loop().run_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping scheduler...")
+        shutdown_scheduler()
+        print("✅ Done!")
