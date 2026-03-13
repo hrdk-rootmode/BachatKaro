@@ -13,7 +13,7 @@ Central scheduler for all background jobs with:
 Schedule Overview:
 ├─ 2:00 AM  - daily_scrape (price updates)
 ├─ 2:30 AM  - daily_scrape_trending (trending products)
-├─ 3:00 AM  - seed_products (rotation seeding)
+├─ 3:00 AM  - seed_products (comprehensive seeding with cross-platform matching)
 ├─ 5:00 AM  - load_trending_redis (cache refresh)
 ├─ 6h cycle - check_price_alerts (6AM, 12PM, 6PM, 12AM)
 ├─ 8:00 PM  - send_streak_reminders
@@ -47,6 +47,122 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# ERROR NOTIFICATION SYSTEM
+# =============================================================================
+
+try:
+    import smtplib
+    from email.mime.text import MimeText
+    from email.mime.multipart import MimeMultipart
+    EMAIL_AVAILABLE = True
+except ImportError:
+    EMAIL_AVAILABLE = False
+    logger.warning("Email modules not available - error notifications disabled")
+
+async def send_error_notification(job_name: str, error: str, traceback_info: str = None):
+    """Send error notification via email (configurable)"""
+    if not EMAIL_AVAILABLE:
+        logger.error(f"🚨 JOB FAILED: {job_name}")
+        logger.error(f"Error: {error}")
+        return
+    
+    try:
+        # Check if error notifications are enabled
+        if not getattr(settings, 'ENABLE_ERROR_NOTIFICATIONS', False):
+            return
+        
+        recipient = getattr(settings, 'ERROR_NOTIFICATION_EMAIL', '')
+        if not recipient:
+            return
+        
+        # Create email content
+        subject = f"🚨 Job Failed: {job_name} - DealHunt Scheduler"
+        
+        branch_info = await get_current_branch()
+        traceback_section = f"Traceback:\n{traceback_info}" if traceback_info else ""
+        
+        body = f"""Job Failure Report
+=================
+
+Job Name: {job_name}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Branch: {branch_info}
+
+Error:
+{error}
+
+{traceback_section}
+
+Please check the logs and investigate the issue.
+
+--
+DealHunt Scheduler"""
+        
+        # Send email (configure your SMTP settings in .env)
+        if hasattr(settings, 'SMTP_HOST') and settings.SMTP_HOST:
+            msg = MimeMultipart()
+            msg['From'] = getattr(settings, 'SMTP_FROM', 'scheduler@dealhunt.com')
+            msg['To'] = recipient
+            msg['Subject'] = subject
+            msg.attach(MimeText(body, 'plain'))
+            
+            server = smtplib.SMTP(settings.SMTP_HOST, getattr(settings, 'SMTP_PORT', 587))
+            if getattr(settings, 'SMTP_USE_TLS', True):
+                server.starttls()
+            if hasattr(settings, 'SMTP_USERNAME') and settings.SMTP_USERNAME:
+                server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+            server.send_message(msg)
+            server.quit()
+            
+            logger.info(f"📧 Error notification sent for {job_name}")
+        else:
+            # Log to console if email not configured
+            logger.error(f"🚨 JOB FAILED: {job_name}")
+            logger.error(f"Branch: {await get_current_branch()}")
+            logger.error(f"Error: {error}")
+            if traceback_info:
+                logger.error(f"Traceback: {traceback_info}")
+    
+    except Exception as e:
+        logger.error(f"Failed to send error notification: {e}")
+
+async def validate_branch() -> bool:
+    """Validate we're running on the correct branch"""
+    try:
+        current_branch = await get_current_branch()
+        expected_branch = getattr(settings, 'SCHEDULER_BRANCH', 'current')
+        
+        # If set to 'current', always accept whatever branch we're on
+        if expected_branch == 'current':
+            logger.info(f"✅ Branch validation passed: {current_branch} (current mode)")
+            return True
+        
+        if current_branch != expected_branch:
+            logger.error(f"🚨 WRONG BRANCH: Running on '{current_branch}' but expected '{expected_branch}'")
+            await send_error_notification(
+                "Branch Validation", 
+                f"Scheduler running on wrong branch: {current_branch} (expected: {expected_branch})"
+            )
+            return False
+        
+        logger.info(f"✅ Branch validation passed: {current_branch}")
+        return True
+    except Exception as e:
+        logger.error(f"Branch validation failed: {e}")
+        return False
+
+async def get_current_branch() -> str:
+    """Get current git branch"""
+    try:
+        import subprocess
+        result = subprocess.run(['git', 'branch', '--show-current'], 
+                              capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() or 'unknown'
+    except:
+        return 'unknown'
 
 
 # =============================================================================
@@ -147,7 +263,7 @@ _job_registry: Dict[str, JobInfo] = {
     'seed_products': JobInfo(
         job_id='seed_products',
         name='Seed Products',
-        description='Add new products via rotation system',
+        description='Comprehensive seeding with cross-platform matching',
         schedule='3:00 AM IST'
     ),
     'load_trending_redis': JobInfo(
@@ -201,12 +317,19 @@ def create_job_wrapper(job_id: str, job_func: Callable) -> Callable:
             logger.error(f"Unknown job: {job_id}")
             return
         
+        # Validate branch before running
+        if not await validate_branch():
+            logger.error(f"⚠️ Skipping job {job_id} due to branch validation failure")
+            job_info.last_status = JobStatus.SKIPPED
+            job_info.last_error = "Wrong branch"
+            return {"success": False, "error": "Wrong branch"}
+        
         # Mark as running
         job_info.is_running = True
         job_info.last_run = datetime.now(IST)
         started_at = datetime.utcnow()
         
-        logger.info(f"🚀 Starting job: {job_id} ({job_info.name})")
+        logger.info(f"🚀 Starting job: {job_id} ({job_info.name}) on branch {await get_current_branch()}")
         
         try:
             # Execute job
@@ -235,6 +358,10 @@ def create_job_wrapper(job_id: str, job_func: Callable) -> Callable:
             finished_at = datetime.utcnow()
             duration = (finished_at - started_at).total_seconds()
             
+            # Get traceback for debugging
+            import traceback
+            traceback_info = traceback.format_exc()
+            
             # Update status
             job_info.error_count += 1
             job_info.last_status = JobStatus.FAILED
@@ -245,6 +372,12 @@ def create_job_wrapper(job_id: str, job_func: Callable) -> Callable:
                 f"Duration: {duration:.2f}s | "
                 f"Error: {e}"
             )
+            
+            # Send error notification
+            try:
+                await send_error_notification(job_id, str(e), traceback_info)
+            except Exception as notification_error:
+                logger.error(f"Failed to send error notification: {notification_error}")
             
             # Don't raise - let scheduler continue
             return {"success": False, "error": str(e)}
@@ -277,9 +410,23 @@ async def _run_daily_scrape_trending():
 
 
 async def _run_seed_products():
-    """Import and run seed products"""
-    from jobs.seed_products import run_seed_products
-    return await run_seed_products()
+    """Import and run seed products - using comprehensive seeding"""
+    try:
+        # Add current directory to Python path and import directly
+        import sys
+        import os
+        current_dir = os.path.abspath('.')
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+        
+        # Import and run the seed function
+        from scripts.seed import seed_smart_rotate
+        result = await seed_smart_rotate()
+        
+        return {"success": True, "output": str(result)}
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 async def _run_load_trending_redis():

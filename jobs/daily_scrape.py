@@ -441,11 +441,24 @@ async def _log_scrape_results(
 # =============================================================================
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Daily Price Scraping Job")
+    parser.add_argument("--force-all", action="store_true", 
+                       help="Force scrape all products regardless of timing")
+    args = parser.parse_args()
+    
     print("🚀 Starting Daily Scrape Job...")
     print("=" * 60)
     
     async def main():
         try:
+            if args.force_all:
+                # Override the cutoff time to scrape everything
+                global SCRAPE_INTERVAL_HOURS
+                SCRAPE_INTERVAL_HOURS = 0  # Scrape everything
+                print("🔧 Force mode: Scrape all products")
+            
             result = await run_daily_scrape()
             
             print("\n📊 Results:")
