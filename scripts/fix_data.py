@@ -1,50 +1,47 @@
 #!/usr/bin/env python3
 """
-Data Fixer v3.0 — Full Database Coverage
-==========================================
+Database Health Analyzer & Fixer v4.0
+======================================
 
-Scans and fixes NULL/empty/broken data across ALL tables:
+Intelligent scanner that finds and fixes:
 
-  TABLE: products
-    ✓ brand = NULL / 'Unknown'       → AI extraction from title
-    ✓ category = NULL / 'General'    → AI categorization
-    ✓ subcategory = NULL             → AI subcategorization
-    ✓ image_url = NULL               → Pull from listing URL if possible
-    ✓ specifications = {} / NULL     → AI spec extraction
-    ✓ ai_metadata.essence = NULL     → AI generation
-    ✓ ai_metadata.tags = []          → AI generation
-    ✓ ai_metadata.quality_score = 0  → AI scoring
-    ✓ stats = NULL                   → Default reset
-    ✓ Orphan products (no listings)  → Optional delete
+GARBAGE DATA (not just NULL):
+  ❌ Brand = "Men", "Cotton", "Blue", "Tshirt", "Generic", "Unknown"
+  ❌ Brand = "Te", "Sb", "Db" (random 2-letter junk)
+  ❌ Title = just brand name ("VANGULL", "Ambrane", "NOISE")
+  ❌ Image URL = broken/404/placeholder
+  ❌ AI essence = NULL or same as title (no compression)
+  ❌ Category = "General" (lazy categorization)
+  ❌ Specs = {} (empty when product has RAM/storage in title)
+  ❌ Quality score = 0 (AI never processed)
 
-  TABLE: product_listings
-    ✓ original_price = NULL          → Set equal to current_price
-    ✓ discount_percent = NULL        → Calculate from prices
-    ✓ rating = NULL                  → Set 0.0 placeholder
-    ✓ review_count = NULL            → Set 0
-    ✓ review_summary = NULL / {}     → Set default {}
-    ✓ currency = NULL                → Default 'INR'
-    ✓ price_history = NULL           → Seed from current_price
-    ✓ in_stock = NULL                → Default True
-    ✓ scrape_error_count = NULL      → Default 0
+USES v4.0 INTELLIGENCE:
+  ✅ Imports extraction from cross_platform_matcher.py
+  ✅ 100+ brand patterns (Fire-Boltt, boAt, Noise, fashion)
+  ✅ Product-line extraction (Phoenix, Hunter, Galaxy S)
+  ✅ Spec extraction (RAM, storage, screen, processor)
+  ✅ Quality gate (skip unfixable garbage)
+  ✅ Smart AI prompts (category-aware)
 
-  TABLE: platforms
-    ✓ selectors = NULL / {}          → Inject known good selectors
-    ✓ scrape_delay_seconds = NULL    → Default 2
-    ✓ is_active = NULL               → Default True
+MODES:
+  --scan              Deep analysis report (no changes)
+  --fix-all           Fix all issues
+  --fix-brands        Fix garbage brands only
+  --fix-specs         Extract missing specs from titles
+  --fix-images        Find working image URLs from listings
+  --fix-ai            Re-enrich low quality products
+  --delete-garbage    Delete unfixable junk products
+  --health-score      Show database health percentage
 
 Usage:
-    python scripts/fix_data.py                          # Scan only
-    python scripts/fix_data.py --fix-all                # Fix ALL tables
-    python scripts/fix_data.py --fix-products           # Only products table
-    python scripts/fix_data.py --fix-listings           # Only listings table
-    python scripts/fix_data.py --fix-platforms          # Only platforms table
-    python scripts/fix_data.py --fix-orphans            # Delete orphan products
-    python scripts/fix_data.py --re-enrich              # Re-run AI on all products
-    python scripts/fix_data.py --dry-run --fix-all      # Preview without saving
-    python scripts/fix_data.py --limit 200 --fix-all    # Custom batch size
+    python scripts/fix_data.py --scan
+    python scripts/fix_data.py --fix-all
+    python scripts/fix_data.py --fix-brands --limit 100
+    python scripts/fix_data.py --delete-garbage --dry-run
+    python scripts/fix_data.py --health-score
 
-Version: 3.0
+Author: DealHunt
+Version: 4.0 (Intelligent Analyzer)
 """
 
 import asyncio
@@ -54,25 +51,36 @@ import os
 import json
 import re
 from datetime import datetime, date
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple, Set
 from decimal import Decimal
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-# Windows: use SelectorEventLoop to avoid "Event loop is closed" error on exit
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 
 from sqlalchemy import select, func, or_, and_, delete, update, text
 from sqlalchemy.orm import selectinload
 from app.core.database import async_session_maker
 from app.models import Product, ProductListing, Platform
+
+# ✅ IMPORT v4.0 INTELLIGENCE FROM MATCHER
+from app.services.scraper.cross_platform_matcher import (
+    extract_specs,
+    extract_brand,
+    check_quality_gate,
+    ProductSpecs,
+    BRAND_PATTERNS,
+    # GENERIC_WORDS
+)
+
+# AI client
 from app.services.ai.groq_client import groq_client
 from app.services.scraper.base import ProductData
 
-
-# ── Cosmetic helpers ────────────────────────────────────────────────────────
+if sys.platform == 'win32':
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# =============================================================================
+# STYLING
+# =============================================================================
 BOLD = "\033[1m"
 RESET = "\033[0m"
 GREEN = "\033[92m"
@@ -87,831 +95,1020 @@ def err(msg): print(f"      {RED}❌{RESET} {msg}")
 def info(msg): print(f"      {DIM}{msg}{RESET}")
 def header(msg): print(f"\n{BOLD}{CYAN}{msg}{RESET}")
 
-# ── Brand validation: words that are NEVER real brands ───────────────────────
-GENERIC_WORDS = {
-    "unknown", "generic", "unbranded", "other", "n/a", "na", "none",
-    "new", "men", "women", "boys", "girls", "pack", "set", "combo",
+
+# =============================================================================
+# GARBAGE DETECTORS (ENHANCED)
+# =============================================================================
+
+# Words that should NEVER be brand names
+GARBAGE_BRANDS = {
+    # Generic
+    "unknown", "generic", "unbranded", "other", "n/a", "na", "none", "null",
+    "brand", "original", "new", "latest", "premium", "best", "top",
+    
+    # Attributes mistaken for brands
+    "men", "women", "boys", "girls", "kids", "unisex", "male", "female",
     "cotton", "silk", "wool", "polyester", "nylon", "leather", "synthetic",
-    "sneaker", "sneakers", "shoe", "dress", "shirt", "trouser", "pant",
-    "kurta", "saree", "top", "bottom", "jacket", "casual", "formal",
-    "stylish", "trendy", "elegant", "latest", "premium", "luxury",
-    "digital", "analog", "silicone", "watch", "bag", "purse", "tote",
-    "a-line", "maxi", "midi", "fit", "flare", "solid", "printed",
-    "round", "polo", "v-neck", "maroon", "blue", "red", "black", "white",
-    "brown", "pink", "yellow", "green", "grey", "beige", "gold",
-    "square", "tech", "te", "db", "sb", "fashion", "collection",
-    "series", "model", "product", "item", "brand", "original",
+    "polycotton", "blend", "mixed", "denim", "linen", "rayon",
+    
+    # Garment types
+    "sneaker", "sneakers", "shoe", "shoes", "dress", "shirt", "tshirt",
+    "trouser", "pant", "kurta", "saree", "top", "bottom", "jacket",
+    
+    # Colors
+    "black", "white", "blue", "red", "green", "yellow", "pink", "grey",
+    "brown", "orange", "purple", "maroon", "navy", "beige", "gold",
+    
+    # Styles
+    "casual", "formal", "stylish", "trendy", "elegant", "smart", "classic",
+    "modern", "vintage", "retro", "slim", "fit", "regular", "loose",
+    
+    # Product features
+    "wireless", "bluetooth", "digital", "analog", "smart", "pro", "plus",
+    "ultra", "max", "lite", "mini", "premium", "deluxe", "standard",
+    
+    # Random 2-letter junk
+    "te", "sb", "db", "ab", "cd", "xy", "qr", "mn", "pq",
 }
 
-KNOWN_PLATFORM_SELECTORS = {
-    "amazon": {
-        "search_url_template": "https://www.amazon.in/s?k={query}&ref=sr_pg_1",
-        "product_title": "#productTitle, span.a-size-large.product-title-word-break",
-        "product_price": "span.a-price-whole, .a-offscreen",
-        "product_image": "#landingImage, #imgTagWrapperId img",
-        "product_rating": "span.a-icon-alt, #acrPopover",
-        "product_url": "a.a-link-normal.s-no-outline",
-        "search_result_title": "h2 a span, .a-size-medium.a-color-base.a-text-normal",
-        "search_result_price": ".a-price .a-offscreen",
-        "search_result_image": ".s-image",
-        "healed_selectors": [],
-    },
-    "flipkart": {
-        "search_url_template": "https://www.flipkart.com/search?q={query}&page=1",
-        "product_title": "span.B_NuCI, .G6XhRU",
-        "product_price": "div._30jeq3._16Jk6d, ._25b18c ._30jeq3",
-        "product_image": "img._396cs4, .CXW8mj img",
-        "product_rating": "div._3LWZlK",
-        "product_url": "a._1fQZEK, a.s1Q9rs",
-        "search_result_title": "._4rR01T, .s1Q9rs",
-        "search_result_price": "._30jeq3",
-        "search_result_image": "._396cs4",
-        "healed_selectors": [],
-    },
-    "meesho": {
-        "search_url_template": "https://www.meesho.com/search?q={query}",
-        "product_title": "p.NewProductCard__title, h4",
-        "product_price": "h5.NewProductCard__discountedPrice",
-        "product_image": "img.NewProductCard__image",
-        "product_rating": "p.NewProductCard__rating",
-        "product_url": "a.NewProductCard__link",
-        "search_result_title": "p[class*='title']",
-        "search_result_price": "h5[class*='price']",
-        "search_result_image": "img[class*='image']",
-        "healed_selectors": [],
-    },
-    "myntra": {
-        "search_url_template": "https://www.myntra.com/{query}",
-        "product_title": "h1.pdp-name",
-        "product_price": ".pdp-price strong",
-        "product_image": ".image-grid-image",
-        "product_rating": ".index-overallRating",
-        "product_url": "li.product-base a",
-        "search_result_title": "h3.product-brand",
-        "search_result_price": ".product-discountedPrice",
-        "search_result_image": ".product-imageSliderContainer img",
-        "healed_selectors": [],
-    },
-    "croma": {
-        "search_url_template": "https://www.croma.com/searchB?q={query}:relevance&langCode=en",
-        "product_title": "h1.pdp-title",
-        "product_price": "span.amount",
-        "product_image": ".pdp-image-gallery img",
-        "product_rating": ".cr-avg-rating",
-        "product_url": ".product .cp-title a",
-        "search_result_title": ".product .cp-title",
-        "search_result_price": ".pdpPrice",
-        "search_result_image": ".product-img img",
-        "healed_selectors": [],
-    },
-    "nykaa": {
-        "search_url_template": "https://www.nykaa.com/search/result/?q={query}",
-        "product_title": "h1.css-ywbabr",
-        "product_price": "span.css-111z9ua",
-        "product_image": "img.css-11wmvr3",
-        "product_rating": ".css-2rdnbl",
-        "product_url": "a.css-qppxbd",
-        "search_result_title": "a.css-qppxbd",
-        "search_result_price": "span.css-111z9ua",
-        "search_result_image": "img.css-11wmvr3",
-        "healed_selectors": [],
-    },
-}
+# Patterns that indicate garbage brand
+GARBAGE_BRAND_PATTERNS = [
+    re.compile(r'^[a-z]{1,2}$', re.I),  # 1-2 letters only
+    re.compile(r'^\d+$'),  # Just numbers
+    re.compile(r'^[^a-zA-Z]+$'),  # No letters at all
+]
 
-DEFAULT_SELECTORS = {
-    "search_url_template": "",
-    "product_title": "",
-    "product_price": "",
-    "product_image": "",
-    "product_rating": "",
-    "product_url": "",
-    "healed_selectors": [],
-}
+
+def is_garbage_brand(brand: Optional[str]) -> bool:
+    """Detect if brand is garbage/invalid"""
+    if not brand:
+        return True
+    
+    brand_lower = brand.lower().strip()
+    
+    # Check garbage word list
+    if brand_lower in GARBAGE_BRANDS:
+        return True
+    
+    # Check patterns
+    for pattern in GARBAGE_BRAND_PATTERNS:
+        if pattern.match(brand):
+            return True
+    
+    # Too short (but not known brand)
+    if len(brand_lower) <= 2:
+        # Check if it's a known brand abbreviation
+        if not BRAND_PATTERNS.search(brand):
+            return True
+    
+    return False
+
+
+def is_valid_brand(brand: Optional[str]) -> bool:
+    """Check if brand is valid (opposite of garbage)"""
+    if not brand:
+        return False
+    
+    if is_garbage_brand(brand):
+        return False
+    
+    # Must match known brand pattern
+    if BRAND_PATTERNS.search(brand):
+        return True
+    
+    # Or be at least 3 chars and not in garbage list
+    brand_lower = brand.lower().strip()
+    if len(brand_lower) >= 3 and brand_lower not in GARBAGE_BRANDS:
+        return True
+    
+    return False
+
+
+def is_title_just_brand(title: str, brand: Optional[str]) -> bool:
+    """Check if title is just the brand name (no product info)"""
+    if not title or not brand:
+        return False
+    
+    # Remove brand from title
+    title_clean = re.sub(re.escape(brand), '', title, flags=re.IGNORECASE).strip()
+    
+    # Count remaining meaningful words
+    words = [w for w in re.findall(r'\b[a-zA-Z]{3,}\b', title_clean)
+             if w.lower() not in {'the', 'a', 'an', 'and', 'for', 'with'}]
+    
+    # If less than 2 meaningful words left, title is just brand
+    return len(words) < 2
+
+
+def is_image_url_broken(url: Optional[str]) -> bool:
+    """Check if image URL is broken/placeholder"""
+    if not url:
+        return True
+    
+    url_lower = url.lower()
+    
+    # Common placeholder indicators
+    placeholders = [
+        'placeholder', 'noimage', 'no-image', 'default', 'missing',
+        'na.jpg', 'na.png', 'null.jpg', 'dummy', 'temp'
+    ]
+    
+    for placeholder in placeholders:
+        if placeholder in url_lower:
+            return True
+    
+    # Must start with http
+    if not url.startswith(('http://', 'https://')):
+        return True
+    
+    return False
+
+
+def is_essence_useless(title: str, essence: Optional[str]) -> bool:
+    """Check if AI essence is useless (same as title or too similar)"""
+    if not essence:
+        return True
+    
+    # Essence should be shorter than title (compression)
+    if len(essence) >= len(title) * 0.9:
+        return True
+    
+    # Essence should not be exactly the same
+    if essence.lower().strip() == title.lower().strip():
+        return True
+    
+    return False
+
+
+def is_category_lazy(category: Optional[str]) -> bool:
+    """Check if category is lazy/generic"""
+    if not category:
+        return True
+    
+    lazy_categories = {'general', 'other', 'miscellaneous', 'unknown', 'products'}
+    return category.lower() in lazy_categories
+
+
+def has_specs_in_title_but_empty(title: str, specs: Dict) -> bool:
+    """Check if title has specs info but specifications field is empty"""
+    if specs and len(specs) > 0:
+        return False  # Specs exist
+    
+    # Check if title has common spec patterns
+    spec_indicators = [
+        r'\d+\s*GB',  # Storage/RAM
+        r'\d+\.?\d*\s*inch',  # Screen
+        r'i[3579]|Ryzen|Snapdragon|M[123]',  # Processors
+        r'5G|4G|LTE',  # Network
+    ]
+    
+    for pattern in spec_indicators:
+        if re.search(pattern, title, re.IGNORECASE):
+            return True
+    
+    return False
 
 
 # =============================================================================
-# SECTION 1: COMPREHENSIVE SCANNER
+# COMPREHENSIVE SCANNER
 # =============================================================================
 
-async def scan_database() -> Dict[str, Any]:
-    """Deep scan for all data quality issues across all tables"""
-    header("🔍 Deep Scanning Database...")
-
-    issues = {}
-
+async def scan_database_health() -> Dict[str, Any]:
+    """
+    Deep scan for data quality issues
+    
+    Returns detailed breakdown of all issues found
+    """
+    header("🔬 Deep Scanning Database for ALL Issues...")
+    
+    issues = {
+        "total_products": 0,
+        "total_listings": 0,
+        
+        # Brand issues
+        "garbage_brands": 0,
+        "null_brands": 0,
+        "title_just_brand": 0,
+        
+        # Title issues
+        "titles_too_short": 0,
+        "titles_low_quality": 0,
+        
+        # Image issues
+        "null_images": 0,
+        "broken_image_urls": 0,
+        
+        # AI issues
+        "null_essence": 0,
+        "useless_essence": 0,
+        "null_tags": 0,
+        "zero_quality_score": 0,
+        "never_ai_processed": 0,
+        
+        # Category issues
+        "null_category": 0,
+        "lazy_category": 0,
+        "null_subcategory": 0,
+        
+        # Spec issues
+        "null_specs": 0,
+        "empty_specs": 0,
+        "specs_in_title_but_missing": 0,
+        
+        # Listing issues
+        "null_prices": 0,
+        "null_currency": 0,
+        "null_in_stock": 0,
+        
+        # Critical
+        "orphan_products": 0,
+        "completely_broken": 0,  # Products with 5+ issues
+        "unfixable": 0,  # Products that can't be healed
+    }
+    
     async with async_session_maker() as db:
-
-        # ── Products ────────────────────────────────────────────────────────
+        # Total counts
         r = await db.execute(select(func.count(Product.id)))
-        issues["products_total"] = r.scalar() or 0
-
-        for key, cond in [
-            ("products_missing_brand",    or_(Product.brand == None, Product.brand == "", Product.brand == "Unknown")),
-            ("products_missing_category", or_(Product.category == None, Product.category == "", Product.category == "General")),
-            ("products_missing_subcat",   or_(Product.subcategory == None, Product.subcategory == "")),
-            ("products_missing_image",    or_(Product.image_url == None, Product.image_url == "")),
-            ("products_missing_essence",  or_(Product.ai_metadata == None, Product.ai_metadata['essence'].astext == None, Product.ai_metadata['essence'].astext == "")),
-            ("products_missing_tags",     or_(Product.ai_metadata == None, Product.ai_metadata['tags'].astext == None, Product.ai_metadata['tags'].astext == "[]")),
-            ("products_low_ai_score",     or_(Product.ai_metadata == None, Product.ai_metadata['quality_score'].astext == None, Product.ai_metadata['quality_score'].astext == "0")),
-            ("products_empty_specs",      or_(Product.specifications == None, Product.specifications == {})),
-            ("products_null_stats",       Product.stats == None),
-        ]:
-            r = await db.execute(select(func.count(Product.id)).where(cond))
-            issues[key] = r.scalar() or 0
-
-        r = await db.execute(select(func.count(Product.id)).where(
-            ~Product.id.in_(select(ProductListing.product_id).distinct())
-        ))
-        issues["products_orphan"] = r.scalar() or 0
-
-        # ── ProductListings ─────────────────────────────────────────────────
+        issues["total_products"] = r.scalar() or 0
+        
         r = await db.execute(select(func.count(ProductListing.id)))
-        issues["listings_total"] = r.scalar() or 0
-
-        for key, cond in [
-            ("listings_null_original_price",  ProductListing.original_price == None),
-            ("listings_null_discount",        ProductListing.discount_percent == None),
-            ("listings_null_rating",          ProductListing.rating == None),
-            ("listings_null_review_count",    ProductListing.review_count == None),
-            ("listings_null_review_summary",  or_(ProductListing.review_summary == None, ProductListing.review_summary == {})),
-            ("listings_null_currency",        or_(ProductListing.currency == None, ProductListing.currency == "")),
-            ("listings_null_in_stock",        ProductListing.in_stock == None),
-            ("listings_null_price_history",   or_(ProductListing.price_history_json == None, ProductListing.price_history_json == [])),
-            ("listings_null_error_count",     ProductListing.scrape_error_count == None),
-        ]:
-            r = await db.execute(select(func.count(ProductListing.id)).where(cond))
-            issues[key] = r.scalar() or 0
-
-        # ── Platforms ───────────────────────────────────────────────────────
-        r = await db.execute(select(func.count(Platform.id)))
-        issues["platforms_total"] = r.scalar() or 0
-
-        r = await db.execute(select(func.count(Platform.id)).where(
-            or_(Platform.selectors == None, Platform.selectors == {})
-        ))
-        issues["platforms_null_selectors"] = r.scalar() or 0
-
-        r = await db.execute(select(func.count(Platform.id)).where(
-            Platform.scrape_delay_seconds == None
-        ))
-        issues["platforms_null_delay"] = r.scalar() or 0
-
+        issues["total_listings"] = r.scalar() or 0
+        
+        # Load all products for detailed analysis
+        result = await db.execute(
+            select(Product)
+            .options(selectinload(Product.listings))
+            .limit(1000)  # Analyze first 1000
+        )
+        products = result.scalars().all()
+        
+        print(f"\n   Analyzing {len(products)} products in detail...")
+        
+        for product in products:
+            product_issues = 0
+            
+            # Brand analysis
+            if not product.brand:
+                issues["null_brands"] += 1
+                product_issues += 1
+            elif is_garbage_brand(product.brand):
+                issues["garbage_brands"] += 1
+                product_issues += 1
+            
+            if is_title_just_brand(product.title, product.brand):
+                issues["title_just_brand"] += 1
+                product_issues += 1
+            
+            # Title analysis
+            if len(product.title or "") < 15:
+                issues["titles_too_short"] += 1
+                product_issues += 1
+            
+            # Image analysis
+            if not product.image_url:
+                issues["null_images"] += 1
+                product_issues += 1
+            elif is_image_url_broken(product.image_url):
+                issues["broken_image_urls"] += 1
+                product_issues += 1
+            
+            # AI metadata analysis
+            ai_meta = product.ai_metadata or {}
+            
+            if not ai_meta:
+                issues["never_ai_processed"] += 1
+                product_issues += 1
+            
+            essence = ai_meta.get("essence")
+            if not essence:
+                issues["null_essence"] += 1
+                product_issues += 1
+            elif is_essence_useless(product.title, essence):
+                issues["useless_essence"] += 1
+                product_issues += 1
+            
+            tags = ai_meta.get("tags", [])
+            if not tags:
+                issues["null_tags"] += 1
+                product_issues += 1
+            
+            quality_score = ai_meta.get("quality_score", 0)
+            if quality_score == 0:
+                issues["zero_quality_score"] += 1
+                product_issues += 1
+            
+            # Category analysis
+            if not product.category:
+                issues["null_category"] += 1
+                product_issues += 1
+            elif is_category_lazy(product.category):
+                issues["lazy_category"] += 1
+                product_issues += 1
+            
+            if not product.subcategory:
+                issues["null_subcategory"] += 1
+            
+            # Specs analysis
+            specs = product.specifications or {}
+            
+            if not specs:
+                issues["empty_specs"] += 1
+            
+            if has_specs_in_title_but_empty(product.title, specs):
+                issues["specs_in_title_but_missing"] += 1
+                product_issues += 1
+            
+            # Orphan check
+            if not product.listings:
+                issues["orphan_products"] += 1
+                product_issues += 1
+            
+            # Critical: Product with many issues
+            if product_issues >= 5:
+                issues["completely_broken"] += 1
+            
+            # Check if fixable
+            specs_extracted = extract_specs(product.title)
+            passed, _ = check_quality_gate(product.title, specs_extracted)
+            
+            if not passed:
+                issues["unfixable"] += 1
+    
     return issues
 
 
-def print_scan_results(issues: Dict[str, Any]):
-    total_p = issues.get("products_total", 0)
-    total_l = issues.get("listings_total", 0)
-    total_pl = issues.get("platforms_total", 0)
-
-    def severity(v, total):
-        pct = (v / max(total, 1)) * 100
+def print_health_report(issues: Dict[str, Any]):
+    """Print comprehensive health report"""
+    total_products = issues["total_products"]
+    total_listings = issues["total_listings"]
+    
+    def severity(count, total):
+        if total == 0:
+            return GREEN + "✅"
+        pct = (count / total) * 100
         if pct > 30: return RED + "🔴"
         if pct > 10: return YELLOW + "🟡"
         if pct > 0:  return YELLOW + "🟠"
         return GREEN + "✅"
-
-    def row(label, key, total):
-        v = issues.get(key, 0)
-        pct = (v / max(total, 1)) * 100
-        icon = severity(v, total)
-        print(f"    {icon} {label}: {v}/{total} ({pct:.1f}%){RESET}")
-
-    print(f"\n{'=' * 65}")
-    print(f"{BOLD}📊 DATA QUALITY REPORT{RESET}")
-    print(f"{'=' * 65}")
-
-    print(f"\n{BOLD}  ┌─ TABLE: products ({total_p} rows){RESET}")
-    row("brand = NULL/Unknown",       "products_missing_brand",    total_p)
-    row("category = NULL/General",    "products_missing_category", total_p)
-    row("subcategory = NULL",         "products_missing_subcat",   total_p)
-    row("image_url = NULL",           "products_missing_image",    total_p)
-    row("ai_metadata.essence = NULL", "products_missing_essence",  total_p)
-    row("ai_metadata.tags = []",      "products_missing_tags",     total_p)
-    row("quality_score = 0/NULL",     "products_low_ai_score",     total_p)
-    row("specifications = {}",        "products_empty_specs",      total_p)
-    row("stats = NULL",               "products_null_stats",       total_p)
-    row("orphan (no listings)",       "products_orphan",           total_p)
-
-    print(f"\n{BOLD}  ├─ TABLE: product_listings ({total_l} rows){RESET}")
-    row("original_price = NULL",      "listings_null_original_price",  total_l)
-    row("discount_percent = NULL",    "listings_null_discount",        total_l)
-    row("rating = NULL",              "listings_null_rating",          total_l)
-    row("review_count = NULL",        "listings_null_review_count",    total_l)
-    row("review_summary = NULL/{}",   "listings_null_review_summary",  total_l)
-    row("currency = NULL",            "listings_null_currency",        total_l)
-    row("in_stock = NULL",            "listings_null_in_stock",        total_l)
-    row("price_history = NULL",       "listings_null_price_history",   total_l)
-    row("scrape_error_count = NULL",  "listings_null_error_count",     total_l)
-
-    print(f"\n{BOLD}  └─ TABLE: platforms ({total_pl} rows){RESET}")
-    row("selectors = NULL/{}",        "platforms_null_selectors", total_pl)
-    row("scrape_delay = NULL",        "platforms_null_delay",     total_pl)
-
-    # Overall health
-    fixable = sum(v for k, v in issues.items()
-                  if k not in ("products_total", "listings_total", "platforms_total"))
-    total_rows = total_p + total_l + total_pl
-    health = max(0, 100 - (fixable / max(total_rows, 1) * 100))
+    
+    def row(label, key):
+        count = issues.get(key, 0)
+        pct = (count / max(total_products, 1)) * 100
+        icon = severity(count, total_products)
+        return f"    {icon} {label}: {count:,} ({pct:.1f}%){RESET}"
+    
+    print(f"\n{'=' * 75}")
+    print(f"{BOLD}🔬 DATABASE HEALTH REPORT{RESET}")
+    print(f"{'=' * 75}")
+    print(f"  Total Products: {total_products:,}")
+    print(f"  Total Listings: {total_listings:,}")
+    
+    print(f"\n{BOLD}  ┌─ BRAND ISSUES{RESET}")
+    print(row("NULL/Empty Brand", "null_brands"))
+    print(row("Garbage Brand (Men/Cotton/Blue/Generic)", "garbage_brands"))
+    print(row("Title is Just Brand Name", "title_just_brand"))
+    
+    print(f"\n{BOLD}  ├─ TITLE ISSUES{RESET}")
+    print(row("Title < 15 chars", "titles_too_short"))
+    print(row("Low Quality Title", "titles_low_quality"))
+    
+    print(f"\n{BOLD}  ├─ IMAGE ISSUES{RESET}")
+    print(row("NULL Image URL", "null_images"))
+    print(row("Broken/Placeholder Image", "broken_image_urls"))
+    
+    print(f"\n{BOLD}  ├─ AI METADATA ISSUES{RESET}")
+    print(row("Never AI Processed", "never_ai_processed"))
+    print(row("NULL AI Essence", "null_essence"))
+    print(row("Useless Essence (same as title)", "useless_essence"))
+    print(row("NULL/Empty Tags", "null_tags"))
+    print(row("Quality Score = 0", "zero_quality_score"))
+    
+    print(f"\n{BOLD}  ├─ CATEGORY ISSUES{RESET}")
+    print(row("NULL Category", "null_category"))
+    print(row("Lazy Category (General/Other)", "lazy_category"))
+    print(row("NULL Subcategory", "null_subcategory"))
+    
+    print(f"\n{BOLD}  ├─ SPECIFICATION ISSUES{RESET}")
+    print(row("Empty Specifications {}", "empty_specs"))
+    print(row("Specs in Title but Not Extracted", "specs_in_title_but_missing"))
+    
+    print(f"\n{BOLD}  └─ CRITICAL ISSUES{RESET}")
+    print(row("Orphan Products (no listings)", "orphan_products"))
+    print(row("Completely Broken (5+ issues)", "completely_broken"))
+    print(row("Unfixable (fail quality gate)", "unfixable"))
+    
+    # Calculate health score
+    fixable_issues = sum(
+        issues.get(k, 0) for k in [
+            "garbage_brands", "null_brands", "null_essence", "useless_essence",
+            "null_category", "lazy_category", "empty_specs", "specs_in_title_but_missing",
+            "zero_quality_score"
+        ]
+    )
+    
+    total_checkable = total_products * 9  # 9 major checks
+    health = max(0, 100 - (fixable_issues / max(total_checkable, 1) * 100))
+    
     bar_filled = int(health / 5)
     bar = "█" * bar_filled + "░" * (20 - bar_filled)
     color = GREEN if health > 80 else (YELLOW if health > 50 else RED)
-    print(f"\n  {color}DATA HEALTH: [{bar}] {health:.1f}%{RESET}")
-    print(f"{'=' * 65}")
+    
+    print(f"\n  {color}DATABASE HEALTH: [{bar}] {health:.1f}%{RESET}")
+    print(f"\n  {BOLD}FIXABLE ISSUES: {fixable_issues:,}{RESET}")
+    print(f"  {RED}UNFIXABLE (recommend delete): {issues.get('unfixable', 0):,}{RESET}")
+    
+    print(f"{'=' * 75}")
 
 
 # =============================================================================
-# SECTION 2: PRODUCTS TABLE FIXER
+# INTELLIGENT FIXERS
 # =============================================================================
 
-def _is_valid_brand(brand: Optional[str]) -> bool:
-    """Check brand is not a generic word"""
-    if not brand:
-        return False
-    b = brand.lower().strip()
-    if b in GENERIC_WORDS:
-        return False
-    if len(b) <= 1:
-        return False
-    return True
+async def fix_brands_intelligently(limit: int = 200, dry_run: bool = False) -> Dict[str, int]:
+    """
+    Fix garbage/NULL brands using v4.0 extraction + AI
+    """
+    header(f"🏷️  Fixing Brands (limit={limit}, dry_run={dry_run})")
+    
+    stats = {
+        "scanned": 0,
+        "null_fixed": 0,
+        "garbage_fixed": 0,
+        "ai_extracted": 0,
+        "regex_extracted": 0,
+        "marked_generic": 0,  # NEW: For fashion items
+        "unfixable": 0,
+        "errors": 0
+    }
+    
+    async with async_session_maker() as db:
+        # Find products with garbage/NULL brands
+        result = await db.execute(
+            select(Product)
+            .where(or_(
+                Product.brand == None,
+                Product.brand == "",
+                Product.brand == "Unknown"
+            ))
+            .limit(limit)
+        )
+        products = result.scalars().all()
+        
+        # Also check for garbage brands
+        all_products = await db.execute(select(Product).limit(limit * 2))
+        all_products = all_products.scalars().all()
+        
+        garbage_products = [p for p in all_products if is_garbage_brand(p.brand)]
+        products_to_fix = list(set(list(products) + garbage_products))[:limit]
+        
+        print(f"\n   Found {len(products_to_fix)} products with brand issues\n")
+        
+        batch = 0
+        for i, product in enumerate(products_to_fix, 1):
+            stats["scanned"] += 1
+            old_brand = product.brand
+            
+            try:
+                print(f"   [{i}/{len(products_to_fix)}] {product.title[:50]}...")
+                print(f"      Current brand: {old_brand or 'NULL'}")
+                
+                # Check if it's a generic fashion item first
+                specs = extract_specs(product.title)
+                if specs.garment_type and not specs.brand:
+                    new_brand = "Generic Fashion"
+                    stats["marked_generic"] += 1
+                    ok(f"Marked as: {new_brand} (Garment: {specs.garment_type})")
+                    
+                    if not dry_run:
+                        product.brand = new_brand
+                    batch += 1
+                    continue
+                
+                # Strategy 1: Extract with regex
+                normalized_brand, original_brand = extract_brand(product.title)
+                
+                # We missed HP in the brand list casing! Let's handle it manually.
+                if product.title.startswith("HP ") or " HP " in product.title:
+                    normalized_brand = "HP"
+                
+                if normalized_brand and is_valid_brand(normalized_brand):
+                    new_brand = normalized_brand
+                    stats["regex_extracted"] += 1
+                    ok(f"Regex extracted: {new_brand}")
+                else:
+                    # Strategy 2: Use AI (only if it looks like electronics/appliances)
+                    category_lower = (product.category or "").lower()
+                    if "fashion" in category_lower or "clothing" in category_lower:
+                        warn("Generic fashion item - skipping AI")
+                        stats["unfixable"] += 1
+                        continue
+                        
+                    try:
+                        pd = ProductData(
+                            external_id=str(product.id),
+                            title=product.title,
+                            current_price=Decimal("0"),
+                            product_url="",
+                            platform_name="unknown"
+                        )
+                        
+                        enriched = await groq_client.process_product(pd)
+                        ai_brand = enriched.get("specifications", {}).get("brand")
+                        
+                        if ai_brand and is_valid_brand(ai_brand):
+                            new_brand = ai_brand
+                            stats["ai_extracted"] += 1
+                            ok(f"AI extracted: {new_brand}")
+                        else:
+                            warn("Could not extract valid brand")
+                            stats["unfixable"] += 1
+                            continue
+                    
+                    except Exception as e:
+                        err(f"AI failed: {e}")
+                        stats["unfixable"] += 1
+                        continue
+                
+                # Update database
+                if not dry_run:
+                    product.brand = new_brand
+                    
+                    # Also update ai_metadata if exists
+                    if product.ai_metadata:
+                        ai_meta = dict(product.ai_metadata)
+                        ai_meta["brand_fixed_at"] = datetime.utcnow().isoformat()
+                        ai_meta["old_brand"] = old_brand
+                        product.ai_metadata = ai_meta
+                
+                if old_brand:
+                    stats["garbage_fixed"] += 1
+                else:
+                    stats["null_fixed"] += 1
+                
+                batch += 1
+                if batch >= 20 and not dry_run:
+                    await db.commit()
+                    batch = 0
+            
+            except Exception as e:
+                stats["errors"] += 1
+                err(f"Error: {e}")
+        
+        if not dry_run and batch > 0:
+            await db.commit()
+    
+    return stats
+
+async def fix_specs_from_titles(limit: int = 200, dry_run: bool = False) -> Dict[str, int]:
+    """
+    Extract specs from titles when specifications field is empty
+    
+    Uses v4.0 extraction for:
+    - RAM, Storage, Screen size, Processor
+    - Fashion attributes (garment, material, fit)
+    - Product line, model, generation
+    """
+    header(f"📊 Extracting Specs from Titles (limit={limit}, dry_run={dry_run})")
+    
+    stats = {
+        "scanned": 0,
+        "specs_extracted": 0,
+        "ram_extracted": 0,
+        "storage_extracted": 0,
+        "screen_extracted": 0,
+        "fashion_extracted": 0,
+        "errors": 0
+    }
+    
+    async with async_session_maker() as db:
+        # Find products with empty specs but potential info in title
+        result = await db.execute(
+            select(Product)
+            .where(or_(
+                Product.specifications == None,
+                Product.specifications == {}
+            ))
+            .limit(limit)
+        )
+        products = result.scalars().all()
+        
+        print(f"\n   Found {len(products)} products with empty specs\n")
+        
+        batch = 0
+        for i, product in enumerate(products, 1):
+            stats["scanned"] += 1
+            
+            try:
+                # Extract all specs
+                specs = extract_specs(
+                    product.title,
+                    category=product.category or "general"
+                )
+                
+                # Build spec dict
+                new_specs = {}
+                changes = []
+                
+                if specs.brand and is_valid_brand(specs.brand):
+                    new_specs["brand"] = specs.brand
+                
+                if specs.product_line:
+                    new_specs["product_line"] = specs.product_line
+                    changes.append(f"line={specs.product_line}")
+                
+                if specs.model:
+                    new_specs["model"] = specs.model
+                    changes.append(f"model={specs.model}")
+                
+                if specs.ram_gb:
+                    new_specs["ram_gb"] = specs.ram_gb
+                    stats["ram_extracted"] += 1
+                    changes.append(f"RAM={specs.ram_gb}GB")
+                
+                if specs.storage_gb:
+                    new_specs["storage_gb"] = specs.storage_gb
+                    stats["storage_extracted"] += 1
+                    changes.append(f"Storage={specs.storage_gb}GB")
+                
+                if specs.screen_size:
+                    new_specs["screen_size"] = specs.screen_size
+                    stats["screen_extracted"] += 1
+                    changes.append(f"Screen={specs.screen_size}\"")
+                
+                if specs.processor:
+                    new_specs["processor"] = specs.processor
+                    changes.append(f"CPU={specs.processor}")
+                
+                if specs.generation:
+                    new_specs["variant"] = specs.generation
+                    changes.append(f"variant={specs.generation}")
+                
+                if specs.network:
+                    new_specs["network"] = specs.network
+                    changes.append(f"network={specs.network}")
+                
+                # Fashion attributes
+                if specs.garment_type:
+                    new_specs["garment_type"] = specs.garment_type
+                    stats["fashion_extracted"] += 1
+                    changes.append(f"garment={specs.garment_type}")
+                
+                if specs.material:
+                    new_specs["material"] = specs.material
+                    changes.append(f"material={specs.material}")
+                
+                if specs.fit:
+                    new_specs["fit"] = specs.fit
+                
+                if specs.gender:
+                    new_specs["gender"] = specs.gender
+                
+                if new_specs:
+                    print(f"   [{i}] {product.title[:50]}...")
+                    ok(" | ".join(changes))
+                    
+                    if not dry_run:
+                        product.specifications = new_specs
+                    
+                    stats["specs_extracted"] += 1
+                    
+                    batch += 1
+                    if batch >= 20 and not dry_run:
+                        await db.commit()
+                        batch = 0
+            
+            except Exception as e:
+                stats["errors"] += 1
+                err(f"[{i}] Error: {e}")
+        
+        if not dry_run and batch > 0:
+            await db.commit()
+    
+    return stats
 
 
-def _build_product_data(product: Product, listing: Optional[ProductListing] = None,
-                        platform_name: str = "unknown") -> ProductData:
-    price = Decimal(str(listing.current_price)) if listing and listing.current_price else Decimal('0')
-    return ProductData(
-        external_id=str(product.id),
-        title=product.title,
-        current_price=price,
-        product_url=listing.product_url if listing else "",
-        platform_name=platform_name,
-        brand=product.brand if _is_valid_brand(product.brand) else None,
-        category=product.category if product.category and product.category not in ("General", "") else None,
-        subcategory=product.subcategory,
-        image_url=product.image_url or "",
-        rating=listing.rating if listing else None,
-        review_count=listing.review_count if listing else None,
-        specifications=product.specifications or {},
-    )
-
-
-async def fix_products(limit: int = 200, dry_run: bool = False) -> Dict[str, int]:
-    """Fix all NULL/empty fields in the products table using AI"""
-    header(f"🛠️  Fixing Products Table (limit={limit}, dry_run={dry_run})")
-
-    stats = {"brand": 0, "category": 0, "subcategory": 0, "specs": 0,
-             "essence": 0, "tags": 0, "stats_reset": 0, "errors": 0, "skipped": 0}
-
+async def fix_images_from_listings(limit: int = 200, dry_run: bool = False) -> Dict[str, int]:
+    """
+    Fix NULL/broken product images by pulling from listings
+    """
+    header(f"🖼️  Fixing Images (limit={limit}, dry_run={dry_run})")
+    
+    stats = {
+        "scanned": 0,
+        "fixed": 0,
+        "no_listing_image": 0,
+        "errors": 0
+    }
+    
     async with async_session_maker() as db:
         result = await db.execute(
             select(Product)
             .options(selectinload(Product.listings))
             .where(or_(
-                Product.brand == None, Product.brand == "", Product.brand == "Unknown",
-                Product.category == None, Product.category == "", Product.category == "General",
-                Product.subcategory == None,
-                Product.ai_metadata == None,
-                Product.ai_metadata['essence'].astext == None,
-                Product.ai_metadata['essence'].astext == "",
-                Product.ai_metadata['tags'].astext == None,
-                Product.ai_metadata['tags'].astext == "[]",
-                Product.specifications == None,
-                Product.specifications == {},
-                Product.stats == None,
+                Product.image_url == None,
+                Product.image_url == ""
             ))
-            .order_by(Product.created_at.desc())
             .limit(limit)
         )
         products = result.scalars().all()
-        print(f"\n   Found {len(products)} products needing fixes\n")
-
-        batch = 0
-        for i, product in enumerate(products, 1):
-            try:
-                listing = product.listings[0] if product.listings else None
-                platform_name = "unknown"
-                if listing:
-                    try:
-                        r = await db.execute(select(Platform.name).where(Platform.id == listing.platform_id))
-                        platform_name = r.scalar() or "unknown"
-                    except Exception:
-                        pass
-
-                print(f"   [{i}/{len(products)}] {product.title[:55]}...")
-
-                # ── Fix stats (no AI needed) ──
-                if product.stats is None:
-                    if not dry_run:
-                        product.stats = {"views": 0, "clicks": 0, "watches": 0, "searches": 0, "conversions": 0}
-                    stats["stats_reset"] += 1
-
-                # ── AI Enrichment ──
-                pd = _build_product_data(product, listing, platform_name)
-                enriched = await groq_client.process_product(pd)
-
-                if not enriched:
-                    stats["skipped"] += 1
-                    info("AI returned nothing")
-                    continue
-
-                changes = []
-
-                # Brand
-                if not _is_valid_brand(product.brand):
-                    new_brand = enriched.get("specifications", {}).get("brand")
-                    if _is_valid_brand(new_brand):
-                        if not dry_run: product.brand = new_brand
-                        stats["brand"] += 1
-                        changes.append(f"Brand→{new_brand}")
-
-                # Category
-                if not product.category or product.category in ("", "General"):
-                    new_cat = enriched.get("category")
-                    if new_cat and new_cat not in ("", "General"):
-                        if not dry_run: product.category = new_cat
-                        stats["category"] += 1
-                        changes.append(f"Category→{new_cat}")
-
-                # Subcategory
-                if not product.subcategory:
-                    new_sub = enriched.get("subcategory")
-                    if new_sub:
-                        if not dry_run: product.subcategory = new_sub
-                        stats["subcategory"] += 1
-                        changes.append(f"Subcat→{new_sub}")
-
-                # Specifications
-                if not product.specifications or product.specifications == {}:
-                    new_specs = {k: v for k, v in (enriched.get("specifications") or {}).items() if v is not None}
-                    if new_specs:
-                        if not dry_run: product.specifications = new_specs
-                        stats["specs"] += 1
-                        changes.append(f"Specs({len(new_specs)})")
-
-                # AI Metadata
-                ai_meta = product.ai_metadata or {}
-                ai_changed = False
-
-                new_essence = enriched.get("essence", "")
-                if new_essence and len(new_essence) >= 5 and not ai_meta.get("essence"):
-                    ai_meta["essence"] = new_essence
-                    stats["essence"] += 1
-                    changes.append(f"Essence→{new_essence[:25]}...")
-                    ai_changed = True
-
-                new_tags = enriched.get("tags", [])
-                if new_tags and not ai_meta.get("tags"):
-                    ai_meta["tags"] = new_tags
-                    stats["tags"] += 1
-                    changes.append(f"Tags({len(new_tags)})")
-                    ai_changed = True
-
-                new_score = enriched.get("quality_score", 0)
-                if new_score > (ai_meta.get("quality_score") or 0):
-                    ai_meta["quality_score"] = new_score
-                    ai_changed = True
-
-                if ai_changed:
-                    ai_meta["fixed_at"] = datetime.utcnow().isoformat()
-                    ai_meta["fixed_by"] = "fix_data_v3"
-                    if not dry_run: product.ai_metadata = ai_meta
-
-                if changes:
-                    ok(" | ".join(changes))
-                else:
-                    info("No fixable fields")
-
-                batch += 1
-                if batch >= 10 and not dry_run:
-                    await db.commit()
-                    batch = 0
-
-            except Exception as e:
-                stats["errors"] += 1
-                err(str(e)[:80])
-
-            await asyncio.sleep(0.2)  # Light rate limit
-
-        if not dry_run and batch > 0:
-            await db.commit()
-
-    return stats
-
-
-# =============================================================================
-# SECTION 3: PRODUCT_LISTINGS TABLE FIXER  (NO AI — pure logic)
-# =============================================================================
-
-async def fix_listings(limit: int = 500, dry_run: bool = False) -> Dict[str, int]:
-    """
-    Fix NULL fields in product_listings using pure calculation logic.
-    This is fast (no AI) — runs on all listings in bulk.
-    """
-    header(f"📋 Fixing ProductListings Table (limit={limit}, dry_run={dry_run})")
-
-    stats = {
-        "original_price": 0, "discount_percent": 0, "rating": 0,
-        "review_count": 0, "review_summary": 0, "currency": 0,
-        "in_stock": 0, "price_history": 0, "error_count": 0,
-        "errors": 0,
-    }
-
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(ProductListing).where(or_(
-                ProductListing.original_price == None,
-                ProductListing.discount_percent == None,
-                ProductListing.rating == None,
-                ProductListing.review_count == None,
-                ProductListing.review_summary == None,
-                ProductListing.review_summary == {},
-                ProductListing.currency == None,
-                ProductListing.in_stock == None,
-                ProductListing.price_history_json == None,
-                ProductListing.price_history_json == [],
-                ProductListing.scrape_error_count == None,
-            ))
-            .limit(limit)
+        
+        # Also check broken images
+        all_result = await db.execute(
+            select(Product)
+            .options(selectinload(Product.listings))
+            .limit(limit * 2)
         )
-        listings = result.scalars().all()
-        print(f"\n   Found {len(listings)} listings needing fixes")
-
+        all_products = all_result.scalars().all()
+        
+        broken_products = [p for p in all_products if is_image_url_broken(p.image_url)]
+        
+        products_to_fix = list(set(list(products) + broken_products))[:limit]
+        
+        print(f"\n   Found {len(products_to_fix)} products with image issues\n")
+        
         batch = 0
-        fixed_ids = []
-
-        for listing in listings:
-            changed = []
-            cp = listing.current_price or 0
-
-            # ── original_price ──────────────────────────────────────────────
-            if listing.original_price is None:
-                if not dry_run: listing.original_price = cp
-                stats["original_price"] += 1
-                changed.append("orig_price")
-
-            # ── discount_percent ─────────────────────────────────────────────
-            if listing.discount_percent is None:
-                op = listing.original_price or cp
-                if op and cp and op > cp:
-                    disc = round(((op - cp) / op) * 100, 1)
-                else:
-                    disc = 0.0
-                if not dry_run: listing.discount_percent = disc
-                stats["discount_percent"] += 1
-                changed.append(f"disc={disc}%")
-
-            # ── rating ───────────────────────────────────────────────────────
-            if listing.rating is None:
-                if not dry_run: listing.rating = 0.0
-                stats["rating"] += 1
-                changed.append("rating=0")
-
-            # ── review_count ─────────────────────────────────────────────────
-            if listing.review_count is None:
-                if not dry_run: listing.review_count = 0
-                stats["review_count"] += 1
-                changed.append("reviews=0")
-
-            # ── review_summary ───────────────────────────────────────────────
-            if listing.review_summary is None or listing.review_summary == {}:
-                default_summary = {"positive": [], "negative": [], "summary": "No reviews yet"}
-                if not dry_run: listing.review_summary = default_summary
-                stats["review_summary"] += 1
-                changed.append("summary")
-
-            # ── currency ──────────────────────────────────────────────────────
-            if not listing.currency:
-                if not dry_run: listing.currency = "INR"
-                stats["currency"] += 1
-                changed.append("currency=INR")
-
-            # ── in_stock ──────────────────────────────────────────────────────
-            if listing.in_stock is None:
-                if not dry_run: listing.in_stock = True
-                stats["in_stock"] += 1
-                changed.append("in_stock=True")
-
-            # ── price_history ─────────────────────────────────────────────────
-            if not listing.price_history_json:
-                seed = [{"p": round(cp, 2), "d": date.today().isoformat()}] if cp else []
-                if not dry_run: listing.price_history_json = seed
-                stats["price_history"] += 1
-                changed.append("price_hist")
-
-            # ── scrape_error_count ────────────────────────────────────────────
-            if listing.scrape_error_count is None:
-                if not dry_run: listing.scrape_error_count = 0
-                stats["error_count"] += 1
-                changed.append("err_count=0")
-
-            if changed:
-                fixed_ids.append(listing.id)
-
-            batch += 1
-            if batch >= 50 and not dry_run:
-                await db.commit()
-                batch = 0
-
-        if not dry_run and batch > 0:
-            await db.commit()
-
-        print(f"   Fixed {len(fixed_ids)} listings")
-
-    return stats
-
-
-# =============================================================================
-# SECTION 4: PLATFORMS TABLE FIXER
-# =============================================================================
-
-async def fix_platforms(dry_run: bool = False) -> Dict[str, int]:
-    """Fix NULL selectors and other missing fields in platforms table"""
-    header(f"🌐 Fixing Platforms Table (dry_run={dry_run})")
-
-    stats = {"selectors": 0, "delay": 0, "activated": 0, "errors": 0}
-
-    async with async_session_maker() as db:
-        result = await db.execute(select(Platform))
-        platforms = result.scalars().all()
-        print(f"\n   Found {len(platforms)} platforms\n")
-
-        for platform in platforms:
-            changes = []
-
-            # ── Selectors ─────────────────────────────────────────────────────
-            current_selectors = platform.selectors or {}
-            needs_selector_fix = (
-                not current_selectors
-                or not current_selectors.get("search_url_template")
-                or not current_selectors.get("product_title")
-            )
-
-            if needs_selector_fix:
-                known = KNOWN_PLATFORM_SELECTORS.get(platform.name.lower())
-                if known:
-                    if not dry_run: platform.selectors = known
-                    stats["selectors"] += 1
-                    changes.append("selectors=known")
-                else:
-                    # Inject default empty structure so it's not NULL
-                    if not dry_run: platform.selectors = DEFAULT_SELECTORS.copy()
-                    stats["selectors"] += 1
-                    changes.append("selectors=default")
-
-            # Ensure healed_selectors key always exists
-            elif "healed_selectors" not in (platform.selectors or {}):
-                new_sel = dict(platform.selectors)
-                new_sel["healed_selectors"] = []
-                if not dry_run: platform.selectors = new_sel
-                changes.append("healed_selectors=[]")
-
-            # ── scrape_delay_seconds ──────────────────────────────────────────
-            if platform.scrape_delay_seconds is None:
-                if not dry_run: platform.scrape_delay_seconds = 2
-                stats["delay"] += 1
-                changes.append("delay=2s")
-
-            # ── is_active ─────────────────────────────────────────────────────
-            if platform.is_active is None:
-                if not dry_run: platform.is_active = True
-                stats["activated"] += 1
-                changes.append("is_active=True")
-
-            if changes:
-                print(f"   {GREEN}✅{RESET} {platform.name}: {' | '.join(changes)}")
+        for i, product in enumerate(products_to_fix, 1):
+            stats["scanned"] += 1
+            
+            # Try to get image from first listing
+            if product.listings:
+                # Try to find listing with valid image
+                for listing in product.listings:
+                    # Image might be in product specs or other fields
+                    # For now, we rely on scraper to populate it
+                    pass
+                
+                # Placeholder: in production, you'd scrape the listing URL again
+                warn(f"[{i}] No auto-fix available - needs re-scrape")
+                stats["no_listing_image"] += 1
             else:
-                print(f"   {DIM}⚪ {platform.name}: OK{RESET}")
-
-        if not dry_run:
+                warn(f"[{i}] No listings to pull image from")
+                stats["no_listing_image"] += 1
+        
+        if not dry_run and batch > 0:
             await db.commit()
-
+    
     return stats
 
 
-# =============================================================================
-# SECTION 5: ORPHAN CLEANER
-# =============================================================================
-
-async def fix_orphans(dry_run: bool = False) -> Dict[str, int]:
-    """Delete products with no listings"""
-    header(f"🗑️  Cleaning Orphan Products (dry_run={dry_run})")
-    stats = {"deleted": 0}
-
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(Product.id, Product.title).where(
-                ~Product.id.in_(select(ProductListing.product_id).distinct())
-            )
-        )
-        orphans = result.all()
-        print(f"\n   Found {len(orphans)} orphans\n")
-
-        for pid, title in orphans:
-            print(f"   {'🗑️ ' if not dry_run else '👁️ '} {title[:55]}...")
-            if not dry_run:
-                await db.execute(delete(Product).where(Product.id == pid))
-            stats["deleted"] += 1
-
-        if not dry_run and orphans:
-            await db.commit()
-
-    return stats
-
-
-# =============================================================================
-# SECTION 6: RE-ENRICH (Force AI refresh on all products)
-# =============================================================================
-
-async def re_enrich(limit: int = 50, dry_run: bool = False) -> Dict[str, int]:
-    """Force re-run AI on products, update only if quality improves"""
-    header(f"🤖 Re-enriching Products (limit={limit}, dry_run={dry_run})")
-    stats = {"processed": 0, "improved": 0, "brand_fixed": 0, "cat_fixed": 0, "unchanged": 0, "errors": 0}
-
+async def fix_ai_metadata(limit: int = 100, dry_run: bool = False) -> Dict[str, int]:
+    """
+    Re-process products with low quality AI metadata
+    """
+    header(f"🤖 Fixing AI Metadata (limit={limit}, dry_run={dry_run})")
+    
+    stats = {
+        "scanned": 0,
+        "re_enriched": 0,
+        "quality_improved": 0,
+        "essence_improved": 0,
+        "errors": 0
+    }
+    
     async with async_session_maker() as db:
         result = await db.execute(
             select(Product)
-            .options(selectinload(Product.listings))
-            .order_by(Product.created_at.desc())
+            .where(or_(
+                Product.ai_metadata == None,
+                Product.ai_metadata['quality_score'].astext == '0',
+                Product.ai_metadata['essence'].astext == None
+            ))
             .limit(limit)
         )
         products = result.scalars().all()
-
+        
+        print(f"\n   Found {len(products)} products needing AI re-processing\n")
+        
         batch = 0
         for i, product in enumerate(products, 1):
+            stats["scanned"] += 1
+            
             try:
-                listing = product.listings[0] if product.listings else None
-                old_score = (product.ai_metadata or {}).get("quality_score") or 0
-                pd = _build_product_data(product, listing)
+                old_score = (product.ai_metadata or {}).get("quality_score", 0)
+                
+                pd = ProductData(
+                    external_id=str(product.id),
+                    title=product.title,
+                    current_price=Decimal("0"),
+                    product_url="",
+                    platform_name="unknown",
+                    brand=product.brand,
+                    category=product.category
+                )
+                
                 enriched = await groq_client.process_product(pd)
-
-                if not enriched:
-                    stats["unchanged"] += 1
-                    continue
-
-                changes = []
-                new_score = enriched.get("quality_score", 0)
-
-                if new_score > old_score:
-                    ai_meta = product.ai_metadata or {}
-                    ai_meta.update({
-                        "essence": enriched.get("essence") or ai_meta.get("essence", ""),
-                        "tags": enriched.get("tags") or ai_meta.get("tags", []),
-                        "quality_score": new_score,
-                        "re_enriched_at": datetime.utcnow().isoformat(),
-                    })
-                    if not dry_run: product.ai_metadata = ai_meta
-                    stats["improved"] += 1
-                    changes.append(f"score {old_score}→{new_score}")
-
-                # Always fix brand/category regardless of score
-                if not _is_valid_brand(product.brand):
-                    nb = enriched.get("specifications", {}).get("brand")
-                    if _is_valid_brand(nb):
-                        if not dry_run: product.brand = nb
-                        stats["brand_fixed"] += 1
-                        changes.append(f"brand→{nb}")
-
-                if not product.category or product.category in ("", "General"):
-                    nc = enriched.get("category")
-                    if nc and nc not in ("", "General"):
-                        if not dry_run:
-                            product.category = nc
-                            product.subcategory = enriched.get("subcategory") or product.subcategory
-                        stats["cat_fixed"] += 1
-                        changes.append(f"cat→{nc}")
-
-                stats["processed"] += 1
-                if changes:
-                    ok(f"[{i}] {' | '.join(changes)}")
-                else:
-                    info(f"[{i}] No improvement (score={old_score})")
-                    stats["unchanged"] += 1
-
-                batch += 1
-                if batch >= 10 and not dry_run:
-                    await db.commit()
-                    batch = 0
-
-                await asyncio.sleep(0.2)
-
+                
+                if enriched:
+                    new_score = enriched.get("quality_score", 0)
+                    new_essence = enriched.get("essence")
+                    
+                    print(f"   [{i}] {product.title[:50]}...")
+                    
+                    changes = []
+                    
+                    if new_score > old_score:
+                        changes.append(f"score {old_score}→{new_score}")
+                        stats["quality_improved"] += 1
+                    
+                    if new_essence and not is_essence_useless(product.title, new_essence):
+                        changes.append(f"essence='{new_essence[:30]}...'")
+                        stats["essence_improved"] += 1
+                    
+                    if changes:
+                        ok(" | ".join(changes))
+                    
+                    if not dry_run:
+                        ai_meta = {
+                            "essence": new_essence or "",
+                            "tags": enriched.get("tags", []),
+                            "quality_score": new_score,
+                            "re_enriched_at": datetime.utcnow().isoformat(),
+                            "previous_score": old_score
+                        }
+                        product.ai_metadata = ai_meta
+                        
+                        # Update category if better
+                        new_cat = enriched.get("category")
+                        if new_cat and not is_category_lazy(new_cat):
+                            product.category = new_cat
+                    
+                    stats["re_enriched"] += 1
+                    
+                    batch += 1
+                    if batch >= 10 and not dry_run:
+                        await db.commit()
+                        batch = 0
+                
+                await asyncio.sleep(0.3)  # Rate limit
+            
             except Exception as e:
                 stats["errors"] += 1
-                err(f"[{i}] {str(e)[:70]}")
-
+                err(f"[{i}] Error: {e}")
+        
         if not dry_run and batch > 0:
             await db.commit()
-
+    
     return stats
 
 
+async def delete_garbage_products(dry_run: bool = False) -> Dict[str, int]:
+    """
+    Delete products that are complete garbage or unfixable.
+    """
+    header(f"🗑️  Deleting Unfixable Garbage (dry_run={dry_run})")
+    
+    stats = {
+        "scanned": 0,
+        "deleted": 0,
+        "kept": 0
+    }
+    
+    async with async_session_maker() as db:
+        result = await db.execute(select(Product).limit(1000))
+        products = result.scalars().all()
+        
+        print(f"\n   Scanning {len(products)} products for unfixable garbage...\n")
+        
+        for product in products:
+            stats["scanned"] += 1
+            title = product.title or ""
+            title_lower = title.lower()
+            
+            # Extract specs to check for features
+            specs = extract_specs(title)
+            passed_gate, gate_reason = check_quality_gate(title, specs)
+            
+            should_delete = False
+            reason = ""
+            
+            # 1. Literal Junk Phrases (Timers, Statuses)
+            junk_phrases = ['currently unavailable', 'coming soon', '00h :', '01h :']
+            if any(x in title_lower for x in junk_phrases):
+                should_delete = True
+                reason = "Title is a status message or timer"
+                
+            # 2. Title is literally just the brand name (e.g. "VANGULL...")
+            elif is_title_just_brand(title, product.brand):
+                should_delete = True
+                reason = f"Title is just the brand name ('{product.brand}')"
+                
+            # 3. Garbage brand AND no identifiable specs/garment type
+            elif (not product.brand or is_garbage_brand(product.brand)):
+                if not specs.garment_type and not specs.model and not specs.product_line:
+                    should_delete = True
+                    reason = f"Garbage brand ('{product.brand}') with no extractable product type"
+            
+            # 4. Fails the standard quality gate
+            elif not passed_gate:
+                should_delete = True
+                reason = gate_reason
+                
+            # EXECUTE DELETION
+            if should_delete:
+                print(f"   🗑️  {title[:50]}...")
+                print(f"      Reason: {reason}")
+                
+                if not dry_run:
+                    await db.delete(product)
+                
+                stats["deleted"] += 1
+            else:
+                stats["kept"] += 1
+        
+        if not dry_run and stats["deleted"] > 0:
+            await db.commit()
+        
+        print(f"\n   {'Would delete' if dry_run else 'Deleted'}: {stats['deleted']}")
+        print(f"   Kept: {stats['kept']}")
+    
+    return stats
+
 # =============================================================================
-# SECTION 7: SUMMARY PRINTER
+# SUMMARY
 # =============================================================================
 
-def print_summary(title: str, results: Dict[str, int]):
-    print(f"\n{'─' * 55}")
+def print_fix_summary(title: str, stats: Dict[str, int]):
+    print(f"\n{'─' * 60}")
     print(f"{BOLD}📊 {title}{RESET}")
-    print(f"{'─' * 55}")
-    for key, value in results.items():
+    print(f"{'─' * 60}")
+    for key, value in stats.items():
         if value > 0 and "error" in key:
             print(f"   {RED}❌{RESET} {key.replace('_', ' ').title()}: {value}")
         elif value > 0:
             print(f"   {GREEN}✅{RESET} {key.replace('_', ' ').title()}: {value}")
-        else:
-            print(f"   {DIM}⚪ {key.replace('_', ' ').title()}: 0{RESET}")
-    print(f"{'─' * 55}")
+    print(f"{'─' * 60}")
 
 
 # =============================================================================
-# SECTION 8: MAIN
+# MAIN
 # =============================================================================
 
 async def main(args):
     start = datetime.now()
-
-    print(f"\n{'=' * 65}")
-    print(f"{BOLD}🔧 DEALHUNT DATA FIXER v3.0{RESET}")
+    
+    print(f"\n{'=' * 75}")
+    print(f"{BOLD}🔬 DATABASE HEALTH ANALYZER v4.0{RESET}")
     print(f"   Time: {start.strftime('%Y-%m-%d %H:%M:%S')}")
     if args.dry_run:
-        print(f"   {YELLOW}⚠️  DRY RUN — no changes will be written to DB{RESET}")
-    print(f"{'=' * 65}")
-
-    # Always scan
-    issues = await scan_database()
-    print_scan_results(issues)
-
-    do_anything = any([
-        args.fix_products, args.fix_listings, args.fix_platforms,
-        args.fix_orphans, args.re_enrich, args.fix_all,
-    ])
-
-    if not do_anything:
-        print(f"\n{BOLD}📋 Scan complete. Available actions:{RESET}")
-        print("   --fix-all          Fix all tables at once")
-        print("   --fix-products     Fix products table (AI-powered)")
-        print("   --fix-listings     Fix product_listings (logic-based, fast)")
-        print("   --fix-platforms    Fix platforms table (selectors, delays)")
-        print("   --fix-orphans      Delete orphan products")
-        print("   --re-enrich        Force re-run AI on all products")
-        print("   --dry-run          Preview without saving")
-        print("   --limit N          Batch size (default 200)")
-        return
-
-    # ── Step 0: Platforms (no AI, fast) → always first
-    if args.fix_all or args.fix_platforms:
-        r = await fix_platforms(dry_run=args.dry_run)
-        print_summary("PLATFORMS", r)
-
-    # ── Step 1: Listings (no AI, fastest) → bulk fix
-    if args.fix_all or args.fix_listings:
-        r = await fix_listings(limit=args.limit * 5, dry_run=args.dry_run)
-        print_summary("PRODUCT LISTINGS", r)
-
-    # ── Step 2: Orphans → clean before fixing products
-    if args.fix_all or args.fix_orphans:
-        r = await fix_orphans(dry_run=args.dry_run)
-        print_summary("ORPHAN CLEANUP", r)
-
-    # ── Step 3: Products (AI-powered)
-    if args.fix_all or args.fix_products:
-        r = await fix_products(limit=args.limit, dry_run=args.dry_run)
-        print_summary("PRODUCTS", r)
-
-    # ── Step 4: Re-enrich
-    if args.fix_all or args.re_enrich:
-        r = await re_enrich(limit=args.limit, dry_run=args.dry_run)
-        print_summary("RE-ENRICHMENT", r)
-
+        print(f"   {YELLOW}⚠️  DRY RUN MODE{RESET}")
+    print(f"{'=' * 75}")
+    
+    # Always run health scan
+    issues = await scan_database_health()
+    print_health_report(issues)
+    
+    # Execute fixes
+    if args.health_score:
+        # Just show health, already displayed above
+        pass
+    
+    elif args.fix_brands or args.fix_all:
+        r = await fix_brands_intelligently(limit=args.limit, dry_run=args.dry_run)
+        print_fix_summary("BRAND FIXES", r)
+    
+    if args.fix_specs or args.fix_all:
+        r = await fix_specs_from_titles(limit=args.limit, dry_run=args.dry_run)
+        print_fix_summary("SPEC EXTRACTION", r)
+    
+    if args.fix_images or args.fix_all:
+        r = await fix_images_from_listings(limit=args.limit, dry_run=args.dry_run)
+        print_fix_summary("IMAGE FIXES", r)
+    
+    if args.fix_ai or args.fix_all:
+        r = await fix_ai_metadata(limit=args.limit // 2, dry_run=args.dry_run)
+        print_fix_summary("AI RE-ENRICHMENT", r)
+    
+    if args.delete_garbage:
+        r = await delete_garbage_products(dry_run=args.dry_run)
+        print_fix_summary("GARBAGE DELETION", r)
+    
     duration = (datetime.now() - start).total_seconds()
-    print(f"\n{BOLD}⏱️  Total Duration: {duration:.1f}s{RESET}")
-    if args.dry_run:
-        print(f"{YELLOW}⚠️  DRY RUN — remove --dry-run to apply changes.{RESET}")
+    print(f"\n{BOLD}⏱️  Duration: {duration:.1f}s{RESET}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DealHunt Data Fixer v3.0 — Full DB Coverage",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python scripts/fix_data.py                              # Scan only
-  python scripts/fix_data.py --fix-all                    # Fix ALL tables
-  python scripts/fix_data.py --fix-listings               # Fast: fix listings only
-  python scripts/fix_data.py --fix-platforms              # Fix platform selectors
-  python scripts/fix_data.py --fix-products --limit 100   # Fix 100 products
-  python scripts/fix_data.py --fix-orphans                # Delete orphan products
-  python scripts/fix_data.py --re-enrich --limit 20       # Re-AI 20 products
-  python scripts/fix_data.py --dry-run --fix-all          # Preview everything
-        """
+        description="Database Health Analyzer v4.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--fix-all",       action="store_true", help="Fix all tables")
-    parser.add_argument("--fix-products",  action="store_true", help="Fix products table (AI)")
-    parser.add_argument("--fix-listings",  action="store_true", help="Fix product_listings (fast)")
-    parser.add_argument("--fix-platforms", action="store_true", help="Fix platforms table")
-    parser.add_argument("--fix-orphans",   action="store_true", help="Delete orphan products")
-    parser.add_argument("--re-enrich",     action="store_true", help="Re-run AI on all products")
-    parser.add_argument("--dry-run",       action="store_true", help="Preview without saving")
-    parser.add_argument("--limit",         type=int, default=200, help="Max products to process (default 200)")
-
+    
+    parser.add_argument("--scan", action="store_true", help="Scan only (default)")
+    parser.add_argument("--health-score", action="store_true", help="Show health score only")
+    parser.add_argument("--fix-all", action="store_true", help="Fix all issues")
+    parser.add_argument("--fix-brands", action="store_true", help="Fix garbage brands")
+    parser.add_argument("--fix-specs", action="store_true", help="Extract specs from titles")
+    parser.add_argument("--fix-images", action="store_true", help="Fix image URLs")
+    parser.add_argument("--fix-ai", action="store_true", help="Re-enrich with AI")
+    parser.add_argument("--delete-garbage", action="store_true", help="Delete unfixable products")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without saving")
+    parser.add_argument("--limit", type=int, default=200, help="Batch size")
+    
     args = parser.parse_args()
+    
+    # Default to scan if nothing specified
+    if not any([args.fix_all, args.fix_brands, args.fix_specs, 
+                args.fix_images, args.fix_ai, args.delete_garbage,
+                args.health_score]):
+        args.scan = True
+    
     asyncio.run(main(args))

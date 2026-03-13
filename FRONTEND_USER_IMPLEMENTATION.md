@@ -1119,66 +1119,462 @@ const RewardedAdButton = () => {
 
 ## 🔄 API INTEGRATION MAPPING
 
-### All 60+ Backend Endpoints Mapped to Frontend
-
-#### **Auth Endpoints (7)**
-| Endpoint | Method | Frontend Usage | Redux Action |
-|----------|--------|---|---|
-| `/auth/signup` | POST | SignupScreen | authSlice.signup |
-| `/auth/login` | POST | LoginScreen | authSlice.login |
-| `/auth/refresh-token` | POST | Auto on token expire | authSlice.refreshToken |
-| `/auth/me` | GET | ProfileScreen on mount | authSlice.fetchProfile |
-| `/auth/me` | PUT | Edit ProfileScreen | authSlice.updateProfile |
-| `/auth/me` | DELETE | Delete account modal | authSlice.deleteAccount |
-| `/auth/verify-referral-code` | POST | SignupScreen | authSlice.verifyReferral |
-
-#### **Search Endpoints (4)**
-| Endpoint | Method | Frontend Usage | RTK Query |
-|----------|--------|---|---|
-| `/search/search` | POST | SearchResultsScreen | apiSlice.useSearchQuery |
-| `/search/by-url` | POST | URLSearchScreen | apiSlice.useURLSearchQuery |
-| `/search/trending` | GET | HomeScreen | apiSlice.useTrendingQuery |
-| `/search/platforms/supported` | GET | FilterSheet | apiSlice.usePlatformsQuery |
-
-#### **Product Endpoints (2)**
-| Endpoint | Method | Frontend Usage | RTK Query |
-|----------|--------|---|---|
-| `/products/{id}` | GET | ProductDetailScreen | apiSlice.useProductQuery |
-| `/products/{id}/price-history` | GET | PriceChart component | apiSlice.usePriceHistoryQuery |
-
-#### **Watchlist Endpoints (5)**
-| Endpoint | Method | Frontend Usage | Redux Action |
-|----------|--------|---|---|
-| `/watchlist` | GET | WatchlistScreen on mount | watchlistSlice.fetchList |
-| `/watchlist` | POST | ProductDetail "Add" | watchlistSlice.addItem |
-| `/watchlist/{id}` | PUT | Watchlist edit modal | watchlistSlice.updateItem |
-| `/watchlist/{id}` | DELETE | Watchlist item swipe | watchlistSlice.removeItem |
-| `/watchlist/check/{id}` | GET | ProductDetail checks | watchlistSlice.checkIfWatched |
-
-#### **Streak Endpoints (5)**
-| Endpoint | Method | Frontend Usage | Redux Action |
-|----------|--------|---|---|
-| `/streak/check-in` | POST | HomeScreen on mount | streakSlice.checkIn |
-| `/streak/status` | GET | StreakScreen | streakSlice.fetchStatus |
-| `/streak/milestones` | GET | MilestonesScreen | streakSlice.fetchMilestones |
-| `/streak/use-freeze` | POST | Streak broken modal | streakSlice.useFreeze |
-| `/streak/leaderboard` | GET | LeaderboardScreen (Phase 2) | streakSlice.fetchLeaderboard |
-
-#### **Subscription Endpoints (8)**
-| Endpoint | Method | Frontend Usage | RTK Query |
-|----------|--------|---|---|
-| `/subscription/plans` | GET | PlansScreen | apiSlice.usePlansQuery |
-| `/subscription/payment-methods` | GET | CheckoutScreen | apiSlice.usePaymentMethodsQuery |
-| `/subscription/create-order` | POST | CheckoutScreen (Razorpay) | apiSlice.useCreateOrderMutation |
-| `/subscription/verify-payment` | POST | CheckoutScreen (Razorpay) | apiSlice.useVerifyPaymentMutation |
-| `/subscription/verify-purchase` | POST | CheckoutScreen (Google Play) | apiSlice.useVerifyPurchaseMutation |
-| `/subscription/acknowledge-purchase` | POST | CheckoutScreen (Google Play) | apiSlice.useAcknowledgePurchaseMutation |
-| `/subscription/status` | GET | HomeScreen quota | subscriptionSlice.fetchStatus |
-| `/subscription/cancel` | POST | SettingsScreen unsubscribe | subscriptionSlice.cancelPlan |
+### Complete Backend Endpoint Reference (58 Endpoints)
+**Last Updated: March 12, 2026** | **Backend API Version: v1**
 
 ---
 
-## 🛠️ REDUX STATE STRUCTURE
+#### **Authentication Endpoints (10)**
+
+| Endpoint | Method | Frontend Usage | Redux Action | Notes |
+|----------|--------|---|---|---|
+| `/auth/signup-public` | POST | PublicSignupScreen | authSlice.signup | Rate limited, no Firebase token required |
+| `/auth/signup` | POST | SignupScreen | authSlice.signup | Requires Firebase token |
+| `/auth/refresh-token` | POST | Auto on token expire | authSlice.refreshToken | Refresh Firebase token |
+| `/auth/token-status` | GET | Token validation | authSlice.checkToken | Check token validity |
+| `/auth/logout` | POST | LogoutModal | authSlice.logout | Logout current session |
+| `/auth/me` | GET | ProfileScreen on mount | authSlice.fetchProfile | Get current user profile |
+| `/auth/me/stats` | GET | ProfileScreen stats | authSlice.fetchStats | User stats (searches, savings) |
+| `/auth/me` | PUT | Edit ProfileScreen | authSlice.updateProfile | Update user profile |
+| `/auth/me` | DELETE | Delete account modal | authSlice.deleteAccount | Delete user account |
+| `/auth/verify-referral-code` | POST | SignupScreen | authSlice.verifyReferral | Verify referral code |
+
+#### **Search Endpoints (3)**
+
+| Endpoint | Method | Frontend Usage | RTK Query | Quota System |
+|----------|--------|---|---|---|
+| `/search/search` | POST | SearchResultsScreen | useSearchQuery | DAILY_SCRAPE quota (80% allocation) |
+| `/search/by-url` | POST | URLSearchScreen | useURLSearchQuery | DAILY_SCRAPE quota |
+| `/search/trending` | GET | HomeScreen trending | useTrendingQuery | DAILY_SCRAPE quota (cached 6h) |
+
+**Search Quota Details:**
+- Feature: `DAILY_SCRAPE` (80% of total daily limit)
+- Multi-key allocation: 14,400 tokens/day × 4 keys = 57,600 tokens/day
+- DAILY_SCRAPE allocation: 45,760 tokens/day
+- Fallback chain: Try MAIN key → Try SEARCH key → Try HEALING key → Try CHAT key → Return cached results
+
+#### **Product Endpoints (2)**
+
+| Endpoint | Method | Frontend Usage | RTK Query | Details |
+|----------|--------|---|---|---|
+| `/products/{product_id}` | GET | ProductDetailScreen | useProductQuery | Enriched product data with AI summaries |
+| `/products/{product_id}/price-history` | GET | PriceChart component | usePriceHistoryQuery | 120-day historical price data |
+
+#### **Watchlist Endpoints (5)**
+
+| Endpoint | Method | Frontend Usage | Redux Action | Notes |
+|----------|--------|---|---|---|
+| `/watchlist` | GET | WatchlistScreen on mount | watchlistSlice.fetchList | Get all user watchlist items |
+| `/watchlist` | POST | ProductDetail "Add to Watchlist" | watchlistSlice.addItem | Add product to watchlist |
+| `/watchlist/{item_id}` | PUT | Watchlist edit modal | watchlistSlice.updateItem | Update target price/settings |
+| `/watchlist/{item_id}` | DELETE | Watchlist item swipe | watchlistSlice.removeItem | Remove from watchlist |
+| `/watchlist/check/{product_id}` | GET | ProductDetail checks | watchlistSlice.checkStatus | Check if product in watchlist |
+
+**Plan Limits:**
+- FREE: 5 watchlist items max
+- PRO: 50 watchlist items max
+- PREMIUM: Unlimited watchlist items
+
+#### **Streak & Gamification Endpoints (5)**
+
+| Endpoint | Method | Frontend Usage | Redux Action | Notes |
+|----------|--------|---|---|---|
+| `/streak/check-in` | POST | HomeScreen on mount | streakSlice.checkIn | Daily check-in, returns reward if any |
+| `/streak/status` | GET | StreakScreen | streakSlice.fetchStatus | Current streak, longest, rewards |
+| `/streak/milestones` | GET | MilestonesScreen | streakSlice.fetchMilestones | All milestone states |
+| `/streak/use-freeze` | POST | Streak broken modal | streakSlice.useFreeze | Use freeze to maintain streak |
+| `/streak/leaderboard` | GET | LeaderboardScreen | streakSlice.fetchLeaderboard | Top 100 streaks (Phase 2) |
+
+**Streak Freezes Available:**
+- FREE tier: 0 freezes/month
+- PRO tier: 2 freezes/month
+- PREMIUM tier: 5 freezes/month
+
+#### **Subscription & Payment Endpoints (7)**
+
+| Endpoint | Method | Frontend Usage | RTK Query/Redux | Platform |
+|----------|--------|---|---|---|
+| `/subscription/plans` | GET | PlansScreen | usePlansQuery | Get all subscription plans |
+| `/subscription/payment-methods` | GET | CheckoutScreen | usePaymentMethodsQuery | Get available payment methods |
+| `/subscription/create-order` | POST | CheckoutScreen | useCreateOrderMutation | Create Razorpay order (web) |
+| `/subscription/verify-payment` | POST | CheckoutScreen | useVerifyPaymentMutation | Verify Razorpay signature (web) |
+| `/subscription/verify-purchase` | POST | CheckoutScreen | useVerifyPurchaseMutation | Verify Google Play purchase (Android) |
+| `/subscription/acknowledge-purchase` | POST | CheckoutScreen | useAcknowledgePurchaseMutation | Acknowledge Google Play purchase |
+| `/subscription/webhook/google` | POST | (Webhook) | N/A | Google Play RTDN webhook handler |
+
+**Subscription Plans:**
+- **FREE**: 10 searches/day, 5 watchlist items, ads enabled
+- **PRO**: ₹99/month, 100 searches/day, 50 watchlist items, no ads
+- **PREMIUM**: ₹999/year, unlimited searches, unlimited watchlist, no ads
+
+#### **Admin Dashboard Endpoints (26) - Admin Only**
+*Requires Firebase admin claim + whitelist email verification*
+
+**User Management (6 endpoints):**
+- GET `/admin/users` - List users with filtering
+- GET `/admin/users/{user_id}` - User detail + stats
+- PUT `/admin/users/{user_id}/ban` - Ban user
+- PUT `/admin/users/{user_id}/unban` - Unban user
+- DELETE `/admin/users/{user_id}` - Delete user
+- POST `/admin/users/bulk-bonus` - Grant bulk bonuses
+
+**Revenue Analytics (4 endpoints):**
+- GET `/admin/revenue/overview` - Revenue dashboard
+- GET `/admin/revenue/transactions` - Transaction list
+- GET `/admin/revenue/plans` - Revenue by plan
+- GET `/admin/revenue/affiliates` - Affiliate performance
+
+**Promotion Management (7 endpoints):**
+- POST `/admin/promotions` - Create promotion
+- GET `/admin/promotions` - List promotions
+- GET `/admin/promotions/{id}` - Promotion detail
+- PUT `/admin/promotions/{id}` - Update promotion
+- DELETE `/admin/promotions/{id}` - Delete promotion
+- GET `/admin/promotions/revenue/report` - Revenue report
+
+**System Monitoring (9 endpoints):**
+- GET `/admin/system/health` - System status (DB, Redis, Groq)
+- GET `/admin/system/stats` - DAU, WAU, MAU stats
+- GET `/admin/system/logs` - System logs
+- POST `/admin/system/force-scrape` - Trigger scraper manually
+- GET `/admin/system/scheduler` - APScheduler status
+- POST `/admin/system/trigger-job` - Trigger job by ID
+- PUT `/admin/system/config` - Update configuration
+- GET `/admin/system/config` - Get all configuration
+- POST `/admin/system/maintenance` - Toggle maintenance mode
+
+---
+
+## ⚡ GROQ AI MULTI-KEY SYSTEM & QUOTA MANAGEMENT
+
+### Understanding the Quota System
+
+The backend uses **4 separate Groq API keys** for intelligent fallback and quota isolation:
+
+```
+Key 1: GROQ_API_KEY_MAIN       (Primary, 14,400 tokens/day)
+Key 2: GROQ_API_KEY_SEARCH     (Fallback, 14,400 tokens/day)
+Key 3: GROQ_API_KEY_HEALING    (Fallback, 14,400 tokens/day)
+Key 4: GROQ_API_KEY_CHAT       (Fallback, 14,400 tokens/day)
+
+TOTAL CAPACITY: 57,600 tokens/day
+```
+
+### Feature-Specific Quota Allocation
+
+Each feature gets a percentage of the daily limit:
+
+| Feature | Quota % | Tokens/Day (1 key) | Tokens/Day (4 keys) | Usage |
+|---------|---------|---------|---------|---------|
+| **DAILY_SCRAPE** | 80% | 11,520 | 46,080 | Search queries, trending products, URL-based scraping |
+| **SEARCH** | 10% | 1,440 | 5,760 | Advanced search with AI enrichment, autocomplete |
+| **HEALING** | 5% | 720 | 2,880 | Broken selector healing + recovery |
+| **CHAT** | 5% | 720 | 2,880 | Premium chat features, analysis |
+
+### Key Rotation & Fallback Strategy
+
+When a feature exhausts its quota on the primary key, the system **automatically tries other keys**:
+
+```
+Request comes in for DAILY_SCRAPE
+    ↓
+Check GROQ_API_KEY_MAIN quota
+    ↓
+├─ QUOTA OK? → Use MAIN key ✅
+│
+├─ QUOTA EXHAUSTED → Try GROQ_API_KEY_SEARCH ⚡
+│       ├─ SEARCH key quota OK? → Use SEARCH key ✅
+│       ├─ SEARCH exhausted → Try GROQ_API_KEY_HEALING ⚡
+│       │       ├─ HEALING key quota OK? → Use HEALING key ✅
+│       │       ├─ HEALING exhausted → Try GROQ_API_KEY_CHAT ⚡
+│       │       │       ├─ CHAT key quota OK? → Use CHAT key ✅
+│       │       │       └─ All keys exhausted → Return None (fallback)
+```
+
+**Log Example:**
+```
+[2026-03-12 10:30:15] FEATURE=DAILY_SCRAPE | QUOTA=720/1440 (50%)
+[2026-03-12 10:30:16] KEY=MAIN → EXHAUSTED | TRY=SEARCH
+[2026-03-12 10:30:16] KEY=SEARCH → OK (150 tokens) | SUCCESS ✅
+```
+
+### What Happens When ALL Keys Exhausted?
+
+When all 4 keys have exhausted their quota for a feature:
+
+1. **Groq AI call returns `None`**
+2. **Backend activate fallback chain:**
+   - ❌ AI enrichment skipped
+   - ✅ Use cached selectors from previous heals
+   - ✅ Use raw platform data (no enrichment)
+   - ✅ Use fallback parsing via regex/JavaScript
+
+3. **Frontend receives data with degraded quality:**
+   ```json
+   {
+     "product": {
+       "title": "iPhone 15 Pro",
+       "description": null,  // AI failed, no enrichment
+       "price": 79999,
+       "source": "raw_platform_data",
+       "ai_enriched": false
+     }
+   }
+   ```
+
+4. **Error response if Groq fails:**
+   ```json
+   {
+     "status": "warning",
+     "message": "AI service temporarily unavailable, showing cached data",
+     "data": { /* fallback data */ },
+     "quota_status": {
+       "daily_scrape": {"used": 46080, "limit": 46080, "status": "exhausted"},
+       "search": {"used": 5760, "limit": 5760, "status": "exhausted"},
+       "healing": {"used": 2880, "limit": 2880, "status": "exhausted"},
+       "chat": {"used": 2880, "limit": 2880, "status": "exhausted"}
+     }
+   }
+   ```
+
+### Quota Reset Timing
+
+- **Daily Reset:** Midnight UTC (00:00 UTC)
+- **Tracking:** Redis stores per-key quotas with daily date:
+  ```
+  groq:usage:DAILY_SCRAPE:2026-03-12 = 45000
+  groq:usage:SEARCH:2026-03-12 = 1400
+  groq:usage:HEALING:2026-03-12 = 2880
+  groq:usage:CHAT:2026-03-12 = 2800
+  ```
+- **Automatic cleanup:** Old quotas auto-expire after 48 hours
+
+### Circuit Breaker: Recovery After Failure
+
+When **5 consecutive API failures** occur:
+
+```
+Failure 1 → Log and retry
+Failure 2 → Log and retry
+Failure 3 → Log and retry
+Failure 4 → Log and retry
+Failure 5 → CIRCUIT BREAKER TRIGGERS ⚠️
+    ↓
+Recovery Window: 300 seconds (5 minutes)
+    ↓
+All Groq requests return fallback for 5 minutes
+    ↓
+After 5 min: Reset counter, try Groq again
+```
+
+**Frontend Impact:**
+- Search results show degraded quality for 5 minutes
+- AI enrichment skipped
+- User sees banner: "Service recovering, showing fast results"
+
+### Multi-Key Development vs Production
+
+**DEVELOPMENT (Current):**
+- Only `GROQ_API_KEY_MAIN` configured
+- Quota: 14,400 tokens/day
+- When exhausted: Uses cached data, no fallback to other keys
+
+**PRODUCTION (With 4 Keys):**
+- All 4 keys configured
+- Quota: 57,600 tokens/day
+- When one key exhausted: Automatically tries other keys
+- Provides 4x capacity with automatic failover
+
+---
+
+## � ERROR HANDLING & FALLBACK BEHAVIOR
+
+### Standard Error Response Structure
+
+All API errors follow this format:
+
+```json
+{
+  "status": "error",
+  "error": {
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "Too many requests. Please try again later.",
+    "retry_after": 60  // seconds
+  }
+}
+```
+
+### Common Error Codes
+
+| Code | HTTP | Meaning | Frontend Action | Retry Strategy |
+|------|------|---------|---|---|
+| `INVALID_TOKEN` | 401 | Expired/invalid Firebase token | Refresh token, then retry | Automatic (3 attempts) |
+| `QUOTA_EXCEEDED` | 429 | Daily search quota exhausted | Show "Upgrade plan" button | Wait until daily reset |
+| `RATE_LIMIT_EXCEEDED` | 429 | API rate limited (10 req/sec) | Show error, wait then retry | Wait `retry_after` seconds |
+| `GROQ_QUOTA_EXHAUSTED` | 503 | All Groq API keys exhausted | Show cached data, disable AI features | Automatic (uses fallback) |
+| `DB_CONNECTION_ERROR` | 500 | Database temporarily unavailable | Show "Service temporarily down" | Retry after 10 seconds |
+| `SERVICE_UNAVAILABLE` | 503 | Service in maintenance | Show "We'll be back soon" modal | Retry every 30 seconds |
+| `PLAN_LIMIT_EXCEEDED` | 402 | Plan feature limit reached | Show upgrade prompt | Plan change required |
+| `INVALID_REQUEST` | 400 | Invalid request parameters | Show validation error to user | Fix input and retry |
+
+### RTK Query Error Handling Pattern
+
+```typescript
+// In your API slice or hook
+const handleError = (error: any) => {
+  const errorCode = error?.data?.error?.code;
+  
+  switch (errorCode) {
+    case 'INVALID_TOKEN':
+      // Trigger token refresh
+      dispatch(authSlice.refreshToken());
+      break;
+      
+    case 'QUOTA_EXCEEDED':
+      // Show upgrade modal
+      dispatch(showUpgradeModal());
+      break;
+      
+    case 'GROQ_QUOTA_EXHAUSTED':
+      // Show graceful degradation message
+      showToast('Showing cached results (AI temporarily paused)');
+      break;
+      
+    case 'RATE_LIMIT_EXCEEDED':
+      // Exponential backoff retry
+      setTimeout(() => retryRequest(), error.retry_after * 1000);
+      break;
+      
+    default:
+      // Generic error
+      showToast('Something went wrong, please try again');
+  }
+};
+```
+
+### Search Request Failed - Fallback Chain
+
+When `/search/search` fails:
+
+```
+User presses [Search]
+    ↓
+POST /search/search {query: "iPhone 15"}
+    ↓
+├─ SUCCESS → Return AI-enriched results with prices ✅
+│
+├─ GROQ_QUOTA_EXHAUSTED → Fallback 1: Use Redis cache ⚡
+│       ├─ Cache found? → Return cached results ✅
+│       ├─ Cache miss → Fallback 2: Query database
+│
+├─ DB_UNAVAILABLE → Fallback 3: Use last known data from AsyncStorage ⚡
+│
+├─ ALL FAIL → Fallback 4: Show offline results (if available) ⚡
+│       ├─ Offline data? → Show with "OFFLINE" badge
+│       └─ No data? → Show "No connection" empty state
+```
+
+**Response with fallback:**
+```json
+{
+  "results": [
+    {
+      "product_id": "uuid",
+      "title": "iPhone 15 Pro",
+      "price": 79999,
+      "source": "cached",  // Shows where data came from
+      "cache_age_minutes": 45
+    }
+  ],
+  "source": "redis_cache",
+  "ai_enriched": false,
+  "message": "Showing cached results (AI service paused)"
+}
+```
+
+### Watchlist Add Failed - Recovery Flow
+
+```
+User clicks "Add to Watchlist"
+    ↓
+POST /watchlist {product_id, target_price}
+    ↓
+├─ SUCCESS → Add to Redux, badge turns red ✅
+│
+├─ NETWORK_ERROR → Add to offline queue ⚡
+│   (Store in AsyncStorage)
+│   Show: "✓ Saved locally. Will sync when online."
+│       ↓
+│       (When connection restored)
+│       Sync to server automatically
+│       If fail: Show retry button
+│
+├─ QUOTA_EXCEEDED → Show plan upgrade modal ⚡
+│   Message: "Free plan allows 5 watchlist items. Upgrade to Pro for 50."
+│
+└─ SERVER_ERROR → Show retry button ⚡
+    Retry with exponential backoff
+```
+
+### Subscription Payment Failed - Recovery
+
+```
+User clicks [Pay ₹99]
+    ↓
+POST /subscription/create-order
+    ↓
+├─ SUCCESS → Open payment modal → User completes payment ✅
+│   ↓
+│   POST /subscription/verify-payment
+│   ↓
+│   ├─ VERIFIED → Subscribe user ✅
+│   ├─ FAILED → Show "Payment verification failed, contact support"
+│
+├─ CREATE_ORDER_FAILED → Show "Payment setup failed, try again"
+│   Retry button → Exponential backoff
+│
+└─ NETWORK_ERROR → Save as pending payment
+    Show: "Payment process interrupted. Check your bank account."
+    Retry button available after 5 minutes
+```
+
+### Network Status & Offline Mode
+
+```typescript
+// useNetworkStatus hook
+const useNetworkStatus = () => {
+  const [isOnline, setIsOnline] = useState(true);
+  
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsOnline(state.isConnected);
+    });
+    return unsubscribe;
+  }, []);
+  
+  return isOnline;
+};
+
+// In SearchScreen
+const SearchScreen = () => {
+  const isOnline = useNetworkStatus();
+  
+  if (!isOnline) {
+    return (
+      <>
+        <OfflineBanner text="No internet connection. Showing cached results." />
+        <SearchResults source="offline_cache" />
+      </>
+    );
+  }
+  
+  // Normal online rendering
+};
+```
+
+---
+
+## �🛠️ REDUX STATE STRUCTURE
 
 ```typescript
 // Redux State Shape
@@ -1219,14 +1615,94 @@ interface RootState {
     searchesRemaining: number;
     watchlistLimit: number;
     isLoading: boolean;
+    quotaStatus?: {  // NEW: Groq multi-key quota tracking
+      dailyScrape: {
+        used: number;
+        limit: number;
+        status: 'ok' | 'warning' | 'exhausted';
+      };
+      search: {
+        used: number;
+        limit: number;
+        status: 'ok' | 'warning' | 'exhausted';
+      };
+      healing: {
+        used: number;
+        limit: number;
+        status: 'ok' | 'warning' | 'exhausted';
+      };
+      chat: {
+        used: number;
+        limit: number;
+        status: 'ok' | 'warning' | 'exhausted';
+      };
+      circuitBreakerActive: boolean;  // 5 consecutive failures triggered
+      recoveryUntil?: Date;  // Recovery window end time
+    };
   };
   app: {
     theme: 'light' | 'dark';
     notificationsEnabled: boolean;
     offlineMode: boolean;
     language: 'en';
+    aiServiceStatus: 'healthy' | 'degraded' | 'unavailable';  // Track AI service health
   };
 }
+```
+
+### Quota Status in Subscription Slice
+
+The `quotaStatus` object should be updated every time you fetch search results or products:
+
+```typescript
+// When calling /search/search endpoint
+const { data, isLoading, error } = useSearchQuery(query);
+
+// Response includes quota info:
+{
+  results: [...],
+  source: "api",
+  quotaStatus: {
+    dailyScrape: { used: 30000, limit: 46080, status: "ok" },
+    search: { used: 1000, limit: 5760, status: "ok" },
+    healing: { used: 2880, limit: 2880, status: "exhausted" },  // RED
+    chat: { used: 200, limit: 2880, status: "ok" }
+  }
+}
+
+// Update Redux:
+dispatch(subscriptionSlice.updateQuotaStatus(response.quotaStatus));
+```
+
+**In UI - Show Quota Warnings:**
+
+```typescript
+// If any quota is "exhausted" or "warning"
+const QuotaWarning = () => {
+  const quotaStatus = useSelector(state => state.subscription.quotaStatus);
+  
+  if (quotaStatus.dailyScrape.status === 'exhausted') {
+    return (
+      <Banner type="error">
+        🚨 Daily search quota exhausted. Showing cached results.
+        Will reset at midnight.
+      </Banner>
+    );
+  }
+  
+  if (quotaStatus.dailyScrape.status === 'warning') {
+    const percentUsed = (quotaStatus.dailyScrape.used / quotaStatus.dailyScrape.limit) * 100;
+    if (percentUsed > 80) {
+      return (
+        <Banner type="warning">
+          ⚠️ Search quota running low ({percentUsed}% used). Upgrade to Pro for more.
+        </Banner>
+      );
+    }
+  }
+  
+  return null;
+};
 ```
 
 ---

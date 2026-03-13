@@ -479,58 +479,110 @@ class GroqClient:
         max_tokens: int = 500,
         json_mode: bool = True
     ) -> Optional[str]:
-        """Make API call to Groq with quota management"""
-        if not await self._check_quota(feature):
+        """Make API call to Groq with intelligent key rotation
+        
+        🔄 KEY ROTATION STRATEGY:
+        1. Try feature-specific key first (MAIN, SEARCH, HEALING, CHAT)
+        2. If quota exhausted, try other available keys
+        3. Only return None if ALL keys are exhausted or missing
+        
+        This maximizes uptime with 4x Groq accounts (57,600 tokens/day total)
+        """
+        # Get list of candidate keys to try (feature-specific first, then others)
+        candidates = []
+        
+        # Priority 1: Feature-specific key
+        feature_key = self.api_keys.get(feature)
+        if feature_key:
+            candidates.append((feature, feature_key, True))  # is_priority=True
+        
+        # Priority 2: Other keys (fallback)
+        for other_feature, other_key in self.api_keys.items():
+            if other_feature != feature and other_key:
+                candidates.append((other_feature, other_key, False))
+        
+        if not candidates:
+            logger.error("❌ No Groq API keys configured")
             return None
         
-        # Get API key
-        api_key = self.api_keys.get(feature)
-        if not api_key:
-            for feat, key in self.api_keys.items():
-                if key:
-                    api_key = key
-                    break
-        
-        if not api_key:
-            logger.error("No Groq API key available")
-            return None
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.base_url, headers=headers, json=payload)
-                response.raise_for_status()
+        # Try each key in order
+        last_error = None
+        for attempt_feature, api_key, is_priority in candidates:
+            try:
+                # Check quota for this key
+                if not await self._check_quota(attempt_feature):
+                    if is_priority:
+                        logger.warning(
+                            f"⚠️ Feature '{feature.value}' quota exhausted, "
+                            f"falling back to {attempt_feature.value}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Skipping {attempt_feature.value} (quota exhausted)"
+                        )
+                    continue
                 
-                data = response.json()
-                result = data["choices"][0]["message"]["content"]
+                # Make API call
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }
                 
-                await self._increment_usage(feature)
+                payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
                 
-                return result.strip()
+                if json_mode:
+                    payload["response_format"] = {"type": "json_object"}
                 
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                logger.error(f"Groq rate limit hit for {feature.value}")
-            else:
-                logger.error(f"Groq API error: {e.response.status_code}")
-            return None
-        except Exception as e:
-            logger.error(f"Groq API call failed: {str(e)}")
-            return None
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self.base_url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    result = data["choices"][0]["message"]["content"]
+                    
+                    # Increment usage for the key that succeeded
+                    await self._increment_usage(attempt_feature)
+                    
+                    if attempt_feature != feature and not is_priority:
+                        logger.info(
+                            f"✅ {attempt_feature.value} key used (fallback from {feature.value})"
+                        )
+                    
+                    return result.strip()
+            
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    logger.warning(
+                        f"🚫 Rate limit on {attempt_feature.value} key (code 429)"
+                    )
+                    last_error = f"Rate limit ({attempt_feature.value})"
+                else:
+                    logger.warning(
+                        f"⚠️ Groq API error {e.response.status_code} on {attempt_feature.value}"
+                    )
+                    last_error = f"API error {e.response.status_code}"
+                # Try next key
+                continue
+            
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Error with {attempt_feature.value} key: {str(e)[:100]}"
+                )
+                last_error = str(e)[:50]
+                # Try next key
+                continue
+        
+        # All keys exhausted or failed
+        logger.error(
+            f"❌ All Groq API keys failed for {feature.value} "
+            f"(Last error: {last_error})"
+        )
+        return None
     
     # =========================================================================
     # 🚀 ENHANCED SELECTOR HEALING (Platform-Specific)

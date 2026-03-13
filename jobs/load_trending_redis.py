@@ -14,12 +14,19 @@ FIXED: Redis connection handling for Windows
 import logging
 import sys
 import os
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 import json
 
 # Add parent directory to Python path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# 🔧 WINDOWS FIX: Silence Proactor Event Loop Warning
+if sys.platform == 'win32':
+    from asyncio.proactor_events import _ProactorBasePipeTransport
+    def silence_proactor_del(self): pass
+    _ProactorBasePipeTransport.__del__ = silence_proactor_del
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, Integer, text
@@ -77,6 +84,7 @@ async def run_load_trending() -> Dict[str, Any]:
             
             stats["products_cached"] = len(cache_data)
             stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
+            stats["success"] = True
             
             logger.info(
                 f"✅ Trending cache updated | "

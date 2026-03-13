@@ -94,7 +94,8 @@ class RedisClient:
         self,
         key: str,
         value: str,
-        ttl: Optional[int] = None
+        ttl: Optional[int] = None,
+        ex: Optional[int] = None
     ) -> bool:
         """
         Set key-value pair with optional TTL
@@ -110,8 +111,9 @@ class RedisClient:
             return False
         
         try:
-            if ttl:
-                return await self._client.setex(key, ttl, value)
+            expiry = ex or ttl
+            if expiry:
+                return await self._client.setex(key, expiry, value)
             else:
                 return await self._client.set(key, value)
         except Exception as e:

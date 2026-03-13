@@ -1,0 +1,12 @@
+{
+  "myntra": {
+    "brand": {
+      "selector": ".desktop-categoryLink",
+      "healed_at": "2026-03-11T17:17:55.827441",
+      "method": "ai_batch",
+      "version": 1,
+      "health": "good",
+      "success_rate": 0.0
+    }
+  }
+}

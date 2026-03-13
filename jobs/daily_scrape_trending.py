@@ -32,6 +32,12 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# 🔧 WINDOWS FIX: Silence Proactor Event Loop Warning
+if sys.platform == 'win32':
+    from asyncio.proactor_events import _ProactorBasePipeTransport
+    def silence_proactor_del(self): pass
+    _ProactorBasePipeTransport.__del__ = silence_proactor_del
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 

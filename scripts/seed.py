@@ -4,7 +4,7 @@ Database Seeding Script
 =======================
 
 Populate database with products for demo/testing.
-Includes AUTO CROSS-PLATFORM MATCHING.
+Includes AUTO CROSS-PLATFORM MATCHING & GARBAGE PROTECTION.
 
 Modes:
 - --quick:        2 products per platform (fast demo)
@@ -17,7 +17,7 @@ Usage:
     python scripts/seed.py --full --limit 100
 
 Author: DealHunt
-Version: 2.0 (Cross-Platform Enabled)
+Version: 3.0 (Zero False Positives Edition)
 """
 
 import asyncio
@@ -41,7 +41,13 @@ from app.core.database import async_session_maker
 from app.services.scraper.factory import get_platform_handler
 from app.services.ai.enrichment_service import enrichment_service
 from app.services.product_service import product_service
-from app.services.scraper.cross_platform_matcher import cross_platform_matcher # ✅ NEW IMPORT
+
+# ✅ NEW IMPORTS: Added Quality Gate and Spec Extraction
+from app.services.scraper.cross_platform_matcher import (
+    cross_platform_matcher,
+    extract_specs,
+    check_quality_gate
+)
 
 # =============================================================================
 # CONFIGURATION
@@ -135,69 +141,93 @@ async def _find_and_save_cross_platform(source_product, db):
 # =============================================================================
 
 async def seed_quick() -> Dict[str, int]:
-    """Quick seed: 2 products per platform + matches"""
-    print("\n⚡ Quick Seed Mode (2 products per platform + Cross-Platform Matches)")
+    """
+    Quick Seed (The Highlight Reel):
+    Gets 2 high-profile products from a specific category per platform 
+    to quickly prove the system works across all verticals.
+    """
+    print("\n⚡ QUICK SEED MODE (The Highlight Reel)")
+    print("   Fetching 2 iconic products per platform + Cross-Platform Matches...")
     
     results = {p: 0 for p in PLATFORMS}
     
+    # The "Highlight Reel" mapping: We force specific, highly-comparable queries.
+    QUICK_QUERIES = {
+        "amazon": ("Electronics", "iphone 15"),
+        "flipkart": ("Electronics", "gaming laptop"),
+        "myntra": ("Fashion", "men printed tshirt"),
+        "nykaa": ("Beauty", "matte lipstick"),
+        "croma": ("Electronics", "smart tv 43 inch"),
+        "meesho": ("Fashion", "women kurti")
+    }
+    
     async with async_session_maker() as db:
         for platform in PLATFORMS:
-            print(f"\n📌 {platform.upper()}")
+            # Check if we have a highlight query for this platform
+            if platform not in QUICK_QUERIES:
+                continue
+                
+            category, query = QUICK_QUERIES[platform]
+            print(f"\n{'='*60}\n📌 QUICK DEMO: {platform.upper()} (Searching: '{query}')\n{'='*60}")
             
             try:
                 handler = await get_platform_handler(platform, db)
                 if not handler:
-                    print(f"   ❌ No handler")
+                    print(f"   ❌ No handler configured.")
                     continue
                 
-                # Get first available category
-                categories = PLATFORM_CATEGORY_MAP.get(platform, ["Electronics"])
-                category = categories[0]
-                queries = SEARCH_QUERIES.get(category, ["trending"])
-                
-                # Search
                 result = await asyncio.wait_for(
-                    handler.search(query=queries[0], page=1),
-                    timeout=60 # Increased timeout for cross-platform
+                    handler.search(query=query, page=1),
+                    timeout=45
                 )
                 
                 if not result or not result.products:
-                    print(f"   ❌ No products found")
+                    print(f"   ❌ No products found.")
                     continue
                 
-                # Take first 2
-                products = result.products[:2]
-                
-                for product in products:
+                products_saved = 0
+                for p in result.products:
+                    if products_saved >= 2: break  # Only grab 2 per platform
+                    
                     try:
-                        # Enrich
-                        product = await enrichment_service.enrich_product(product)
+                        # 🛡️ Quality Gate
+                        specs = extract_specs(p.title, category=category)
+                        passed, gate_reason = check_quality_gate(p.title, specs)
+                        if not passed:
+                            continue
                         
-                        # Save Source Product
+                        p.category = category
+                        product = await enrichment_service.enrich_product(p)
+                        
+                        # Save Base Product
                         saved = await product_service.save_product(
                             product_data=product,
                             db=db,
                             is_user_search=False
                         )
                         
+                        products_saved += 1
                         results[platform] += 1
-                        print(f"   ✅ {saved.title[:40]}... (₹{product.current_price})")
+                        print(f"   ✅ [Base] {saved.title[:45]}... (₹{product.current_price:,.0f})")
                         
-                        # ⚡ TRIGGER CROSS-PLATFORM MATCHING
-                        await _find_and_save_cross_platform(product, db)
+                        # ⚡ Cross-Platform Compare
+                        await _find_and_compare_cross_platform(product, db)
+                        print("") # spacing
                         
                     except Exception as e:
-                        print(f"   ❌ Error: {e}")
+                        pass # Silently skip errors to keep demo fast
                 
             except Exception as e:
-                print(f"   ❌ Platform Error: {e}")
+                print(f"   ❌ Platform Error: {str(e)[:40]}")
             
+            # Cleanup memory
             await asyncio.sleep(1)
-            from app.services.scraper.browser import close_browser_manager
-            await close_browser_manager()
+            try:
+                from app.services.scraper.browser import close_browser_manager
+                await close_browser_manager()
+            except: pass
     
     return results
-
 
 async def seed_smart_rotate(categories: List[str] = None, products_per_category: int = 5) -> Dict[str, int]:
     """Smart rotation: Distribute across categories"""
@@ -235,6 +265,13 @@ async def seed_smart_rotate(categories: List[str] = None, products_per_category:
                                 product.category = category
                                 product = await enrichment_service.enrich_product(product)
                                 
+                                # 🛡️ NEW: QUALITY GATE CHECK
+                                specs = extract_specs(product.title)
+                                passed, gate_reason = check_quality_gate(product.title, specs)
+                                if not passed:
+                                    print(f"      ⏭️ Rejected Garbage: {gate_reason} ({product.title[:20]}...)")
+                                    continue
+                                
                                 saved = await product_service.save_product(product_data=product, db=db, is_user_search=False)
                                 
                                 products_saved += 1
@@ -251,62 +288,127 @@ async def seed_smart_rotate(categories: List[str] = None, products_per_category:
                     print(f"      ❌ {e}")
                 
             await asyncio.sleep(1)
-            from app.services.scraper.browser import close_browser_manager
-            await close_browser_manager()
+            try:
+                from app.services.scraper.browser import close_browser_manager
+                await close_browser_manager()
+            except: pass
     
     return results
 
 
 async def seed_full(limit: int = 100) -> Dict[str, int]:
-    """Full seed: All categories, all platforms"""
-    print(f"\n🌟 Full Seed Mode (limit: {limit})")
+    """
+    Advanced Platform-Centric Full Seed:
+    - Loops by PLATFORM first.
+    - Amazon/Flipkart: 7 per category, then 5 Trending.
+    - Others: 5 per category, then 3 Trending.
+    - Cross-platform matching triggers for every single valid product.
+    """
+    print(f"\n🌟 PLATFORM-CENTRIC FULL SEED MODE")
     results = {p: 0 for p in PLATFORMS}
-    total_saved = 0
     
     async with async_session_maker() as db:
-        for category in CATEGORIES:
-            if total_saved >= limit: break
-            print(f"\n📁 Category: {category}")
-            queries = SEARCH_QUERIES.get(category, ["trending"])
+        
+        # OUTER LOOP: Platform by Platform
+        for platform in PLATFORMS:
+            print(f"\n{'='*65}\n🚀 STARTING PLATFORM BASE: {platform.upper()}\n{'='*65}")
             
-            for platform in PLATFORMS:
-                if total_saved >= limit: break
-                if category not in PLATFORM_CATEGORY_MAP.get(platform, []): continue
+            # 🎯 Determine the limits for this specific platform
+            if platform in ["amazon", "flipkart"]:
+                cat_limit = 7
+                trend_limit = 5
+            else:
+                cat_limit = 5
+                trend_limit = 3
                 
-                print(f"\n   📌 {platform.upper()}")
-                try:
-                    handler = await get_platform_handler(platform, db)
-                    if not handler: continue
+            try:
+                handler = await get_platform_handler(platform, db)
+                if not handler:
+                    print(f"   ❌ Platform handler not found.")
+                    continue
+                
+                # ==========================================================
+                # STAGE 1: EACH CATEGORY FOR THIS PLATFORM
+                # ==========================================================
+                platform_categories = PLATFORM_CATEGORY_MAP.get(platform, [])
+                
+                for category in platform_categories:
+                    print(f"\n   📁 CATEGORY: {category.upper()} (Target: {cat_limit} products)")
+                    queries = SEARCH_QUERIES.get(category, ["best sellers"])
                     
+                    products_saved = 0
                     for query in queries:
-                        if total_saved >= limit: break
+                        if products_saved >= cat_limit: break
                         
-                        result = await asyncio.wait_for(handler.search(query=query, page=1), timeout=60)
+                        result = await asyncio.wait_for(handler.search(query=query, page=1), timeout=45)
                         if not result or not result.products: continue
                         
-                        for product in result.products[:5]:
-                            if total_saved >= limit: break
+                        for p in result.products:
+                            if products_saved >= cat_limit: break
                             try:
-                                product.category = category
-                                product = await enrichment_service.enrich_product(product)
+                                # Quality Gate
+                                specs = extract_specs(p.title, category=category)
+                                passed, _ = check_quality_gate(p.title, specs)
+                                if not passed: continue
+                                
+                                p.category = category
+                                product = await enrichment_service.enrich_product(p)
                                 
                                 saved = await product_service.save_product(product_data=product, db=db, is_user_search=False)
+                                products_saved += 1
                                 results[platform] += 1
-                                total_saved += 1
                                 
-                                print(f"   ✅ {saved.title[:40]}... (₹{product.current_price})")
-                                # ⚡ TRIGGER CROSS-PLATFORM MATCHING
-                                await _find_and_save_cross_platform(product, db)
+                                print(f"      ✅ [{products_saved}/{cat_limit}] {saved.title[:45]}... (₹{product.current_price:,.0f})")
+                                
+                                # ⚡ Cross-Platform Match
+                                await _find_and_compare_cross_platform(product, db)
+                                print("") # spacing
                                 
                             except Exception: pass
                         await asyncio.sleep(0.5)
-                except Exception: pass
-        
-        from app.services.scraper.browser import close_browser_manager
-        await close_browser_manager()
-    
-    return results
+                
+                # ==========================================================
+                # STAGE 2: TRENDING DEALS FOR THIS PLATFORM
+                # ==========================================================
+                print(f"\n   🔥 {platform.upper()} TRENDING DEALS (Target: {trend_limit} products)")
+                trend_query = "trending deals" if platform in ["amazon", "flipkart"] else "best sellers"
+                
+                result = await asyncio.wait_for(handler.search(query=trend_query, page=1), timeout=45)
+                if result and result.products:
+                    products_saved = 0
+                    for p in result.products:
+                        if products_saved >= trend_limit: break
+                        try:
+                            # Quality Gate
+                            specs = extract_specs(p.title, category="General")
+                            passed, _ = check_quality_gate(p.title, specs)
+                            if not passed: continue
+                            
+                            p.category = "Trending"
+                            product = await enrichment_service.enrich_product(p)
+                            
+                            saved = await product_service.save_product(product_data=product, db=db, is_user_search=False)
+                            products_saved += 1
+                            results[platform] += 1
+                            
+                            print(f"      🔥 [{products_saved}/{trend_limit}] {saved.title[:45]}... (₹{product.current_price:,.0f})")
+                            
+                            # ⚡ Cross-Platform Match
+                            await _find_and_compare_cross_platform(product, db)
+                            print("") # spacing
+                            
+                        except Exception: pass
+                        
+            except Exception as e:
+                print(f"   ❌ {platform.upper()} Error: {str(e)[:40]}")
+            
+            # Clean up the browser memory before moving to the next base platform
+            try:
+                from app.services.scraper.browser import close_browser_manager
+                await close_browser_manager()
+            except: pass
 
+    return results
 
 def print_summary(results: Dict[str, int], start_time: datetime):
     duration = (datetime.now() - start_time).total_seconds()
@@ -331,7 +433,7 @@ def print_summary(results: Dict[str, int], start_time: datetime):
 async def main(args):
     start_time = datetime.now()
     print("=" * 60)
-    print("🌱 DEALHUNT SEEDER v2.0")
+    print("🌱 DEALHUNT SEEDER v3.0 (Zero False Positives Edition)")
     print(f"   Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     

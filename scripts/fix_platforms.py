@@ -30,6 +30,14 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 import json
 
+# =============================================================================
+# 🔧 WINDOWS FIX: Silence Proactor Event Loop Warning
+# =============================================================================
+if sys.platform == 'win32':
+    from asyncio.proactor_events import _ProactorBasePipeTransport
+    def silence_proactor_del(self): pass
+    _ProactorBasePipeTransport.__del__ = silence_proactor_del
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from sqlalchemy import select
@@ -254,6 +262,9 @@ async def heal_platform(
     """
     Use AI to heal broken selectors for a platform
     
+    OPTIMIZED: Uses batch healing to identify all broken fields at once
+    Reduces Groq API quota consumption by checking quota before starting
+    
     Args:
         platform_name: Platform to heal
         apply_fixes: Whether to persist fixes to database
@@ -312,7 +323,30 @@ async def heal_platform(
                 
                 selectors = platform.selectors or {}
             
-            # Try to heal each broken field
+            # Check combined quota (can fallback between keys)
+            quota = await groq_client.get_quota_status()
+            
+            # Get remaining quota across ALL features
+            all_remaining = sum(
+                s.get("remaining", 0) 
+                for s in quota.values()
+            )
+            
+            # Only skip if total quota is critically low (<20 tokens left)
+            if all_remaining < 20:
+                print(f"      {colorize('⚠️ CRITICAL QUOTA', Colors.YELLOW)} - Total remaining: {all_remaining}")
+                results["status"] = "skipped_quota"
+                results["errors"].append(f"Insufficient total quota: {all_remaining}")
+                await browser.close()
+                return results
+            
+            # Log quota status (informational)
+            healing_remaining = quota.get("healing", {}).get("remaining", 0)
+            if healing_remaining < 50:
+                print(f"      {colorize('ℹ️', Colors.CYAN)} Healing quota low ({healing_remaining}) - will fallback to other keys")
+            
+            # Identify which fields need healing
+            fields_to_heal = []
             for field in FIELDS_TO_TEST:
                 current_selector = selectors.get(field, "")
                 if isinstance(current_selector, dict):
@@ -331,9 +365,19 @@ async def heal_platform(
                     if text and len(text.strip()) > 0:
                         continue  # Already working
                 
-                # Need to heal this field
-                print(f"   🤖 Asking AI for {colorize(field, Colors.CYAN)}...")
-                
+                # This field needs healing
+                fields_to_heal.append((field, current_selector))
+            
+            if not fields_to_heal:
+                print(f"   {colorize('✅', Colors.GREEN)} All selectors working")
+                results["status"] = "healthy"
+                await browser.close()
+                return results
+            
+            # Heal all broken fields
+            print(f"   🤖 Healing {len(fields_to_heal)} broken field(s)...")
+            
+            for field, current_selector in fields_to_heal:
                 new_selector = await groq_client.suggest_selector_fix(
                     html_snippet=html_content,
                     failed_selector=current_selector,
@@ -361,9 +405,9 @@ async def heal_platform(
                         })
                         
                         if works:
-                            print(f"      {colorize('✅', Colors.GREEN)} AI suggestion works: {new_selector[:50]}")
+                            print(f"      {colorize('✅', Colors.GREEN)} {field}")
                         else:
-                            print(f"      {colorize('⚠️', Colors.YELLOW)} AI suggestion didn't work")
+                            print(f"      {colorize('⚠️', Colors.YELLOW)} {field}: selector didn't work")
                             results["failed"] += 1
                             
                     except Exception as e:
@@ -376,15 +420,15 @@ async def heal_platform(
                         })
                         results["failed"] += 1
                 else:
-                    print(f"      {colorize('❌', Colors.RED)} AI couldn't generate selector")
+                    print(f"      {colorize('❌', Colors.RED)} {field}: AI couldn't generate selector")
                     results["failed"] += 1
                 
-                await asyncio.sleep(1)  # Rate limit
+                await asyncio.sleep(0.5)  # Rate limit
             
             await browser.close()
         
         # Apply fixes if requested
-        if apply_fixes:
+        if apply_fixes and results.get("status") != "skipped_quota":
             working_suggestions = [s for s in results["suggestions"] if s.get("works")]
             
             if working_suggestions:
@@ -396,17 +440,22 @@ async def heal_platform(
                 print(f"\n   💾 Applied {colorize(str(applied), Colors.GREEN)} fixes to database")
         
         # Determine status
-        working_count = len([s for s in results["suggestions"] if s.get("works")])
-        total_count = len(results["suggestions"])
-        
-        if working_count == total_count and total_count > 0:
-            results["status"] = "success"
-        elif working_count > 0:
-            results["status"] = "partial"
-        elif total_count > 0:
-            results["status"] = "failed"
+        if results.get("status") == "skipped_quota":
+            pass  # Already set
+        elif results.get("status") == "healthy":
+            pass  # Already set
         else:
-            results["status"] = "no_healing_needed"
+            working_count = len([s for s in results["suggestions"] if s.get("works")])
+            total_count = len(results["suggestions"])
+            
+            if working_count == total_count and total_count > 0:
+                results["status"] = "success"
+            elif working_count > 0:
+                results["status"] = "partial"
+            elif total_count > 0:
+                results["status"] = "failed"
+            else:
+                results["status"] = "no_healing_needed"
         
     except ImportError:
         results["errors"].append("Playwright not installed")
@@ -526,6 +575,8 @@ def print_healing_summary(results: List[Dict[str, Any]]):
     total_suggestions = 0
     total_working = 0
     total_applied = 0
+    total_skipped = 0
+    total_healthy = 0
     
     for result in results:
         platform = result["platform"]
@@ -545,15 +596,30 @@ def print_healing_summary(results: List[Dict[str, Any]]):
             icon = colorize("🔶", Colors.YELLOW)
         elif status == "no_healing_needed":
             icon = colorize("👍", Colors.BLUE)
+        elif status == "healthy":
+            icon = colorize("💚", Colors.GREEN)
+            total_healthy += 1
+        elif status == "skipped_quota":
+            icon = colorize("⏭️", Colors.YELLOW)
+            total_skipped += 1
         else:
             icon = colorize("❌", Colors.RED)
         
-        print(f"   {icon} {platform.capitalize():12} | {working}/{len(suggestions)} fixes | Applied: {applied}")
+        if status == "skipped_quota":
+            print(f"   {icon} {platform.capitalize():12} | SKIPPED (quota too low)")
+        elif status == "healthy":
+            print(f"   {icon} {platform.capitalize():12} | All selectors healthy")
+        else:
+            print(f"   {icon} {platform.capitalize():12} | {working}/{len(suggestions)} fixes | Applied: {applied}")
     
     print("\n" + "-" * 40)
     print(f"   Total Suggestions: {total_suggestions}")
     print(f"   Working: {total_working}")
     print(f"   Applied to DB: {total_applied}")
+    if total_skipped > 0:
+        print(f"   Skipped (quota): {total_skipped}")
+    if total_healthy > 0:
+        print(f"   Healthy: {total_healthy}")
 
 
 async def generate_full_report() -> Dict[str, Any]:
@@ -763,3 +829,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n{colorize(f'❌ Error: {e}', Colors.RED)}")
         sys.exit(1)
+    finally:
+        # Cleanup: force event loop closure on Windows
+        if sys.platform == 'win32':
+            try:
+                import concurrent.futures
+                concurrent.futures.ThreadPoolExecutor().shutdown(wait=False)
+            except:
+                pass

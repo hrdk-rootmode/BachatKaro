@@ -58,10 +58,19 @@ class Settings(BaseSettings):
     # =============================================================================
     # GROQ AI (Multiple accounts for 4x quota)
     # =============================================================================
-    GROQ_API_KEY_MAIN: str  # For daily scraping
-    GROQ_API_KEY_SEARCH: str  # For URL searches
-    GROQ_API_KEY_HEALING: str  # For self-healing scrapers
-    GROQ_API_KEY_CHAT: str  # For premium AI chat
+    # 🔄 KEY ROTATION: Use all 4 keys to maximize quota
+    # - MAIN: Daily scraping, product enrichment (80% of quota)
+    # - SEARCH: Real-time URL searches (10% of quota)
+    # - HEALING: Self-healing scraper fallback (5% of quota)
+    # - CHAT: Premium AI chat feature (5% of quota)
+    # 
+    # Fallback Strategy:
+    # If MAIN quota exhausted, tries SEARCH, HEALING, CHAT in order
+    # Enables 57,600 tokens/day with 4 accounts (14,400 * 4)
+    GROQ_API_KEY_MAIN: str = ""  # At least one required
+    GROQ_API_KEY_SEARCH: str = ""  # Optional - fallback key
+    GROQ_API_KEY_HEALING: str = ""  # Optional - fallback key
+    GROQ_API_KEY_CHAT: str = ""  # Optional - fallback key
     GROQ_MODEL: str = "llama-3.1-8b-instant"
     GROQ_DAILY_LIMIT: int = 14400
     
