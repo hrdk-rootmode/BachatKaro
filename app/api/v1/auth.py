@@ -476,6 +476,91 @@ async def logout(
     }
 
 
+@router.get("/ping")
+async def auth_ping():
+    """
+    🔍 PING ENDPOINT - Simple connectivity test (NO AUTH REQUIRED)
+    
+    Use this to verify the backend is reachable from your device
+    
+    Returns: {"status": "pong", "timestamp": "2026-03-17T..."}
+    """
+    return {
+        "status": "pong",
+        "message": "Backend is reachable!",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.get("/debug/token-check")
+async def debug_token_check(request: Request):
+    """
+    🔍 DEBUG ENDPOINT - Check if Firebase token verification works
+    
+    No authentication required - for testing purposes only
+    
+    Usage: curl -H "Authorization: Bearer YOUR_TOKEN" http://localhost:8000/api/v1/auth/debug/token-check
+    
+    Returns:
+    - Authorization header status
+    - Token verification result
+    - Any error messages
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Check Authorization header
+    auth_header = request.headers.get("Authorization")
+    
+    if not auth_header:
+        return {
+            "status": "error",
+            "message": "No Authorization header provided",
+            "expected": "Authorization: Bearer <firebase_token>"
+        }
+    
+    try:
+        # Extract token from "Bearer {token}"
+        parts = auth_header.split(" ")
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return {
+                "status": "error",
+                "message": "Invalid Authorization header format",
+                "expected": "Authorization: Bearer <firebase_token>",
+                "received": auth_header[:50] + "..." if len(auth_header) > 50 else auth_header
+            }
+        
+        token = parts[1]
+        
+        # Try to verify Firebase token
+        from firebase_admin import auth as firebase_auth
+        
+        try:
+            decoded_token = firebase_auth.verify_id_token(token)
+            return {
+                "status": "success",
+                "message": "Firebase token is valid",
+                "firebase_uid": decoded_token.get("uid"),
+                "email": decoded_token.get("email"),
+                "token_valid": True
+            }
+        except Exception as e:
+            logger.error(f"Token verification failed: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Firebase token verification failed: {str(e)}",
+                "error_type": type(e).__name__,
+                "token_valid": False
+            }
+    
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"Unexpected error: {str(e)}"
+        }
+
+
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_profile(
     user: User = Depends(get_current_user)
@@ -489,7 +574,29 @@ async def get_current_user_profile(
     - Notification preferences
     - Streak information
     """
-    return user
+    # Transform User object to UserResponse with computed fields
+    usage_stats = user.usage_stats or {}
+    streak_data = user.streak_data or {}
+    watchlist = user.watchlist or []
+    
+    return UserResponse(
+        id=str(user.id),  # Convert UUID to string
+        firebase_uid=user.firebase_uid,
+        email=user.email,
+        display_name=user.display_name,
+        plan=user.plan,
+        plan_expires_at=user.plan_expires_at,
+        referral_code=user.referral_code,
+        total_searches=usage_stats.get("total_searches", 0),
+        searches_today=usage_stats.get("searches_today", 0),
+        watchlist_count=len(watchlist) if watchlist else 0,
+        current_streak=streak_data.get("current_streak", 0),
+        max_streak=streak_data.get("max_streak", 0),
+        freeze_count=streak_data.get("freeze_count", 0),
+        is_blocked=user.is_blocked,
+        created_at=user.created_at,
+        last_active=user.last_active
+    )
 
 
 @router.get("/me/stats", response_model=UserUsageStats)

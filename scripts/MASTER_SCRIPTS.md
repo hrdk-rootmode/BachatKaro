@@ -2,6 +2,11 @@ database seeding:
     python scripts/seed.py --quick
     quick, smart-rotate, full
 
+# Increase batch size
+python scripts/match_existing_products.py --limit 200 --no-ai
+#daily job 
+python jobs/daily_scrape.py --force-all
+
 ---------------------all platform
 testing :
     python scripts/test_scrapers.py --platform all --query "smartphone" --standalone

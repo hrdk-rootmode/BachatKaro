@@ -19,7 +19,7 @@ import logging
 from typing import Dict, Any, Optional
 
 from app.services.scraper.base import ProductData
-from app.services.ai.groq_client import groq_client
+from app.services.ai.groq_client import groq_client, GroqFeature
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,24 @@ class AIEnrichmentService:
         # Limit to first 12 words
         words = title.split()[:12]
         return ' '.join(words)
+
+    async def call_llm_raw(self, prompt: str) -> str:
+        """
+        Raw LLM call for custom prompts (used by matching script)
+        
+        Args:
+            prompt: The prompt to send to LLM
+            
+        Returns:
+            Raw text response from LLM
+        """
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = await groq_client._call_groq(messages, GroqFeature.HEALING)
+            return response.get('content', '') or ''
+        except Exception as e:
+            logger.error(f"Raw LLM call failed: {e}")
+            return ''
 
 
 # =============================================================================

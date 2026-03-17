@@ -7,6 +7,18 @@ from fastapi import APIRouter
 
 api_router = APIRouter()
 
+
+@api_router.get("", tags=["API"])
+@api_router.get("/", tags=["API"])
+async def api_v1_root():
+	"""API v1 root endpoint for quick connectivity checks."""
+	return {
+		"message": "DealHunt API v1 is running",
+		"version": "v1",
+		"status": "ok",
+		"docs": "/docs"
+	}
+
 # Import routers
 from app.api.v1 import auth, search, products, watchlist, streak, subscription, admin   
 

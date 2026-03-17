@@ -9,3 +9,4 @@ firebase-adminsdk.json
 # test_*.py
 debug_output/
 results/
+*.md

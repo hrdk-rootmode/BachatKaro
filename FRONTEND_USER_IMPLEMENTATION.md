@@ -14,7 +14,8 @@
 8. [Authentication Flow](#authentication-flow)
 9. [Payment Integration](#payment-integration)
 10. [Ads & Monetization](#ads--monetization)
-11. [Deployment](#deployment)
+11. [Scrape Status Display](#scrape-status-display) ⭐ **NEW**
+12. [Deployment](#deployment)
 
 ---
 
@@ -271,7 +272,8 @@ dealhunt-app/
 │   │   ├── RewardedAdButton.tsx         # Watch ad for +5 searches
 │   │   ├── FilterSheet.tsx              # Swipe-up filter modal
 │   │   ├── PricingCard.tsx              # Subscription plan card
-│   │   └── NotificationBadge.tsx        # Red dot on watchlist alerts
+│   │   ├── NotificationBadge.tsx        # Red dot on watchlist alerts
+│   │   └── ScrapeStatusCard.tsx        # ⭐ **NEW**: Scrape time display
 │   │
 │   ├── store/
 │   │   ├── index.ts                     # Store configuration
@@ -281,7 +283,8 @@ dealhunt-app/
 │   │   │   ├── watchlistSlice.ts        # Redux: Watched products
 │   │   │   ├── streakSlice.ts           # Redux: Current streak, rewards
 │   │   │   ├── subscriptionSlice.ts     # Redux: Plan, quota limits
-│   │   │   └── appSlice.ts              # Redux: Theme, notifications, language
+│   │   │   ├── appSlice.ts              # Redux: Theme, notifications, language
+│   │   │   └── scrapeStatusSlice.ts     # ⭐ **NEW**: Scrape status state
 │   │   │
 │   │   ├── api/
 │   │   │   ├── apiSlice.ts              # RTK Query base configuration
@@ -290,7 +293,8 @@ dealhunt-app/
 │   │   │   ├── productsApi.ts           # RTK endpoints: detail, price history
 │   │   │   ├── watchlistApi.ts          # RTK endpoints: get, add, delete
 │   │   │   ├── streakApi.ts             # RTK endpoints: checkin, status, milestones
-│   │   │   └── subscriptionApi.ts       # RTK endpoints: plans, order, verify
+│   │   │   ├── subscriptionApi.ts       # RTK endpoints: plans, order, verify
+│   │   │   └── scrapeStatusApi.ts      # ⭐ **NEW**: Scrape status endpoints
 │   │   │
 │   │   └── middleware/
 │   │       └── persistConfig.ts         # Redux Persist configuration
@@ -330,7 +334,8 @@ dealhunt-app/
 │   │   ├── useDebounce.ts               # Debounce any value
 │   │   ├── useNetworkStatus.ts          # Online/offline detection
 │   │   ├── useTheme.ts                  # Dark mode toggle
-│   │   └── usePagination.ts             # Infinite scroll pagination
+│   │   ├── usePagination.ts             # Infinite scroll pagination
+│   │   └── useScrapeStatus.ts          # ⭐ **NEW**: Scrape status hook
 │   │
 │   ├── utils/
 │   │   ├── formatters.ts                # formatPrice, formatDate, formatStreak
@@ -339,6 +344,7 @@ dealhunt-app/
 │   │   ├── deviceInfo.ts                # Get hardware_id, device model, OS
 │   │   ├── deepLinking.ts               # Parse deep links (dealhunt://product/{id})
 │   │   ├── errorHandler.ts              # Standard error responses
+│   │   ├── timeUtils.ts                 # ⭐ **NEW**: Time formatting utilities
 │   │   └── logger.ts                    # Logging utility (future Sentry integration)
 │   │
 │   ├── theme/
@@ -1703,6 +1709,275 @@ const QuotaWarning = () => {
   
   return null;
 };
+```
+
+---
+
+## 🕐 SCRAPE STATUS DISPLAY ⭐ **NEW**
+
+### **Purpose**: Show exact scrape times and interval status to users
+
+### **API Endpoints to Use**:
+```typescript
+// Get overall scrape statistics
+GET /api/v1/scrape-status/overview
+Response: {
+  total_products: 1234,
+  platforms: [
+    {
+      platform_name: "amazon",
+      total_products: 456,
+      scraped_recently: 234,
+      needs_scraping: 222,
+      avg_hours_since_scrape: 18.5
+    }
+  ],
+  scrape_interval_hours: 24,
+  last_global_scrape: "2026-03-15T01:09:36.994267+00:00"
+}
+
+// Get individual product scrape status
+GET /api/v1/scrape-status/products?limit=50&platform=amazon
+Response: [
+  {
+    product_id: "123",
+    external_id: "B08XYZ123",
+    platform_name: "amazon",
+    last_scraped: "2026-03-15T01:09:36.994267+00:00",
+    hours_since_scrape: 11.5,
+    needs_scraping: false,
+    scrape_interval_hours: 24
+  }
+]
+
+// Get current interval configuration
+GET /api/v1/scrape-status/interval
+Response: {
+  scrape_interval_hours: 24,
+  scrape_interval_description: "Products are scraped every 24 hours",
+  next_scrape_due: "Products scraped more than 24 hours ago will be included in next run",
+  configuration_source: "jobs/daily_scrape.py"
+}
+```
+
+### **Frontend Components**:
+
+#### **1. ScrapeStatusCard.tsx**
+```typescript
+interface ScrapeStatusProps {
+  product: {
+    external_id: string;
+    platform_name: string;
+    last_scraped: string;
+    hours_since_scrape: number;
+    needs_scraping: boolean;
+  };
+}
+
+const ScrapeStatusCard: React.FC<ScrapeStatusProps> = ({ product }) => {
+  const { formatRelativeTime, formatExactTime } = useTimeUtils();
+  
+  return (
+    <Card style={styles.card}>
+      <View style={styles.header}>
+        <PlatformBadge platform={product.platform_name} size="small" />
+        <Text style={styles.externalId}>{product.external_id}</Text>
+      </View>
+      
+      <View style={styles.status}>
+        <Text style={styles.lastScraped}>
+          Last scraped: {formatExactTime(product.last_scraped)}
+        </Text>
+        <Text style={styles.relativeTime}>
+          {formatRelativeTime(product.hours_since_scrape)} ago
+        </Text>
+        <View style={[
+          styles.statusBadge,
+          { backgroundColor: product.needs_scraping ? '#ff6b6b' : '#4caf50' }
+        ]}>
+          <Text style={styles.statusText}>
+            {product.needs_scraping ? 'Needs Update' : 'Up to Date'}
+          </Text>
+        </View>
+      </View>
+      
+      <View style={styles.footer}>
+        <Text style={styles.interval}>
+          Scraped every {product.scrape_interval_hours}h
+        </Text>
+      </View>
+    </Card>
+  );
+};
+```
+
+#### **2. useScrapeStatus.ts Hook**
+```typescript
+// hooks/useScrapeStatus.ts
+import { useQuery } from '@reduxjs/toolkit/query';
+import { scrapeStatusApi } from '@store/api/scrapeStatusApi';
+
+export const useScrapeStatus = () => {
+  // Get overall statistics
+  const { data: overview, isLoading: overviewLoading } = useQuery(
+    'getScrapeOverview',
+    () => scrapeStatusApi.getOverview()
+  );
+
+  // Get individual products
+  const { data: products, isLoading: productsLoading } = useQuery(
+    'getScrapeProducts',
+    () => scrapeStatusApi.getProducts({ limit: 50 })
+  );
+
+  // Get interval info
+  const { data: interval, isLoading: intervalLoading } = useQuery(
+    'getScrapeInterval',
+    () => scrapeStatusApi.getInterval()
+  );
+
+  const refreshAll = () => {
+    // Refetch all scrape status data
+    overview?.refetch();
+    products?.refetch();
+    interval?.refetch();
+  };
+
+  return {
+    overview: overview?.data,
+    products: products?.data || [],
+    interval: interval?.data,
+    isLoading: overviewLoading || productsLoading || intervalLoading,
+    refreshAll
+  };
+};
+```
+
+#### **3. timeUtils.ts Enhancements**
+```typescript
+// utils/timeUtils.ts - Add to existing file
+export const formatExactTime = (isoString: string): string => {
+  const date = new Date(isoString);
+  return date.toLocaleString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Asia/Kolkata'
+  });
+};
+
+export const formatRelativeTime = (hours: number): string => {
+  if (hours < 1) return 'Just now';
+  if (hours < 24) return `${Math.round(hours)} hours ago`;
+  if (hours < 48) return 'Yesterday';
+  if (hours < 168) return `${Math.round(hours / 24)} days ago`;
+  return `${Math.round(hours / 168)} weeks ago`;
+};
+
+export const getScrapeStatusColor = (needsScraping: boolean): string => {
+  return needsScraping ? '#ff6b6b' : '#4caf50';
+};
+
+export const getScrapeStatusText = (needsScraping: boolean): string => {
+  return needsScraping ? 'Needs Update' : 'Up to Date';
+};
+```
+
+### **Integration in ProductDetailScreen**:
+```typescript
+// Add to existing ProductDetailScreen.tsx
+import { ScrapeStatusCard } from '@components/ScrapeStatusCard';
+
+const ProductDetailScreen = ({ route }) => {
+  const { product } = route.params;
+  const { products: scrapeProducts } = useScrapeStatus();
+  
+  // Find scrape status for this product
+  const scrapeStatus = scrapeProducts.find(p => p.external_id === product.external_id);
+  
+  return (
+    <ScrollView>
+      {/* Existing product details */}
+      <ProductImageSlider images={product.images} />
+      <ProductInfo product={product} />
+      <PriceChart priceHistory={product.price_history} />
+      
+      {/* NEW: Scrape Status Card */}
+      {scrapeStatus && (
+        <ScrapeStatusCard product={scrapeStatus} />
+      )}
+      
+      <CrossPlatformComparison productId={product.id} />
+    </ScrollView>
+  );
+};
+```
+
+### **Integration in WatchlistScreen**:
+```typescript
+// Add to existing WatchlistScreen.tsx
+const WatchlistScreen = () => {
+  const { products: scrapeProducts } = useScrapeStatus();
+  const { watchlist } = useWatchlist();
+  
+  // Merge scrape status with watchlist data
+  const watchlistWithStatus = watchlist.map(item => {
+    const scrapeStatus = scrapeProducts.find(p => p.external_id === item.external_id);
+    return { ...item, scrapeStatus };
+  });
+  
+  return (
+    <FlatList
+      data={watchlistWithStatus}
+      renderItem={({ item }) => (
+        <WatchlistItem 
+          product={item}
+          scrapeStatus={item.scrapeStatus}
+        />
+      )}
+      keyExtractor={item => item.id}
+    />
+  );
+};
+```
+
+### **Redux Store Integration**:
+```typescript
+// store/api/scrapeStatusApi.ts
+import { apiSlice } from './apiSlice';
+
+export const scrapeStatusApi = apiSlice.injectEndpoints({
+  endpoints: (builder) => ({
+    getOverview: builder.query<ScrapeOverviewResponse, void>({
+      query: () => '/scrape-status/overview',
+      providesTags: ['scrape-overview']
+    }),
+    getProducts: builder.query<ScrapeProduct[], ScrapeProductsParams>({
+      query: ({ limit, platform, needs_scraping_only }) => ({
+        url: '/scrape-status/products',
+        params: { limit, platform, needs_scraping_only }
+      }),
+      providesTags: ['scrape-products']
+    }),
+    getInterval: builder.query<ScrapeIntervalResponse, void>({
+      query: () => '/scrape-status/interval',
+      providesTags: ['scrape-interval']
+    }),
+    getPlatformStats: builder.query<PlatformScrapeStats, string>({
+      query: (platform) => `/scrape-status/platform/${platform}`,
+      providesTags: ['scrape-platform-stats']
+    })
+  })
+});
+
+export const {
+  useGetScrapeOverviewQuery,
+  useGetScrapeProductsQuery,
+  useGetScrapeIntervalQuery,
+  useGetPlatformStatsQuery
+} = scrapeStatusApi;
 ```
 
 ---

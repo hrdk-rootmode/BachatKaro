@@ -19,6 +19,7 @@ Version: 2.0 (Cleaned & Enhanced)
 import logging
 import asyncio
 import random
+import pytz
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional
 from decimal import Decimal
@@ -52,10 +53,10 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 MAX_PRODUCTS_PER_RUN = 500  # Limit to avoid overload
-SCRAPE_INTERVAL_HOURS = 24  # Scrape products not updated in 24h
+SCRAPE_INTERVAL_HOURS = 6  # Scrape products not updated in 24h
 DELAY_BETWEEN_PRODUCTS = 2  # Seconds between scrapes (rate limiting)
 MAX_ERRORS_BEFORE_SKIP = 3  # Skip platform after consecutive errors
-BATCH_SIZE = 50  # Commit after each batch
+BATCH_SIZE = 60  # Commit after each batch
 
 
 # =============================================================================
@@ -78,7 +79,7 @@ async def run_daily_scrape() -> Dict[str, Any]:
         Dictionary with scrape statistics
     """
     logger.info("🔄 Starting daily price scrape...")
-    start_time = datetime.utcnow()
+    start_time = datetime.now(pytz.UTC)
     
     stats = {
         "products_found": 0,
@@ -130,7 +131,7 @@ async def run_daily_scrape() -> Dict[str, Any]:
             
             # Step 5: Calculate duration
             stats["duration_seconds"] = round(
-                (datetime.utcnow() - start_time).total_seconds(), 2
+                (datetime.now(pytz.UTC) - start_time).total_seconds(), 2
             )
             
             # Step 6: Log results
@@ -151,7 +152,7 @@ async def run_daily_scrape() -> Dict[str, Any]:
         logger.error(f"❌ Daily scrape failed: {e}")
         stats["error"] = str(e)
         stats["duration_seconds"] = round(
-            (datetime.utcnow() - start_time).total_seconds(), 2
+            (datetime.now(pytz.UTC) - start_time).total_seconds(), 2
         )
         return stats
 
@@ -162,7 +163,7 @@ async def run_daily_scrape() -> Dict[str, Any]:
 
 async def _get_products_to_scrape(db: AsyncSession) -> List[ProductListing]:
     """Get products that need scraping (prioritized)"""
-    cutoff_time = datetime.utcnow() - timedelta(hours=SCRAPE_INTERVAL_HOURS)
+    cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=SCRAPE_INTERVAL_HOURS)
     
     try:
         # Get watchlisted product IDs (highest priority)
@@ -262,7 +263,7 @@ async def _scrape_platform(
                 old_price = listing.current_price
                 
                 # Update listing
-                listing.last_scraped = datetime.utcnow()
+                listing.last_scraped = datetime.now(pytz.UTC)
                 listing.scrape_error_count = 0
                 listing.last_error = None
                 
@@ -378,7 +379,7 @@ async def _record_price_history(
             product_listing_id=listing.id,
             price=Decimal(str(new_price)),
             in_stock=listing.in_stock if listing.in_stock is not None else True,
-            recorded_at=datetime.utcnow()
+            recorded_at=datetime.now(pytz.UTC)
         )
         db.add(history_entry)
     except Exception as e:

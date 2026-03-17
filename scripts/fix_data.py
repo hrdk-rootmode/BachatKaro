@@ -89,9 +89,9 @@ RED = "\033[91m"
 CYAN = "\033[96m"
 DIM = "\033[2m"
 
-def ok(msg): print(f"      {GREEN}✅{RESET} {msg}")
-def warn(msg): print(f"      {YELLOW}⚠️ {RESET} {msg}")
-def err(msg): print(f"      {RED}❌{RESET} {msg}")
+def ok(msg): print(f"      {GREEN}[OK]{RESET} {msg}")
+def warn(msg): print(f"      {YELLOW}[WARN]{RESET} {msg}")
+def err(msg): print(f"      {RED}[ERROR]{RESET} {msg}")
 def info(msg): print(f"      {DIM}{msg}{RESET}")
 def header(msg): print(f"\n{BOLD}{CYAN}{msg}{RESET}")
 
@@ -279,7 +279,7 @@ async def scan_database_health() -> Dict[str, Any]:
     
     Returns detailed breakdown of all issues found
     """
-    header("🔬 Deep Scanning Database for ALL Issues...")
+    header("[SCAN] Deep Scanning Database for ALL Issues...")
     
     issues = {
         "total_products": 0,
@@ -458,7 +458,7 @@ def print_health_report(issues: Dict[str, Any]):
         return f"    {icon} {label}: {count:,} ({pct:.1f}%){RESET}"
     
     print(f"\n{'=' * 75}")
-    print(f"{BOLD}🔬 DATABASE HEALTH REPORT{RESET}")
+    print(f"{BOLD}[SCAN] DATABASE HEALTH REPORT{RESET}")
     print(f"{'=' * 75}")
     print(f"  Total Products: {total_products:,}")
     print(f"  Total Listings: {total_listings:,}")
@@ -510,7 +510,7 @@ def print_health_report(issues: Dict[str, Any]):
     health = max(0, 100 - (fixable_issues / max(total_checkable, 1) * 100))
     
     bar_filled = int(health / 5)
-    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+    bar = "#" * bar_filled + "-" * (20 - bar_filled)
     color = GREEN if health > 80 else (YELLOW if health > 50 else RED)
     
     print(f"\n  {color}DATABASE HEALTH: [{bar}] {health:.1f}%{RESET}")
@@ -528,7 +528,7 @@ async def fix_brands_intelligently(limit: int = 200, dry_run: bool = False) -> D
     """
     Fix garbage/NULL brands using v4.0 extraction + AI
     """
-    header(f"🏷️  Fixing Brands (limit={limit}, dry_run={dry_run})")
+    header(f"[BRAND]  Fixing Brands (limit={limit}, dry_run={dry_run})")
     
     stats = {
         "scanned": 0,
@@ -668,7 +668,7 @@ async def fix_specs_from_titles(limit: int = 200, dry_run: bool = False) -> Dict
     - Fashion attributes (garment, material, fit)
     - Product line, model, generation
     """
-    header(f"📊 Extracting Specs from Titles (limit={limit}, dry_run={dry_run})")
+    header(f"[SPECS] Extracting Specs from Titles (limit={limit}, dry_run={dry_run})")
     
     stats = {
         "scanned": 0,
@@ -790,13 +790,22 @@ async def fix_specs_from_titles(limit: int = 200, dry_run: bool = False) -> Dict
 async def fix_images_from_listings(limit: int = 200, dry_run: bool = False) -> Dict[str, int]:
     """
     Fix NULL/broken product images by pulling from listings
+    
+    Strategy:
+    1. Find products with NULL or broken image_url
+    2. Check their ProductListings for available images
+    3. Use first valid image from any listing
+    4. If no image in listings, try to extract from listing metadata
+    5. Mark products without fixable images for manual review
     """
-    header(f"🖼️  Fixing Images (limit={limit}, dry_run={dry_run})")
+    header(f"[IMAGE]  Fixing Images (limit={limit}, dry_run={dry_run})")
     
     stats = {
         "scanned": 0,
-        "fixed": 0,
-        "no_listing_image": 0,
+        "fixed_from_listings": 0,
+        "fixed_from_metadata": 0,
+        "no_valid_image_found": 0,
+        "no_listings": 0,
         "errors": 0
     }
     
@@ -830,20 +839,63 @@ async def fix_images_from_listings(limit: int = 200, dry_run: bool = False) -> D
         for i, product in enumerate(products_to_fix, 1):
             stats["scanned"] += 1
             
-            # Try to get image from first listing
-            if product.listings:
-                # Try to find listing with valid image
-                for listing in product.listings:
-                    # Image might be in product specs or other fields
-                    # For now, we rely on scraper to populate it
-                    pass
+            try:
+                print(f"   [{i}] {product.title[:50]}...")
                 
-                # Placeholder: in production, you'd scrape the listing URL again
-                warn(f"[{i}] No auto-fix available - needs re-scrape")
-                stats["no_listing_image"] += 1
-            else:
-                warn(f"[{i}] No listings to pull image from")
-                stats["no_listing_image"] += 1
+                if not product.listings or len(product.listings) == 0:
+                    warn(f"No listings available")
+                    stats["no_listings"] += 1
+                    continue
+                
+                # Try to find valid image from listings
+                found_image = None
+                
+                for listing in product.listings:
+                    # Check if listing has image_url field
+                    if hasattr(listing, 'image_url') and listing.image_url:
+                        if not is_image_url_broken(listing.image_url):
+                            found_image = listing.image_url
+                            break
+                    
+                    # Try to extract from metadata if available
+                    if hasattr(listing, 'metadata') and listing.metadata:
+                        metadata = listing.metadata if isinstance(listing.metadata, dict) else {}
+                        
+                        # Look for image in metadata
+                        for key in ['image', 'image_url', 'thumbnail', 'thumbnail_url',
+                                   'product_image', 'product_image_url', 'img', 'src']:
+                            if key in metadata:
+                                img_url = metadata[key]
+                                if img_url and not is_image_url_broken(img_url):
+                                    found_image = img_url
+                                    stats["fixed_from_metadata"] += 1
+                                    break
+                    
+                    if found_image:
+                        break
+                
+                if found_image:
+                    ok(f"Found valid image from listing")
+                    print(f"      URL: {found_image[:70]}...")
+                    
+                    if not dry_run:
+                        product.image_url = found_image
+                    
+                    stats["fixed_from_listings"] += 1
+                    
+                    batch += 1
+                    if batch >= 20 and not dry_run:
+                        await db.commit()
+                        batch = 0
+                
+                else:
+                    # No valid image found in listings
+                    warn(f"No valid image in {len(product.listings)} listing(s)")
+                    stats["no_valid_image_found"] += 1
+            
+            except Exception as e:
+                stats["errors"] += 1
+                err(f"Error: {e}")
         
         if not dry_run and batch > 0:
             await db.commit()
@@ -855,7 +907,7 @@ async def fix_ai_metadata(limit: int = 100, dry_run: bool = False) -> Dict[str, 
     """
     Re-process products with low quality AI metadata
     """
-    header(f"🤖 Fixing AI Metadata (limit={limit}, dry_run={dry_run})")
+    header(f"[AI] Fixing AI Metadata (limit={limit}, dry_run={dry_run})")
     
     stats = {
         "scanned": 0,
@@ -955,7 +1007,7 @@ async def delete_garbage_products(dry_run: bool = False) -> Dict[str, int]:
     """
     Delete products that are complete garbage or unfixable.
     """
-    header(f"🗑️  Deleting Unfixable Garbage (dry_run={dry_run})")
+    header(f"[DELETE]  Deleting Unfixable Garbage (dry_run={dry_run})")
     
     stats = {
         "scanned": 0,
@@ -1005,7 +1057,7 @@ async def delete_garbage_products(dry_run: bool = False) -> Dict[str, int]:
                 
             # EXECUTE DELETION
             if should_delete:
-                print(f"   🗑️  {title[:50]}...")
+                print(f"   [DELETE]  {title[:50]}...")
                 print(f"      Reason: {reason}")
                 
                 if not dry_run:
@@ -1029,7 +1081,7 @@ async def delete_garbage_products(dry_run: bool = False) -> Dict[str, int]:
 
 def print_fix_summary(title: str, stats: Dict[str, int]):
     print(f"\n{'─' * 60}")
-    print(f"{BOLD}📊 {title}{RESET}")
+    print(f"{BOLD}[SPECS] {title}{RESET}")
     print(f"{'─' * 60}")
     for key, value in stats.items():
         if value > 0 and "error" in key:
@@ -1047,7 +1099,7 @@ async def main(args):
     start = datetime.now()
     
     print(f"\n{'=' * 75}")
-    print(f"{BOLD}🔬 DATABASE HEALTH ANALYZER v4.0{RESET}")
+    print(f"{BOLD}[SCAN] DATABASE HEALTH ANALYZER v4.0{RESET}")
     print(f"   Time: {start.strftime('%Y-%m-%d %H:%M:%S')}")
     if args.dry_run:
         print(f"   {YELLOW}⚠️  DRY RUN MODE{RESET}")
@@ -1083,7 +1135,7 @@ async def main(args):
         print_fix_summary("GARBAGE DELETION", r)
     
     duration = (datetime.now() - start).total_seconds()
-    print(f"\n{BOLD}⏱️  Duration: {duration:.1f}s{RESET}")
+    print(f"\n{BOLD}[TIME]  Duration: {duration:.1f}s{RESET}")
 
 
 if __name__ == "__main__":

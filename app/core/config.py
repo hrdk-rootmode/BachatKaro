@@ -52,8 +52,30 @@ class Settings(BaseSettings):
     # =============================================================================
     # FIREBASE
     # =============================================================================
-    FIREBASE_CREDENTIALS_PATH: str
+    FIREBASE_CREDENTIALS_PATH: str = ""
     FIREBASE_PROJECT_ID: str
+    
+    # Optional: Inline credentials from .env (if JSON file not available)
+    FIREBASE_PRIVATE_KEY: str = ""
+    FIREBASE_CLIENT_EMAIL: str = ""
+    FIREBASE_CLIENT_ID: str = ""
+    FIREBASE_PRIVATE_KEY_ID: str = ""
+    
+    @validator("FIREBASE_CREDENTIALS_PATH")
+    def resolve_firebase_path(cls, v):
+        """Resolve Firebase credentials path to absolute path"""
+        if not v:
+            return v
+        
+        # If already absolute, return as is
+        if os.path.isabs(v):
+            return v
+        
+        # Resolve relative to backend directory
+        backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        absolute_path = os.path.join(backend_dir, v)
+        
+        return absolute_path
     
     # =============================================================================
     # GROQ AI (Multiple accounts for 4x quota)
@@ -232,9 +254,10 @@ class Settings(BaseSettings):
     
     # =====================================================================
     # LEGACY COMPATIBILITY (from old config)
-    # =====================================================================
+    # =============================================================================
     NODE_ENV: str = "development"
     PORT: int = 8000
+    HOST: str = "0.0.0.0"
     USE_BROWSER: bool = False
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: bool = True
     
@@ -310,7 +333,7 @@ def validate_settings():
     critical_checks = {
         "DATABASE_URL": settings.DATABASE_URL,
         "SECRET_KEY length >= 32": len(settings.SECRET_KEY) >= 32,
-        "FIREBASE_CREDENTIALS exist": os.path.exists(settings.FIREBASE_CREDENTIALS_PATH),
+        "FIREBASE_PROJECT_ID": settings.FIREBASE_PROJECT_ID,
         "At least 1 GROQ key": bool(settings.GROQ_API_KEY_MAIN),
     }
     
@@ -318,18 +341,30 @@ def validate_settings():
     
     if failed_checks:
         raise ValueError(
-            f"❌ Configuration validation failed:\n" + 
+            f"[ERROR] Configuration validation failed:\n" + 
             "\n".join(f"  - {check}" for check in failed_checks)
         )
     
-    print("✅ Configuration validated successfully")
-    print(f"🚀 Running in {settings.ENVIRONMENT.upper()} mode")
+    # Check Firebase credentials (warning if missing, not critical)
+    creds_exist = os.path.exists(settings.FIREBASE_CREDENTIALS_PATH) if settings.FIREBASE_CREDENTIALS_PATH else False
+    has_inline_creds = bool(getattr(settings, 'FIREBASE_PRIVATE_KEY', None))
+    
+    if not creds_exist and not has_inline_creds:
+        print("[WARN] Firebase credentials not found (file or env)")
+    else:
+        creds_source = "JSON file" if creds_exist else "inline (.env)"
+        print(f"[OK] Firebase credentials loaded from {creds_source}")
+    
+    print("[OK] Configuration validated successfully")
+    print(f"[RUN] Running in {settings.ENVIRONMENT.upper()} mode")
     if settings.DEBUG:
-        print("⚠️  DEBUG mode is ON (disable in production!)")
+        print("[WARN] DEBUG mode is ON (disable in production!)")
     
     # ✨ NEW: Payment gateway status
-    print(f"💳 Razorpay: {'✅ Configured' if settings.is_razorpay_configured else '⚠️ Mock Mode'}")
-    print(f"📱 Google Play: {'✅ Configured' if settings.is_google_play_configured else '⚠️ Mock Mode'}")
+    razorpay_status = "[OK] Configured" if settings.is_razorpay_configured else "[WARN] Mock Mode"
+    gplay_status = "[OK] Configured" if settings.is_google_play_configured else "[WARN] Mock Mode"
+    print(f"[PAYMENT] Razorpay: {razorpay_status}")
+    print(f"[PAYMENT] Google Play: {gplay_status}")
 
 
 # Auto-validate when imported (comment out during testing if needed)

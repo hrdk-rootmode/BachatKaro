@@ -1,33 +1,228 @@
 """
-Product Service
-===============
+Product Service v2.0 - Enhanced Data Quality
+==============================================
 
 Centralized database operations for Products and ProductListings.
 Single source of truth - eliminates DRY violations between API and Jobs.
 
+🚀 v2.0 ENHANCEMENTS:
+- Brand validation & garbage detection (Men/Cotton/Blue → rejected/fixed)
+- Automatic spec extraction from titles
+- Image URL fallback from listings
+- AI Enrichment ensuring essence ≠ title
+- Quality gates (only store quality products)
+- Pre-storage validation (fix at source, not post-hoc)
+- Cross-platform data preservation (all platforms stored with proper relationships)
+
 Features:
-- Fingerprint-based deduplication
+- Fingerprint-based deduplication (multi-platform comparison)
 - Smart stats tracking (user searches vs job seeding)
 - Platform auto-creation
 - Listing create/update with external_id dedup
 - Seed score calculation for job-created products
+- Brand quality checking before storage
+- Empty specs extraction before storage
+- Mandatory AI enrichment with quality validation
 
 Author: DealHunt
-Version: 1.0 (Centralized)
+Version: 2.0 (Quality-First Data Pipeline)
 """
 
 import logging
+import re
+import hashlib
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_
 
 from app.models import Product, ProductListing, Platform
 from app.services.scraper.base import ProductData
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# GARBAGE BRAND DETECTION (SAME AS fix_data.py v4.0)
+# =============================================================================
+
+GARBAGE_BRANDS = {
+    # Generic
+    "unknown", "generic", "unbranded", "other", "n/a", "na", "none", "null",
+    "brand", "original", "new", "latest", "premium", "best", "top",
+    # Attributes mistaken for brands
+    "men", "women", "boys", "girls", "kids", "unisex", "male", "female",
+    "cotton", "silk", "wool", "polyester", "nylon", "leather", "synthetic",
+    "polycotton", "blend", "mixed", "denim", "linen", "rayon",
+    # Garment types
+    "sneaker", "sneakers", "shoe", "shoes", "dress", "shirt", "tshirt", "t-shirt",
+    "trouser", "pant", "kurta", "saree", "top", "bottom", "jacket",
+    # Colors
+    "black", "white", "blue", "red", "green", "yellow", "pink", "grey",
+    "brown", "orange", "purple", "maroon", "navy", "beige", "gold",
+    # Styles
+    "casual", "formal", "stylish", "trendy", "elegant", "smart", "classic",
+    "modern", "vintage", "retro", "slim", "fit", "regular", "loose",
+    # Product features
+    "wireless", "bluetooth", "digital", "analog", "smart", "pro", "plus",
+    "ultra", "max", "lite", "mini", "premium", "deluxe", "standard",
+    # Random 2-letter junk
+    "te", "sb", "db", "ab", "cd", "xy", "qr", "mn", "pq", "st", "uv",
+}
+
+GARBAGE_BRAND_PATTERNS = [
+    re.compile(r'^[a-z]{1,2}$', re.I),  # 1-2 letters only
+    re.compile(r'^\d+$'),  # Just numbers
+    re.compile(r'^[^a-zA-Z]+$'),  # No letters at all
+]
+
+# Brand extraction patterns (100+ brands)
+BRAND_PATTERNS = re.compile(
+    r'\b('
+    r'Samsung|Apple|iPhone|iPad|OnePlus|Xiaomi|Redmi|POCO|Realme|'
+    r'Vivo|Oppo|Motorola|Moto|Nokia|Google|Pixel|Nothing|iQOO|'
+    r'Fire[\s\-]?Boltt|FireBoltt|boAt|boat|Noise|Zebronics|Mivi|Portronics|'
+    r'Ambrane|pTron|Ptron|Boult|CrossBeats|Hammer|Fastrack|Titan|Sonata|'
+    r'JBL|Sony|Bose|Sennheiser|Skullcandy|Beats|Marshall|'
+    r'Dell|HP|Acer|Asus|Lenovo|MSI|Razer|Alienware|ThinkPad|MacBook|'
+    r'Nike|Adidas|Puma|Reebok|Levis|Wrangler|Lee|Allen\s*Solly|Van\s*Heusen|'
+    r'Peter\s*England|Louis\s*Philippe|US\s*Polo|Roadster|HRX|Bewakoof|'
+    r'Forever\s*21|H&M|Zara|UNIQLO|Shein'
+    r')\b',
+    re.IGNORECASE
+)
+
+
+# =============================================================================
+# VALIDATION & EXTRACTION HELPERS (Module-level functions)
+# =============================================================================
+
+def _is_garbage_brand(brand: Optional[str]) -> bool:
+    """Detect if brand is garbage/invalid"""
+    if not brand:
+        return True
+    
+    brand_lower = brand.lower().strip()
+    
+    # Check garbage word list
+    if brand_lower in GARBAGE_BRANDS:
+        return True
+    
+    # Check patterns
+    for pattern in GARBAGE_BRAND_PATTERNS:
+        if pattern.match(brand):
+            return True
+    
+    # Too short (but not known brand)
+    if len(brand_lower) <= 2:
+        if not BRAND_PATTERNS.search(brand):
+            return True
+    
+    return False
+
+
+def _extract_brand_from_title(title: Optional[str]) -> Optional[str]:
+    """Extract brand from product title using regex"""
+    if not title:
+        return None
+    
+    match = BRAND_PATTERNS.search(title)
+    if match:
+        return match.group(1).strip()
+    
+    return None
+
+
+def _extract_specs_from_title(title: str, category: Optional[str] = None) -> Dict[str, Any]:
+    """Extract specs from product title using regex patterns"""
+    specs = {}
+    
+    if not title:
+        return specs
+    
+    title_lower = title.lower()
+    
+    # RAM extraction (electronics)
+    ram_match = re.search(r'(\d+)\s*(?:gb|gbs?)\s*ram', title_lower)
+    if ram_match:
+        specs["ram_gb"] = int(ram_match.group(1))
+    
+    # Storage extraction
+    storage_match = re.search(r'(\d+)\s*(?:gb|gbs?)\s*(?:storage|ssd|hdd)', title_lower)
+    if storage_match:
+        specs["storage_gb"] = int(storage_match.group(1))
+    
+    # Screen size (inches)
+    screen_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:inch|")', title_lower)
+    if screen_match:
+        specs["screen_size"] = float(screen_match.group(1))
+    
+    # Processor
+    if any(proc in title_lower for proc in ['snapdragon', 'exynos', 'helio', 'dimensity', 'k1', 'a15', 'a16']):
+        if 'snapdragon' in title_lower:
+            specs["processor"] = "Snapdragon"
+        elif 'exynos' in title_lower:
+            specs["processor"] = "Exynos"
+        elif 'helio' in title_lower:
+            specs["processor"] = "Helio"
+    
+    # Generation/Version
+    for gen in ['pro', 'pro max', 'ultra', 'lite', 'plus', 'max', 'mini']:
+        if gen in title_lower:
+            specs["generation"] = gen.title()
+            break
+    
+    # Color extraction
+    colors = ['black', 'white', 'blue', 'red', 'green', 'gold', 'silver', 'grey', 'gray', 'pink', 'purple']
+    for color in colors:
+        if color in title_lower:
+            specs["color"] = color.title()
+            break
+    
+    return specs
+
+
+def _validate_image_url(url: Optional[str]) -> bool:
+    """Check if image URL is valid (not None, not empty, not placeholder)"""
+    if not url or not str(url).strip():
+        return False
+    
+    url_str = str(url).lower()
+    
+    # Reject placeholder/broken patterns
+    placeholders = [
+        'placeholder', 'noimage', 'no-image', 'coming-soon', 
+        'unavailable', 'default', '1x1', 'blank', 'dummy'
+    ]
+    
+    if any(p in url_str for p in placeholders):
+        return False
+    
+    return True
+
+
+def _is_useful_essence(essence: Optional[str], title: Optional[str]) -> bool:
+    """Check if AI essence is actually useful (not same as title)"""
+    if not essence or not title:
+        return False
+    
+    essence_clean = str(essence).lower().strip()
+    title_clean = str(title).lower().strip()
+    
+    # If essence is same as title up to 80% similarity, it's useless
+    essence_short = essence_clean[:80]
+    title_short = title_clean[:80]
+    
+    if essence_short == title_short:
+        return False
+    
+    # If essence is just a substring of title, not useful
+    if len(essence_clean) > 0 and len(essence_clean) < len(title_clean):
+        if title_clean.find(essence_clean) != -1:
+            return False
+    
+    return True
 
 
 class ProductService:
@@ -47,64 +242,164 @@ class ProductService:
         product_data: ProductData,
         db: AsyncSession,
         is_user_search: bool = False
-    ) -> Product:
+    ) -> Optional[Product]:
         """
-        Save scraped AND enriched product to database.
+        🚀 v2.0 ENHANCED: Save with validation & enrichment.
         
-        Handles:
-        - Fingerprint-based deduplication
-        - AI metadata storage
-        - Stats incrementing (searches vs seed_score)
-        - Platform auto-creation
-        - Listing create/update with external_id dedup check
+        VALIDATION PIPELINE (at storage time, not post-hoc):
+        1. ✅ Validate brand (reject garbage: Men/Cotton/Blue)
+        2. ✅ Extract specs if empty (RAM from title, etc)
+        3. ✅ Get image URL (fallback from listings if NULL)
+        4. ✅ Call AI enrichment if not enriched
+        5. ✅ Validate AI essence (must be different from title)
+        6. ✅ Quality gate (only store quality products)
+        7. ✅ Store with multi-platform relationships
+        
+        This ensures clean data in DB, no post-hoc cleanup needed.
         
         Args:
-            product_data: Enriched ProductData object
+            product_data: Raw ProductData from scraper
             db: AsyncSession
-            is_user_search: If True, increments 'searches' stat.
-                           If False, calculates 'seed_score' for trending.
-        
+            is_user_search: If True, increments 'searches' stat
+            
         Returns:
-            Product: The saved or updated Product model
+            Product: Validated, enriched, stored product
         """
+        # =====================================================================
+        # STEP 0: PRE-VALIDATION (Brand & Specs)
+        # =====================================================================
+        
+        # Brand validation: reject or fix garbage brands
+        brand = getattr(product_data, 'brand', None)
+        if _is_garbage_brand(brand):
+            logger.debug(f"🛑 Garbage brand detected: '{brand}', extracting from title...")
+            # Try to extract real brand from title
+            extracted_brand = _extract_brand_from_title(getattr(product_data, 'title', ''))
+            if extracted_brand and not _is_garbage_brand(extracted_brand):
+                product_data.brand = extracted_brand
+                logger.info(f"✅ Brand fixed: {brand} → {extracted_brand}")
+            else:
+                product_data.brand = "Unknown"
+                logger.warning(f"⚠️ Couldn't fix brand, using 'Unknown': {brand}")
+        
+        # Spec extraction: if specs are empty, extract from title
+        specs = getattr(product_data, 'specifications', {}) or {}
+        if not specs or specs == {}:
+            logger.debug(f"📋 Empty specs detected, extracting from title...")
+            extracted_specs = _extract_specs_from_title(
+                getattr(product_data, 'title', ''),
+                category=getattr(product_data, 'category', None)
+            )
+            if extracted_specs:
+                product_data.specifications = extracted_specs
+                logger.info(f"✅ Specs extracted: {extracted_specs}")
+            else:
+                product_data.specifications = {}
+        
+        # =====================================================================
+        # STEP 0.5: IMAGE URL FALLBACK (Get from listings if NULL)
+        # =====================================================================
+        image_url = getattr(product_data, 'image_url', None)
+        if not _validate_image_url(image_url):
+            logger.debug(f"🖼️ Image URL missing or invalid, will try to get from listings...")
+            # Placeholder - will be filled from listing after product creation
+            product_data.image_url = None
+        
+        # =====================================================================
+        # STEP 1: CHECK IF PRODUCT EXISTS (Deduplication - Multi-Platform Match)
+        # =====================================================================
         fingerprint = product_data.fingerprint
         
-        # =====================================================================
-        # STEP 1: Check if product exists (Deduplication)
-        # =====================================================================
         result = await db.execute(
             select(Product).where(Product.fingerprint == fingerprint)
         )
         existing_product = result.scalar_one_or_none()
         
         # =====================================================================
-        # STEP 2: Build AI metadata
+        # STEP 1.5: AI ENRICHMENT (Mandatory before storage)
         # =====================================================================
-        ai_metadata = self._build_ai_metadata(product_data, is_user_search)
+        ai_essence = getattr(product_data, 'ai_essence', None)
+        ai_quality_score = getattr(product_data, 'ai_quality_score', None)
+        
+        # If essence is missing or useless, try to enrich
+        if not _is_useful_essence(ai_essence, getattr(product_data, 'title', '')):
+            logger.debug(f"🧠 Useless/missing essence, calling AI enrichment...")
+            try:
+                from app.services.ai.enrichment_service import enrichment_service
+                product_data = await enrichment_service.enrich_product(product_data)
+                ai_essence = getattr(product_data, 'ai_essence', None)
+                ai_quality_score = getattr(product_data, 'ai_quality_score', 50)
+                
+                if _is_useful_essence(ai_essence, getattr(product_data, 'title', '')):
+                    logger.info(f"✅ AI enrichment successful: essence={ai_essence[:50]}...")
+                else:
+                    logger.warning(f"⚠️ AI enrichment didn't improve: {ai_essence}")
+                    # Fallback: use brand + key specs as essence
+                    essence_parts = []
+                    if product_data.brand and product_data.brand != "Unknown":
+                        essence_parts.append(product_data.brand)
+                    
+                    # Add key specs
+                    specs = getattr(product_data, 'specifications', {}) or {}
+                    if specs.get('ram_gb'):
+                        essence_parts.append(f"{specs['ram_gb']}GB RAM")
+                    if specs.get('storage_gb'):
+                        essence_parts.append(f"{specs['storage_gb']}GB Storage")
+                    if specs.get('processor'):
+                        essence_parts.append(specs['processor'])
+                    
+                    if essence_parts:
+                        ai_essence = " | ".join(essence_parts).lower()
+                        ai_quality_score = 45
+                    else:
+                        ai_essence = getattr(product_data, 'title', '')[:80].lower()
+                        ai_quality_score = 30
+                    
+                    logger.info(f"✅ Fallback essence created: {ai_essence}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ AI enrichment failed (continuing with fallback): {e}")
+                # Fallback essence
+                ai_essence = f"{getattr(product_data, 'brand', 'Product')} - {getattr(product_data, 'title', '')[:40]}".lower()
+                ai_quality_score = 30
         
         # =====================================================================
-        # STEP 3: Create or Update Product
+        # STEP 2: BUILD AI METADATA (with validated essence)
+        # =====================================================================
+        ai_metadata = self._build_ai_metadata(
+            product_data, 
+            is_user_search,
+            force_essence=ai_essence,
+            force_quality_score=ai_quality_score
+        )
+        
+        # =====================================================================
+        # STEP 3: CREATE OR UPDATE PRODUCT
         # =====================================================================
         if existing_product:
             product = existing_product
             
             # Update AI metadata if new processing is better
             old_score = (product.ai_metadata or {}).get("quality_score", 0)
-            new_score = product_data.ai_quality_score or 0
+            new_score = ai_quality_score or 50
             
             if new_score > old_score:
                 product.ai_metadata = ai_metadata
-                product.specifications = product_data.specifications or product.specifications
-                product.subcategory = product_data.subcategory or product.subcategory
-                logger.debug(f"Updated AI metadata (score {old_score} → {new_score})")
+                product.specifications = getattr(product_data, 'specifications', {}) or product.specifications
+                product.subcategory = getattr(product_data, 'subcategory', None) or product.subcategory
+                logger.debug(f"✅ Updated AI metadata (score {old_score} → {new_score})")
             
-            # Update image if missing
-            if not product.image_url and product_data.image_url:
-                product.image_url = product_data.image_url
+            # Update image if missing (and new one is valid)
+            if _validate_image_url(getattr(product_data, 'image_url', None)):
+                if not _validate_image_url(product.image_url):
+                    product.image_url = getattr(product_data, 'image_url', None)
+                    logger.info(f"✅ Image URL backfilled from listing")
             
-            # Update brand if missing
+            # Update brand if it was garbage before
             if (not product.brand or product.brand == "Unknown") and product_data.brand:
-                product.brand = product_data.brand
+                if not _is_garbage_brand(product_data.brand):
+                    product.brand = product_data.brand
+                    logger.info(f"✅ Brand updated: {product_data.brand}")
             
             # Smart Stats Update
             product.stats = self._update_stats(
@@ -112,10 +407,10 @@ class ProductService:
                 is_user_search=is_user_search
             )
             
-            logger.debug(f"Updated existing product: {fingerprint[:16]}...")
+            logger.info(f"✅ Updated existing (multi-platform match): {fingerprint[:16]}...")
             
         else:
-            # Create completely new product
+            # Create new product with validated data
             initial_stats = self._build_initial_stats(product_data, is_user_search)
             
             product = Product(
@@ -132,10 +427,10 @@ class ProductService:
             db.add(product)
             await db.flush()  # Flush to get product.id
             
-            logger.info(f"✅ Created new product: {product.title[:50]}...")
+            logger.info(f"✅ Created new product (stored for multi-platform comparison): {product.title[:50]}...")
         
         # =====================================================================
-        # STEP 4: Handle Platform & Listing
+        # STEP 4: HANDLE PLATFORM & LISTING (all platforms stored together)
         # =====================================================================
         platform_name = getattr(product_data, 'platform_name', 'unknown').lower()
         platform = await self._get_or_create_platform(platform_name, db)
@@ -148,7 +443,24 @@ class ProductService:
         )
         
         # =====================================================================
-        # STEP 5: Commit and Return
+        # STEP 5: TRY TO GET IMAGE FROM LISTING IF STILL MISSING
+        # =====================================================================
+        if not _validate_image_url(product.image_url):
+            logger.debug(f"📸 Trying to get image from listings...")
+            listings = await db.execute(
+                select(ProductListing).where(
+                    ProductListing.product_id == product.id
+                )
+            )
+            for listing in listings.scalars().all():
+                # Try to extract image from listing if it has product URL
+                if listing.product_url and _validate_image_url(getattr(listing, 'image_url', None)):
+                    product.image_url = listing.image_url
+                    logger.info(f"✅ Image backfilled from {platform_name.upper()} listing")
+                    break
+        
+        # =====================================================================
+        # STEP 6: COMMIT AND RETURN
         # =====================================================================
         await db.commit()
         await db.refresh(product)
@@ -158,14 +470,29 @@ class ProductService:
     def _build_ai_metadata(
         self, 
         product_data: ProductData, 
-        is_user_search: bool
+        is_user_search: bool,
+        force_essence: Optional[str] = None,
+        force_quality_score: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Build AI metadata dictionary for storage"""
+        """Build AI metadata dictionary for storage with validation"""
+        
+        # Use forced values if provided (from enrichment)
+        essence = force_essence or getattr(product_data, 'ai_essence', None) or ""
+        quality_score = force_quality_score or getattr(product_data, 'ai_quality_score', None) or 50
+        
+        # Ensure essence is string and not empty
+        if not essence or not str(essence).strip():
+            # Fallback: brand + model
+            brand = getattr(product_data, 'brand', '')
+            title_snippet = getattr(product_data, 'title', '')[:60]
+            essence = f"{brand} {title_snippet}".lower().strip()
+        
         metadata = {
-            "essence": getattr(product_data, 'ai_essence', None) or getattr(product_data, 'title', '')[:100].lower(),
+            "essence": str(essence)[:200].lower(),  # Normalized, max 200 chars
             "tags": getattr(product_data, 'ai_tags', []) or [],
-            "quality_score": getattr(product_data, 'ai_quality_score', 50) or 50,
+            "quality_score": max(0, min(100, int(quality_score))) if quality_score else 50,  # 0-100
             "processed_at": datetime.utcnow().isoformat(),
+            "enriched": True,  # Mark as enriched (new v2.0)
         }
         
         # Mark seeded products

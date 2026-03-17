@@ -179,7 +179,7 @@ class PriceHistory(Base):
     product_listing_id = Column(UUID(as_uuid=True), ForeignKey("product_listings.id"), nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
     in_stock = Column(Boolean, default=True, nullable=False)
-    recorded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    recorded_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     
     # Relationship
     listing = relationship("ProductListing", back_populates="price_history")

@@ -126,8 +126,8 @@ class ProductCategory(str, Enum):
     def get_platforms_for_category(cls, category: "ProductCategory") -> List[str]:
         """Get relevant platforms for a category"""
         platform_map = {
-            cls.ELECTRONICS: ["amazon", "flipkart", "croma", "reliancedigital"],
-            cls.FASHION: ["myntra", "ajio", "amazon", "flipkart", "meesho"],
+            cls.ELECTRONICS: ["amazon", "flipkart", "croma"],
+            cls.FASHION: ["myntra", "amazon", "flipkart", "meesho"],
             cls.BEAUTY: ["nykaa", "myntra", "amazon", "flipkart"],
             cls.HOME: ["amazon", "flipkart", "meesho"],
             cls.GROCERY: ["amazon", "flipkart"],

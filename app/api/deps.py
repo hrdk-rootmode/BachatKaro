@@ -20,11 +20,10 @@ from app.schemas import UserPlan
 from app.schemas import UserSignupRequest
 import redis.asyncio as redis
 from redis.asyncio import Redis
+from app.core.security import initialize_firebase
 
-
-# Initialize Firebase Admin SDK
-if not firebase_admin._apps:
-    firebase_admin.initialize_app()
+# Initialize Firebase Admin SDK with proper credentials
+initialize_firebase()
 
 
 # Security scheme
@@ -45,24 +44,32 @@ async def verify_firebase_token(
     Raises:
         HTTPException: If token is invalid or expired
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     try:
         token = credentials.credentials
+        logger.info(f"Verifying Firebase token: {token[:20]}...")
         decoded_token = firebase_auth.verify_id_token(token)
+        logger.info(f"✅ Token verified for user: {decoded_token.get('email')}")
         return decoded_token
-    except firebase_auth.InvalidIdTokenError:
+    except firebase_auth.InvalidIdTokenError as e:
+        logger.error(f"❌ Invalid Firebase token: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token"
+            detail=f"Invalid authentication token: {str(e)}"
         )
-    except firebase_auth.ExpiredIdTokenError:
+    except firebase_auth.ExpiredIdTokenError as e:
+        logger.error(f"❌ Expired Firebase token: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired"
         )
     except Exception as e:
+        logger.error(f"❌ Firebase token verification failed: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Authentication failed: {str(e)}"
+            detail=f"Authentication failed: {type(e).__name__}: {str(e)}"
         )
 
 
@@ -89,39 +96,53 @@ async def get_current_user(
     Raises:
         HTTPException: If user blocked or creation fails
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     firebase_uid = token_data.get("uid")
+    email = token_data.get("email")
+    
+    logger.info(f"🔍 get_current_user called for: {email} (uid: {firebase_uid})")
     
     # Import user service for auto-creation
     from app.services.user import user_service
     
     # Query user from database
-    user = await user_service.get_by_firebase_uid(db, firebase_uid)
+    try:
+        user = await user_service.get_by_firebase_uid(db, firebase_uid)
+        logger.info(f"  Database lookup: {'Found' if user else 'Not found'}")
+    except Exception as e:
+        logger.error(f"  ❌ Database lookup error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
     
     # Auto-create user if enabled and doesn't exist
     if not user:
+        logger.info(f"  User not found, attempting auto-creation...")
         try:
             user = await User.create_from_firebase_token(db, token_data)
             if user:
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.info(
-                    f"✅ Auto-created user on first login: {user.email} "
-                    f"(Firebase UID: {firebase_uid})"
+                    f"  ✅ Auto-created user: {user.email} (ID: {user.id})"
                 )
+            else:
+                logger.warning(f"  ⚠️ Auto-creation returned None (disabled?)")
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(f"Auto-creation failed for {firebase_uid}: {str(e)}")
+            logger.error(f"  ❌ Auto-creation failed: {type(e).__name__}: {str(e)}", exc_info=True)
             # Fall through to original error
             pass
     
     if not user:
+        logger.error(f"  ❌ User not found and auto-creation failed")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found. Please complete signup first or enable auto-creation."
         )
     
     if user.is_blocked:
+        logger.warning(f"  ❌ User account is blocked: {user.block_reason}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account has been blocked. Contact support."
@@ -129,12 +150,19 @@ async def get_current_user(
     
     # Track IP address
     client_ip = request.client.host
-    await _track_user_ip(user, client_ip, db, redis_client)
+    try:
+        await _track_user_ip(user, client_ip, db, redis_client)
+    except Exception as e:
+        logger.warning(f"  ⚠️ IP tracking failed: {str(e)}")
     
     # Update last active timestamp
-    user.last_active = datetime.utcnow()
-    await db.commit()
+    try:
+        user.last_active = datetime.utcnow()
+        await db.commit()
+    except Exception as e:
+        logger.error(f"  ❌ Failed to update last_active: {str(e)}", exc_info=True)
     
+    logger.info(f"  ✅ Returning user: {user.email} (ID: {user.id})")
     return user
 
 
