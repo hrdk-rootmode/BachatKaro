@@ -29,7 +29,7 @@ Meesho (Akamai Bypass Check):
 
 
 
-curl -X POST "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyA5W3SYb_Hd5Hn6minwEXe5b35rJVmwLOU" \
+curl -X POST "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=YOUR_GEMINI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "email": "patelhardik1262001@gmail.com",
