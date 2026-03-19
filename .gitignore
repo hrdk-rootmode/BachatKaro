@@ -10,3 +10,5 @@ firebase-adminsdk.json
 debug_output/
 results/
 *.md
+
+test_search_*.py

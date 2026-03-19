@@ -61,13 +61,34 @@ class Platform(Base):
 class Product(Base):
     """
     Master product catalog with deduplication
-    Fingerprint ensures same product from multiple platforms = 1 entry
+    Enhanced fingerprinting system:
+    - fingerprint: Primary fingerprint (variant-level)
+    - variant_fingerprint: Explicit variant fingerprint (iPhone 15 Pro 256GB)
+    - base_fingerprint: Series-level fingerprint (iPhone 15)
+    - Ensures same product from multiple platforms are linked
     """
     __tablename__ = "products"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    fingerprint = Column(String(64), unique=True, nullable=False, index=True)
+    # PHASE 1 FIX: Remove unique constraint - variant_fingerprint is the new unique identifier
+    # Multiple products can now have same fingerprint (cross-platform variants)
+    fingerprint = Column(String(64), nullable=False, index=True)
     
+    # =========================================================================
+    # PHASE 2: Enhanced Fingerprinting Columns
+    # =========================================================================
+    variant_fingerprint = Column(String(64), nullable=True, index=True)  # iPhone 15 Pro 256GB Blue
+    base_fingerprint = Column(String(64), nullable=True, index=True)     # iPhone 15 series
+    
+    # Variant detection metadata
+    variant_type = Column(String(100), nullable=True)   # "pro", "plus", "max", "ultra"
+    storage_gb = Column(Integer, nullable=True)         # 256, 512, 1024
+    color = Column(String(50), nullable=True)           # "blue", "black", "pink"
+    condition = Column(String(50), nullable=True, default="new")  # "new", "refurbished"
+    
+    # =========================================================================
+    # Original Product Fields
+    # =========================================================================
     title = Column(String(500), nullable=False)
     brand = Column(String(100), index=True)
     category = Column(String(100), index=True)
@@ -102,6 +123,9 @@ class Product(Base):
     
     __table_args__ = (
         Index('idx_products_fingerprint', 'fingerprint'),
+        Index('idx_products_variant_fingerprint', 'variant_fingerprint'),
+        Index('idx_products_base_fingerprint', 'base_fingerprint'),
+        Index('idx_products_storage_color', 'storage_gb', 'color'),
         Index('idx_products_category', 'category'),
         Index('idx_products_brand', 'brand'),
         # Full-text search on title
@@ -129,6 +153,12 @@ class ProductListing(Base):
     platform_id = Column(Integer, ForeignKey("platforms.id", ondelete="CASCADE"), nullable=False, index=True)
     
     external_id = Column(String(100))  # Platform's product ID
+    
+    # =========================================================================
+    # PHASE 2: Variant Fingerprint for Cross-Platform Matching
+    # =========================================================================
+    variant_fingerprint = Column(String(64), nullable=True, index=True)  # For exact variant matching
+    
     product_url = Column(Text, nullable=False)
     affiliate_url = Column(Text)
     
@@ -164,8 +194,10 @@ class ProductListing(Base):
     price_history = relationship("PriceHistory", back_populates="listing", cascade="all, delete-orphan")
     __table_args__ = (
         UniqueConstraint('platform_id', 'external_id', name='uq_platform_external'),
+        UniqueConstraint('variant_fingerprint', 'platform_id', 'external_id', name='uq_variant_per_platform'),
         Index('idx_listings_product', 'product_id'),
         Index('idx_listings_platform', 'platform_id'),
+        Index('idx_listings_variant_fp', 'variant_fingerprint'),
         Index('idx_listings_price', 'current_price'),
         Index('idx_listings_scraped', 'last_scraped'),
         Index('idx_listings_stock', 'in_stock', postgresql_where=Column('in_stock') == True),

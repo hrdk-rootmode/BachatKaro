@@ -78,10 +78,19 @@ async def get_product(
     response = ProductResponse(
         id=product.id,
         fingerprint=product.fingerprint,
+        # ✅ NEW: Variant fingerprinting fields
+        variant_fingerprint=product.variant_fingerprint,
+        base_fingerprint=product.base_fingerprint,
+        variant_type=product.variant_type,
+        storage_gb=product.storage_gb,
+        color=product.color,
+        condition=product.condition,
+        # Pricing
         best_price=best_price,
         best_platform=best_platform,
         avg_price=avg_price,
         price_trend=price_trend,
+        # AI metadata
         ai_generated_essence=ai_metadata.get("essence", product.title),
         ai_extracted_specs=product.specifications or {},
         ai_tags=ai_metadata.get("tags", []),

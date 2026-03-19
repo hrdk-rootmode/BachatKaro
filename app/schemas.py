@@ -183,7 +183,8 @@ class SearchByURLRequest(BaseModel):
 
 
 class ProductListingResponse(BaseModel):
-    """✅ FIXED: Changed id to str, standardized field names"""
+    """✅ FIXED: Changed id to str, standardized field names
+    ✅ NEW: Added variant_fingerprint for cross-platform matching"""
     model_config = ConfigDict(from_attributes=True)
     
     id: str  # ✅ UUID as string
@@ -199,18 +200,31 @@ class ProductListingResponse(BaseModel):
     image_url: Optional[str]
     in_stock: bool
     last_scraped_at: datetime
+    # ✅ NEW: Variant fingerprinting for cross-platform linking
+    variant_fingerprint: Optional[str] = Field(None, description="Exact variant fingerprint for cross-platform matching")
 
 
 class ProductResponse(BaseModel):
-    """✅ FIXED: Changed id to str"""
+    """✅ FIXED: Changed id to str
+    ✅ NEW: Added variant fingerprinting fields"""
     model_config = ConfigDict(from_attributes=True)
     
     id: str  # ✅ UUID as string
     fingerprint: str
+    # ✅ NEW: Enhanced variant fingerprinting
+    variant_fingerprint: Optional[str] = Field(None, description="Exact variant fingerprint (e.g., iPhone 15 Pro 256GB)")
+    base_fingerprint: Optional[str] = Field(None, description="Base product fingerprint (e.g., iPhone 15 series)")
+    # Variant metadata
+    variant_type: Optional[str] = Field(None, description="Variant type (pro, plus, max, ultra, lite, etc)")
+    storage_gb: Optional[int] = Field(None, description="Storage capacity in GB")
+    color: Optional[str] = Field(None, description="Product color")
+    condition: Optional[str] = Field(None, description="Product condition (new, refurbished, used)")
+    # Price and trending
     best_price: Decimal
     best_platform: Platform
     avg_price: Optional[Decimal]
     price_trend: Optional[str]  # "up", "down", "stable"
+    # AI metadata
     ai_generated_essence: str
     ai_extracted_specs: Dict[str, Any]
     ai_tags: List[str]
@@ -229,11 +243,17 @@ class SearchResponse(BaseModel):
 
 
 class TrendingProductResponse(BaseModel):
-    """Trending product summary"""
+    """Trending product summary
+    ✅ NEW: Added variant fingerprinting for cross-platform deduplication"""
     model_config = ConfigDict(from_attributes=True)
     
     product_id: str  # ✅ UUID as string
     title: str
+    # ✅ NEW: Variant fingerprinting
+    variant_fingerprint: Optional[str] = Field(None, description="Exact variant fingerprint")
+    base_fingerprint: Optional[str] = Field(None, description="Base product fingerprint")
+    variant_type: Optional[str] = Field(None, description="Variant type (pro, plus, max, etc)")
+    # Pricing
     best_price: Decimal
     best_platform: Platform
     discount_percentage: Optional[int]

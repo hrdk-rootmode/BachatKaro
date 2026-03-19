@@ -246,8 +246,8 @@ async def check_rate_limit(
     Check rate limits based on user plan
     
     Limits:
-    - Free: 10 searches/day
-    - Basic: 50 searches/day
+    - Free: 500 searches/day (✅ DEVELOPMENT: Increased from 10)
+    - Basic: 500 searches/day (✅ DEVELOPMENT: Increased from 50)
     - Premium: Unlimited
     
     Uses Redis counters with daily expiry
@@ -259,12 +259,12 @@ async def check_rate_limit(
     if user.plan == UserPlan.PREMIUM:
         return
     
-    # Determine rate limit based on plan
+    # Determine rate limit based on plan (✅ DEVELOPMENT: Increased limits)
     limits = {
-        UserPlan.FREE: 10,
-        UserPlan.BASIC: 50
+        UserPlan.FREE: 500,
+        UserPlan.BASIC: 500
     }
-    daily_limit = limits.get(user.plan, 10)
+    daily_limit = limits.get(user.plan, 500)
     
     # Check current usage
     cache_key = f"rate_limit:search:{user.id}:{datetime.utcnow().date()}"

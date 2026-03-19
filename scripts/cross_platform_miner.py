@@ -51,14 +51,26 @@ from enum import Enum
 from difflib import SequenceMatcher
 from pathlib import Path
 
-# Windows async fix
+# ============================================================================
+# WINDOWS ASYNC FIX - Handle subprocess creation limitations
+# ============================================================================
 if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Use ProactorEventLoop which has better Windows subprocess support
+    # But we must silence the deprecation and handle the subprocess issue
+    try:
+        # Python 3.10+ on Windows: switch to ProactorEventLoop for subprocess support
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        # Fallback to SelectorEventLoop
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    # Suppress the DeletePending file descriptor warning
     try:
         from asyncio.proactor_events import _ProactorBasePipeTransport
-        def silence_proactor_del(self): pass
+        def silence_proactor_del(self):
+            pass
         _ProactorBasePipeTransport.__del__ = silence_proactor_del
-    except ImportError:
+    except (ImportError, AttributeError):
         pass
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -66,13 +78,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.core.database import async_session_maker
-from app.models import Product, ProductListing
+from app.models import Product, ProductListing, Platform as PlatformModel
 from app.services.scraper.base import ProductData, ProductCategory
 from app.services.scraper.factory import get_platform_handler
 from app.services.ai.enrichment_service import enrichment_service
-from app.services.product_service import product_service
+from app.services.product_service import product_service, _validate_image_url, _is_useful_essence
 from app.schemas import Platform
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -109,11 +124,12 @@ class MinerConfig:
     MIN_AI_CONFIDENCE_SCORE = 0.90
     
     # Scraping Settings
-    SCRAPE_TIMEOUT = 45
+    SCRAPE_TIMEOUT = max(10, int(settings.SCRAPER_TIMEOUT / 1000))
     MAX_CANDIDATES_PER_PLATFORM = 12
+    MAX_RETRIES = max(1, settings.SCRAPER_MAX_RETRIES)
     
     # Parallel Scraping
-    MAX_CONCURRENT_PLATFORMS = 3
+    MAX_CONCURRENT_PLATFORMS = max(1, min(6, settings.SCRAPER_CONCURRENT_LIMIT))
     
     # Supported Platforms
     SUPPORTED_PLATFORMS = {'amazon', 'flipkart', 'meesho', 'myntra', 'croma', 'nykaa'}
@@ -275,6 +291,9 @@ class MiningStats:
     ai_verified: int = 0
     ai_rejected: int = 0
     ai_contradictions: int = 0
+    retries: int = 0
+    image_validation_fixed: int = 0
+    essence_validation_fixed: int = 0
     stored: int = 0
     errors: int = 0
     api_calls_saved: int = 0
@@ -296,6 +315,9 @@ class MiningStats:
         print(f"  AI Verified Matches:   {self.ai_verified} ✅")
         print(f"  AI Rejections:         {self.ai_rejected}")
         print(f"  AI Contradictions:     {self.ai_contradictions} 🔍")
+        print(f"  Retry Attempts:        {self.retries}")
+        print(f"  Image Fixups Applied:  {self.image_validation_fixed}")
+        print(f"  Essence Fixups Applied:{self.essence_validation_fixed}")
         print(f"  Successfully Stored:   {self.stored} 💾")
         print(f"  Errors:                {self.errors}")
         print(f"  API Calls Saved:       {self.api_calls_saved} 💰")
@@ -332,6 +354,9 @@ class MiningStats:
                 "ai_verified": self.ai_verified,
                 "ai_rejected": self.ai_rejected,
                 "ai_contradictions": self.ai_contradictions,
+                "retries": self.retries,
+                "image_validation_fixed": self.image_validation_fixed,
+                "essence_validation_fixed": self.essence_validation_fixed,
             },
             "skipped_products": self.skipped_products,
             "matches": self.audit_log,
@@ -1948,6 +1973,7 @@ async def save_matched_product(
     scraped_product: ProductData,
     db_product: Product,
     db,
+    stats: Optional[MiningStats] = None,
 ) -> bool:
     """
     Save a matched product with the CORRECT fingerprint.
@@ -1955,6 +1981,35 @@ async def save_matched_product(
     try:
         # Step 1: Enrich with AI
         enriched = await enrichment_service.enrich_product(scraped_product)
+
+        # Step 1.5: Image validation and fallback alignment with product_service.
+        image_candidates = [
+            getattr(enriched, "image_url", None),
+            getattr(scraped_product, "image_url", None),
+            (scraped_product.raw_data or {}).get("image_url") if getattr(scraped_product, "raw_data", None) else None,
+            (scraped_product.raw_data or {}).get("image") if getattr(scraped_product, "raw_data", None) else None,
+            getattr(db_product, "image_url", None),
+        ]
+        valid_image = next((u for u in image_candidates if _validate_image_url(u)), None)
+        if valid_image and enriched.image_url != valid_image:
+            enriched.image_url = valid_image
+            if stats:
+                stats.image_validation_fixed += 1
+
+        # Step 1.6: Ensure enriched essence is useful; otherwise fallback to source essence.
+        source_essence = ""
+        if db_product.ai_metadata and db_product.ai_metadata.get("essence"):
+            source_essence = str(db_product.ai_metadata.get("essence") or "").strip()
+
+        if not _is_useful_essence(getattr(enriched, "ai_essence", None), enriched.title):
+            fallback_essence = source_essence or " ".join((enriched.title or "").split()[:8]).strip()
+            enriched.ai_essence = fallback_essence
+            if stats:
+                stats.essence_validation_fixed += 1
+
+        if not _is_useful_essence(getattr(enriched, "ai_essence", None), enriched.title):
+            logger.warning("Skipping save: unusable essence after fallback for '%s'", (enriched.title or "")[:80])
+            return False
         
         # Step 2: FORCE fingerprint to match DB product
         existing_fp = db_product.fingerprint
@@ -2007,14 +2062,33 @@ async def scrape_platform(
         if not handler:
             result.error = "No handler"
             return result
-        
-        search_result = await asyncio.wait_for(
-            handler.search(query=query, page=1),
-            timeout=MinerConfig.SCRAPE_TIMEOUT
-        )
+
+        search_result = None
+        last_error = None
+        for attempt in range(1, MinerConfig.MAX_RETRIES + 1):
+            try:
+                search_result = await asyncio.wait_for(
+                    handler.search(query=query, page=1),
+                    timeout=MinerConfig.SCRAPE_TIMEOUT
+                )
+                break
+            except asyncio.TimeoutError:
+                last_error = f"Timeout (attempt {attempt}/{MinerConfig.MAX_RETRIES})"
+                if attempt < MinerConfig.MAX_RETRIES:
+                    stats.retries += 1
+                    await asyncio.sleep(min(2 * attempt, 5))
+                    continue
+                raise
+            except Exception as e:
+                last_error = str(e)[:80]
+                if attempt < MinerConfig.MAX_RETRIES:
+                    stats.retries += 1
+                    await asyncio.sleep(min(2 * attempt, 5))
+                    continue
+                raise
         
         if not search_result or not search_result.products:
-            result.error = "No results"
+            result.error = f"No results" + (f" ({last_error})" if last_error else "")
             return result
         
         result.success = True
@@ -2115,7 +2189,7 @@ async def scrape_platform(
                 if verbose:
                     print(f"\n    ✅ {'AI ' if ai_verified else ''}MATCH! Score={final_score:.0%}")
                 
-                ok = await save_matched_product(scraped, db_product, db)
+                ok = await save_matched_product(scraped, db_product, db, stats)
                 
                 if ok:
                     stats.stored += 1
@@ -2150,10 +2224,23 @@ async def scrape_platform(
     except asyncio.TimeoutError:
         result.error = "Timeout"
         stats.errors += 1
+        logger.warning(f"[{platform_name}] Search timeout: {query}")
+        return result
+    except NotImplementedError as e:
+        # Windows Playwright subprocess issue
+        result.error = "Browser init failed (Windows)"
+        stats.errors += 1
+        if sys.platform == 'win32':
+            logger.error(
+                f"[{platform_name}] Playwright browser failed on Windows. "
+                f"Solutions: Use WSL2, Docker, or Linux machine. "
+                f"On Windows, Playwright subprocess creation is limited."
+            )
         return result
     except Exception as e:
         result.error = str(e)[:60]
         stats.errors += 1
+        logger.exception(f"[{platform_name}] Search error: {query}")
         return result
 
 
@@ -2200,7 +2287,7 @@ async def process_orphan_products(
         
         stmt = (
             select(Product)
-            .options(selectinload(Product.listings))
+            .options(selectinload(Product.listings).selectinload(ProductListing.platform))
             .join(ProductListing)
             .group_by(Product.id)
             .having(func.count(ProductListing.id) == 1)
@@ -2225,19 +2312,18 @@ async def process_orphan_products(
             stats.processed += 1
             listing = db_product.listings[0]
             existing_platform = None
-            
-            # Get existing platform name to exclude
-            try:
-                platform_result = await db.execute(
-                    select(Product).where(Product.id == db_product.id)
-                )
-                # Get platform name from listing
-                for p in Platform:
-                    if listing.platform_id == getattr(Platform, p.name.upper(), None):
-                        existing_platform = p.value
-                        break
-            except:
-                pass
+
+            # Get existing platform name to exclude.
+            if getattr(listing, "platform", None) and getattr(listing.platform, "name", None):
+                existing_platform = listing.platform.name.lower().strip()
+            else:
+                try:
+                    platform_row = await db.execute(
+                        select(PlatformModel.name).where(PlatformModel.id == listing.platform_id)
+                    )
+                    existing_platform = (platform_row.scalar() or "").lower().strip() or None
+                except Exception:
+                    existing_platform = None
             
             # Determine category type
             category_type = determine_category_type(db_product.category, db_product.title)
@@ -2375,6 +2461,11 @@ def parse_platforms(s: str) -> Optional[List[str]]:
 
 def setup_logging(debug: bool = False):
     """Setup logging configuration."""
+    log_level = logging.DEBUG if debug else getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
     if not debug:
         # Suppress SQLAlchemy logs
         logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)

@@ -306,14 +306,122 @@ class ProductService:
             product_data.image_url = None
         
         # =====================================================================
-        # STEP 1: CHECK IF PRODUCT EXISTS (Deduplication - Multi-Platform Match)
+        # STEP 1: AUTO-DETECT VARIANTS (Phase 1 Enhancement)
         # =====================================================================
-        fingerprint = product_data.fingerprint
+        product_data.detect_all_variants()
+        logger.info(f"✅ Variants detected: type={product_data.variant_type}, storage={product_data.storage_gb}GB, color={product_data.color}")
         
+        # =====================================================================
+        # STEP 1.5: ENHANCED DEDUPLICATION (Phase 1: Cross-Platform Logic)
+        # =====================================================================
+        """
+        Three-level deduplication strategy:
+        1. EXACT DUPLICATE CHECK: Same variant on same platform → SKIP
+        2. CROSS-PLATFORM CHECK: Same variant on different platform → LINK existing product
+        3. VARIANT CHECK: Different variant of same base product → CREATE new variant
+        """
+        
+        variant_fingerprint = product_data.get_variant_fingerprint()
+        base_fingerprint = product_data.get_base_fingerprint()
+        platform_id = await self._get_or_create_platform(product_data.platform_name, db)
+        platform_id = platform_id.id
+        external_id = getattr(product_data, 'external_id', None)
+        
+        logger.debug(f"🔍 Deduplication check:")
+        logger.debug(f"   - Variant FP: {variant_fingerprint[:16]}...")
+        logger.debug(f"   - Base FP: {base_fingerprint[:16]}...")
+        logger.debug(f"   - Platform: {product_data.platform_name} ({platform_id})")
+        logger.debug(f"   - External ID: {external_id}")
+        
+        # =====================================================================
+        # CHECK 1: Exact duplicate on SAME platform (by external_id)
+        # =====================================================================
+        if external_id:
+            result = await db.execute(
+                select(ProductListing).where(
+                    ProductListing.platform_id == platform_id,
+                    ProductListing.external_id == external_id
+                )
+            )
+            exact_duplicate = result.scalar_one_or_none()
+            
+            if exact_duplicate:
+                logger.warning(f"⏭️  SKIP: Exact duplicate detected (same variant, same platform, same external_id)")
+                return None
+        
+        # =====================================================================
+        # CHECK 2: Same variant on DIFFERENT platform (link existing product)
+        # =====================================================================
         result = await db.execute(
-            select(Product).where(Product.fingerprint == fingerprint)
+            select(Product).where(Product.variant_fingerprint == variant_fingerprint)
         )
-        existing_product = result.scalar_one_or_none()
+        existing_product_by_variant = result.scalar_one_or_none()
+        
+        if existing_product_by_variant:
+            # Same variant exists (e.g., iPhone 15 Pro 256GB Blue from Amazon exists)
+            # Check if this variant already has listing on this platform
+            result = await db.execute(
+                select(ProductListing).where(
+                    ProductListing.product_id == existing_product_by_variant.id,
+                    ProductListing.platform_id == platform_id
+                )
+            )
+            existing_listing_on_platform = result.scalar_one_or_none()
+            
+            if existing_listing_on_platform:
+                logger.warning(f"⏭️  SKIP: Same variant already listed on this platform")
+                return None
+            
+            logger.info(f"✅ CROSS-PLATFORM MATCH: Reusing product {existing_product_by_variant.id}")
+            logger.info(f"   Adding listing for platform: {product_data.platform_name}")
+            
+            # AI enrichment if needed
+            if not existing_product_by_variant.ai_metadata.get("enriched"):
+                logger.info(f"   Enriching...") 
+                enriched = await enrichment_service.enrich_product(product_data, db)
+                if enriched:
+                    ai_metadata = self._build_ai_metadata(enriched, is_user_search)
+                else:
+                    ai_metadata = existing_product_by_variant.ai_metadata
+            else:
+                ai_metadata = existing_product_by_variant.ai_metadata
+            
+            # Create listing for this platform
+            await self.save_listing(
+                existing_product_by_variant.id,
+                platform_id,
+                product_data,
+                db
+            )
+            
+            await db.commit()
+            await db.refresh(existing_product_by_variant)
+            
+            return existing_product_by_variant
+        
+        # =====================================================================
+        # CHECK 3: Different variant of SAME base product (reuse base, create variant)
+        # =====================================================================
+        result = await db.execute(
+            select(Product).where(
+                and_(
+                    Product.base_fingerprint == base_fingerprint,
+                    Product.base_fingerprint.isnot(None)
+                )
+            )
+        )
+        existing_base_product = result.scalar_one_or_none()
+        
+        if existing_base_product:
+            logger.info(f" VARIANT MATCH: Same base product exists")
+            logger.info(f"   Base: {existing_base_product.title}")
+            logger.info(f"   This variant: {product_data.title}")
+            logger.info(f"   Creating variant relationship...")
+            
+            # Reuse base product record but update variant fields
+            existing_fingerprint = existing_base_product.fingerprint
+        else:
+            existing_fingerprint = None
         
         # =====================================================================
         # STEP 1.5: AI ENRICHMENT (Mandatory before storage)
@@ -407,14 +515,29 @@ class ProductService:
                 is_user_search=is_user_search
             )
             
-            logger.info(f"✅ Updated existing (multi-platform match): {fingerprint[:16]}...")
+            # Update variant fingerprints (Phase 1: Enhanced fingerprinting)
+            if product_data.variant_fingerprint and not product.variant_fingerprint:
+                product.variant_fingerprint = product_data.variant_fingerprint
+                product.base_fingerprint = product_data.base_fingerprint
+                product.variant_type = product_data.variant_type
+                product.storage_gb = product_data.storage_gb
+                product.color = product_data.color
+                logger.info(f"✅ Updated variant fingerprints")
+            
+            logger.info(f"✅ Updated existing (multi-platform match): {variant_fingerprint[:16]}...")
             
         else:
             # Create new product with validated data
             initial_stats = self._build_initial_stats(product_data, is_user_search)
             
             product = Product(
-                fingerprint=fingerprint,
+                fingerprint=variant_fingerprint,
+                variant_fingerprint=variant_fingerprint,  # Phase 1: Enhanced fingerprinting
+                base_fingerprint=base_fingerprint,        # Phase 1: For variant linking
+                variant_type=product_data.variant_type,   # Phase 1: Variant metadata
+                storage_gb=product_data.storage_gb,       # Phase 1: Variant metadata
+                color=product_data.color,                 # Phase 1: Variant metadata
+                condition=product_data.condition.value if product_data.condition else "new",
                 title=getattr(product_data, 'title', 'Unknown'),
                 brand=getattr(product_data, 'brand', None) or "Unknown",
                 category=getattr(product_data, 'category', None) or "General",
@@ -668,8 +791,12 @@ class ProductService:
         raw_discount = getattr(product_data, 'discount_percent', None)
         if isinstance(raw_discount, (int, float)):
             discount = float(raw_discount)
+        
+        # Phase 1: Get variant fingerprint for cross-platform deduplication
+        variant_fingerprint = product_data.get_variant_fingerprint()
             
         listing_data = {
+            "variant_fingerprint": variant_fingerprint,  # Phase 1: Enhanced fingerprint
             "current_price": float(current_price) if current_price else 0.0,
             "original_price": float(original_price) if original_price else None,
             "discount_percent": discount,

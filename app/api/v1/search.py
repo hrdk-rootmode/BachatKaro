@@ -84,6 +84,10 @@ async def search_database(
         for term in search_terms
     ]
     
+    # ✅ FIXED: Handle empty search terms (fallback to empty query)
+    if not title_conditions:
+        title_conditions = [Product.title.ilike(f"%{query.lower()}%")]
+    
     query_stmt = select(Product).where(or_(*title_conditions))
     
     # Pagination
@@ -101,16 +105,47 @@ async def get_product_listings(
     db: AsyncSession,
     platforms: Optional[List[Platform]] = None
 ) -> List[ProductListing]:
-    """Get all listings for a product"""
+    """Get all listings for a product (✅ FIXED: Eager load platform relationship)"""
     query = select(ProductListing).where(
         ProductListing.product_id == product_id,
         ProductListing.in_stock == True
-    )
+    ).options(selectinload(ProductListing.platform))  # ✅ Eager load platform
     
     query = query.order_by(ProductListing.current_price.asc())
     
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+def format_listing_response(listing: ProductListing, product: Product) -> ProductListingResponse:
+    """Format ProductListing for API response (✅ FIXED: Proper field mapping)"""
+    # Get platform name from relationship if loaded
+    platform_name = "amazon"  # Default fallback
+    if hasattr(listing, 'platform') and listing.platform:
+        platform_name = listing.platform.name.lower()
+    
+    # Calculate discount percentage
+    discount_percentage = None
+    if listing.original_price and listing.current_price:
+        discount_percentage = int(
+            ((listing.original_price - listing.current_price) / listing.original_price) * 100
+        )
+    
+    return ProductListingResponse(
+        id=str(listing.id),
+        platform=Platform[platform_name.upper()] if platform_name else Platform.AMAZON,
+        platform_product_id=listing.external_id or str(listing.id),
+        url=listing.affiliate_url or listing.product_url,
+        title=product.title,  # ✅ Title comes from Product, not Listing
+        current_price=Decimal(str(listing.current_price)),
+        original_price=Decimal(str(listing.original_price)) if listing.original_price else None,
+        discount_percentage=discount_percentage,
+        rating=Decimal(str(listing.rating)) if listing.rating else None,
+        review_count=listing.review_count,
+        image_url=product.image_url,  # ✅ Image comes from Product, not Listing
+        in_stock=listing.in_stock,
+        last_scraped_at=listing.last_scraped or datetime.utcnow()
+    )
 
 
 def format_product_response(
@@ -121,39 +156,49 @@ def format_product_response(
     ai_metadata = product.ai_metadata or {}
     
     # Calculate best price from listings
-    best_price = 0
-    best_platform = "amazon"
+    best_price = Decimal('0')
+    best_platform = Platform.AMAZON
     if listings:
         best_listing = min(listings, key=lambda x: x.current_price)
-        best_price = best_listing.current_price
-        best_platform = "amazon"  # Default
+        best_price = Decimal(str(best_listing.current_price))
+        if hasattr(best_listing, 'platform') and best_listing.platform:
+            best_platform = Platform[best_listing.platform.name.upper()]
     
     # Calculate avg price
     avg_price = None
     if listings:
-        avg_price = sum(l.current_price for l in listings) / len(listings)
+        avg_price = Decimal(str(sum(l.current_price for l in listings) / len(listings)))
     
     # Calculate price trend
     price_trend = "stable"
     if avg_price and best_price:
-        if best_price < avg_price * 0.9:
+        if best_price < avg_price * Decimal('0.9'):
             price_trend = "down"
-        elif best_price > avg_price * 1.1:
+        elif best_price > avg_price * Decimal('1.1'):
             price_trend = "up"
     
     return ProductResponse(
-        id=product.id,
+        id=str(product.id),
         fingerprint=product.fingerprint,
+        # ✅ NEW: Variant fingerprinting fields
+        variant_fingerprint=product.variant_fingerprint,
+        base_fingerprint=product.base_fingerprint,
+        variant_type=product.variant_type,
+        storage_gb=product.storage_gb,
+        color=product.color,
+        condition=product.condition,
+        # Pricing
         best_price=best_price,
         best_platform=best_platform,
         avg_price=avg_price,
         price_trend=price_trend,
+        # AI metadata
         ai_generated_essence=ai_metadata.get("essence", product.title),
         ai_extracted_specs=product.specifications or {},
         ai_tags=ai_metadata.get("tags", []),
         created_at=product.created_at,
         listings=[
-            ProductListingResponse.model_validate(listing)
+            format_listing_response(listing, product)
             for listing in listings
         ]
     )
@@ -673,6 +718,8 @@ async def get_trending_products(
     Get trending products sorted by engagement (views + searches)
     
     Sorts by stats['views'] + stats['searches'] + stats['seed_score']
+    
+    ✅ FIXED: Simplified query to avoid SQLAlchemy aggregation hydration issues
     """
     cache_key = "trending:products:top50"
     
@@ -684,67 +731,46 @@ async def get_trending_products(
         return cached
     
     try:
-        # Build optimized query with proper stats sorting
-        result = await db.execute(
-            select(
-                Product,
-                func.min(ProductListing.current_price).label('best_price'),
-                func.max(ProductListing.discount_percent).label('best_discount'),
-                func.count(ProductListing.id).label('listing_count')
-            )
-            .join(ProductListing, Product.id == ProductListing.product_id)
-            .where(ProductListing.in_stock == True)
-            .group_by(Product.id)
-            .order_by(
-                desc(
-                    func.coalesce(
-                        func.cast(Product.stats['views'].astext, Integer), 0
-                    ) +
-                    func.coalesce(
-                        func.cast(Product.stats['searches'].astext, Integer), 0
-                    ) +
-                    func.coalesce(
-                        func.cast(Product.stats['seed_score'].astext, Integer), 0
-                    )
-                )
-            )
-            .limit(limit)
-        )
-        
-        rows = result.all()
-        
-    except Exception as e:
-        # Fallback query if JSONB casting fails
-        logger.warning(f"Optimized trending query failed, using fallback: {e}")
-        
+        # ✅ STEP 1: Get ALL products with at least one in-stock listing
         result = await db.execute(
             select(Product)
-            .join(ProductListing)
-            .group_by(Product.id)
-            .order_by(desc(func.count(ProductListing.id)))
-            .limit(limit)
+            .join(ProductListing, Product.id == ProductListing.product_id)
+            .where(ProductListing.in_stock == True)
+            .distinct(Product.id)  # Avoid duplicates from multiple listings
+            .order_by(Product.id)
         )
         
         products = result.scalars().all()
-        rows = [(p, None, None, 0) for p in products]
+        logger.info(f"Fetched {len(products)} trending products from DB")
+        
+        # ✅ STEP 2: Sort by engagement score in memory
+        def get_engagement_score(product):
+            stats = product.stats or {}
+            return (
+                int(stats.get("views", 0)) +
+                int(stats.get("searches", 0)) +
+                int(stats.get("clicks", 0)) +
+                int(stats.get("seed_score", 0))
+            )
+        
+        # Sort by engagement (descending) and take top N
+        sorted_products = sorted(
+            products,
+            key=get_engagement_score,
+            reverse=True
+        )[:limit]
+        
+    except Exception as e:
+        logger.error(f"Error fetching trending products: {e}", exc_info=True)
+        sorted_products = []
     
-    # Build response
+    # ✅ STEP 3: Build response
     trending = []
     rank = 1
     
-    for row in rows:
-        # Handle both tuple and single object results
-        if isinstance(row, tuple):
-            product = row[0]
-            best_price = row[1] if len(row) > 1 else None
-            best_discount = row[2] if len(row) > 2 else None
-        else:
-            product = row
-            best_price = None
-            best_discount = None
-        
-        # Get best price if not from aggregation
-        if best_price is None:
+    for product in sorted_products:
+        try:
+            # Get best price for this product
             listing_result = await db.execute(
                 select(ProductListing)
                 .where(
@@ -754,46 +780,61 @@ async def get_trending_products(
                 .order_by(ProductListing.current_price.asc())
                 .limit(1)
             )
-            cheapest_listing = listing_result.scalar_one_or_none()
-            best_price = cheapest_listing.current_price if cheapest_listing else 0
-            best_discount = cheapest_listing.discount_percent if cheapest_listing else None
-        
-        # Get AI metadata
-        ai_metadata = product.ai_metadata or {}
-        stats = product.stats or {}
-        
-        # Calculate engagement score
-        engagement_score = (
-            stats.get("views", 0) +
-            stats.get("searches", 0) +
-            stats.get("clicks", 0)
-        )
-        
-        # Determine best platform
-        best_platform = "amazon"
-        
-        trending.append(TrendingProductResponse(
-            product_id=product.id,
-            title=ai_metadata.get("essence", product.title),
-            best_price=float(best_price) if best_price else 0,
-            best_platform=best_platform,
-            discount_percentage=float(best_discount) if best_discount else None,
-            image_url=product.image_url,
-            search_count=engagement_score,
-            rank=rank
-        ))
-        rank += 1
+            best_listing = listing_result.scalar_one_or_none()
+            
+            best_price = float(best_listing.current_price) if best_listing else 0
+            best_discount = int(best_listing.discount_percent or 0) if best_listing else None
+            best_platform = "amazon"  # Default
+            
+            # Get AI metadata
+            ai_metadata = product.ai_metadata or {}
+            stats = product.stats or {}
+            
+            # Calculate engagement score
+            engagement_score = (
+                int(stats.get("views", 0)) +
+                int(stats.get("searches", 0)) +
+                int(stats.get("clicks", 0))
+            )
+            
+            # Build response object
+            trending_item = TrendingProductResponse(
+                product_id=product.id,
+                title=ai_metadata.get("essence", product.title),
+                # ✅ NEW: Variant fingerprinting fields
+                variant_fingerprint=product.variant_fingerprint,
+                base_fingerprint=product.base_fingerprint,
+                variant_type=product.variant_type,
+                # Pricing
+                best_price=best_price,
+                best_platform=best_platform,
+                discount_percentage=best_discount,
+                image_url=product.image_url,
+                search_count=engagement_score,
+                rank=rank
+            )
+            
+            trending.append(trending_item)
+            rank += 1
+            
+        except Exception as e:
+            logger.error(f"Error processing product {product.id}: {e}", exc_info=True)
+            continue
     
-    # Cache results for 1 hour
+    # ✅ STEP 4: Cache results for 1 hour
     if trending:
-        await redis.set_json(
-            cache_key,
-            [t.model_dump(mode='json') for t in trending],
-            ttl=3600
-        )
+        try:
+            await redis.set_json(
+                cache_key,
+                [t.model_dump(mode='json') for t in trending],
+                ttl=3600
+            )
+            logger.info(f"Cached {len(trending)} trending products")
+        except Exception as e:
+            logger.warning(f"Failed to cache trending products: {e}")
     
     logger.info(
-        f"Trending calculated from DB | "
+        f"Trending products fetched | "
         f"Count: {len(trending)} | "
         f"User: {user.id}"
     )

@@ -231,6 +231,16 @@ class ProductData:
     
     # Internal fingerprint cache (use underscore prefix to avoid conflicts)
     _cached_fingerprint: Optional[str] = field(default=None, repr=False)
+    _cached_base_fingerprint: Optional[str] = field(default=None, repr=False)
+    _cached_variant_fingerprint: Optional[str] = field(default=None, repr=False)
+    
+    # =========================================================================
+    # VARIANT DETECTION FIELDS (Phase 1: Enhanced Fingerprinting)
+    # =========================================================================
+    variant_type: Optional[str] = None  # "pro", "plus", "ultra", "max", "standard"
+    storage_gb: Optional[int] = None    # 128, 256, 512, 1024
+    color: Optional[str] = None         # "blue", "black", "pink", "green"
+    condition: ProductCondition = ProductCondition.NEW  # "new", "refurbished"
     
     def __post_init__(self):
         """
@@ -280,9 +290,220 @@ class ProductData:
             except (TypeError, ValueError):
                 self.review_count = None
     
+    # =========================================================================
+    # PHASE 1: ENHANCED FINGERPRINTING WITH VARIANT DETECTION
+    # =========================================================================
+    
+    def _normalize_title(self) -> str:
+        """Normalize title for fingerprinting"""
+        normalized = self.title.lower()
+        # Remove special characters, keep only alphanumeric and space
+        normalized = re.sub(r'[^a-z0-9\s]', ' ', normalized)
+        # Remove extra spaces
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return normalized
+    
+    def _extract_variant_type(self) -> Optional[str]:
+        """Extract variant type (Pro, Plus, Max, Ultra, Standard) from title"""
+        if self.variant_type:  # Already detected
+            return self.variant_type
+        
+        title_lower = self.title.lower()
+        # Critical variants for smartphone/devices
+        variants = {
+            'pro max': 'pro_max',  # Check multi-word first
+            'pro max': 'pro_max',
+            'pro': 'pro',
+            'plus': 'plus',
+            'ultra': 'ultra',
+            'max': 'max',
+            'mini': 'mini',
+            'lite': 'lite',
+            'se': 'se',
+            'note': 'note',
+        }
+        
+        for variant_key, variant_val in variants.items():
+            if f' {variant_key} ' in f' {title_lower} ':
+                return variant_val
+            if variant_key in title_lower:
+                # Verify it's not part of another word
+                pattern = rf'\b{variant_key}\b'
+                if re.search(pattern, title_lower):
+                    return variant_val
+        
+        return None
+    
+    def _extract_storage(self) -> Optional[int]:
+        """Extract storage capacity (GB/TB) from title"""
+        if self.storage_gb:  # Already detected
+            return self.storage_gb
+        
+        title_lower = self.title.lower()
+        specs = self.specifications or {}
+        
+        # Check specifications first
+        if 'storage_gb' in specs:
+            try:
+                return int(specs['storage_gb'])
+            except (ValueError, TypeError):
+                pass
+        
+        # Pattern: 512GB storage, 512 GB ROM, 512GB, 1TB, 1 TB
+        storage_pattern = r'(\d{2,4})\s*(?:gb|gbs?)\s*(?:storage|rom|ssd|internal)?'
+        match = re.search(storage_pattern, title_lower, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+        
+        # Check for TB storage
+        tb_pattern = r'(\d+)\s*(?:tb|terabyte)'
+        tb_match = re.search(tb_pattern, title_lower, re.IGNORECASE)
+        if tb_match:
+            try:
+                return int(tb_match.group(1)) * 1024
+            except ValueError:
+                pass
+        
+        return None
+    
+    def _extract_color(self) -> Optional[str]:
+        """Extract color from title"""
+        if self.color:  # Already detected
+            return self.color
+        
+        title_lower = self.title.lower()
+        specs = self.specifications or {}
+        
+        # Check specifications first
+        if 'color' in specs:
+            return specs['color']
+        
+        # Common colors
+        colors = [
+            'blue', 'black', 'white', 'pink', 'red', 'green', 'gold', 'silver',
+            'grey', 'gray', 'purple', 'orange', 'brown', 'beige', 'navy',
+            'midnight', 'starlight', 'space black', 'deep purple', 'forest green',
+            'sierra blue', 'alpine green', 'graphite', 'gold', 'silver', 'rose'
+        ]
+        
+        for color in colors:
+            if f' {color} ' in f' {title_lower} ':
+                return color
+            if f'({color})' in title_lower or f'-{color}' in title_lower:
+                return color
+        
+        return None
+    
+    def detect_all_variants(self) -> Dict[str, Any]:
+        """Auto-detect all variant information from title"""
+        self.variant_type = self._extract_variant_type()
+        self.storage_gb = self._extract_storage()
+        self.color = self._extract_color()
+        
+        return {
+            "variant_type": self.variant_type,
+            "storage_gb": self.storage_gb,
+            "color": self.color,
+            "condition": self.condition.value if self.condition else "new"
+        }
+    
+    def get_base_fingerprint(self) -> str:
+        """
+        Generate BASE fingerprint (product series level)
+        Example: "iPhone 15" (matches iPhone 15, iPhone 15 Pro, iPhone 15 Plus)
+        
+        Used for linking all variants of same product
+        """
+        if self._cached_base_fingerprint:
+            return self._cached_base_fingerprint
+        
+        # Extract core product identity
+        normalized = self._normalize_title()
+        
+        # Remove variant keywords to get base product
+        variant_patterns = [
+            r'\bpro\b', r'\bplus\b', r'\bmax\b', r'\bultra\b',
+            r'\blite\b', r'\bmini\b', r'\bse\b', r'\bfx\b',
+        ]
+        
+        base = normalized
+        for pattern in variant_patterns:
+            base = re.sub(pattern, '', base, flags=re.IGNORECASE)
+        
+        # Remove storage/color info
+        base = re.sub(r'\b\d+\s*(?:gb|tb)', '', base, flags=re.IGNORECASE)
+        base = re.sub(r'(?:blue|black|white|pink|red|green|gold|silver|grey|gray)', '', base, flags=re.IGNORECASE)
+        
+        # Clean up extra spaces
+        base = re.sub(r'\s+', ' ', base).strip()
+        
+        # Get key words (brand + first few words)
+        words = base.split()
+        brand = (self.brand or 'unknown').lower().strip()
+        
+        # Combine brand + first 3 words of title
+        fp_parts = [brand] + words[:3]
+        fp_string = ' '.join(filter(None, fp_parts))
+        
+        self._cached_base_fingerprint = hashlib.sha256(fp_string.encode()).hexdigest()[:32]
+        return self._cached_base_fingerprint
+    
+    def get_variant_fingerprint(self) -> str:
+        """
+        Generate VARIANT fingerprint (product variant level)
+        Example: "iPhone 15 Pro 256GB Blue" 
+        
+        Used for exact product matching across platforms
+        """
+        if self._cached_variant_fingerprint:
+            return self._cached_variant_fingerprint
+        
+        # Auto-detect variants if not already done
+        if not self.variant_type:
+            self.detect_all_variants()
+        
+        # Build variant fingerprint from components
+        brand = (self.brand or 'unknown').lower().strip()
+        normalized_title = self._normalize_title()
+        
+        # Remove common junk words
+        junk_words = {
+            'the', 'a', 'an', 'and', 'or', 'with', 'by', 'from',
+            'new', 'latest', 'best', 'original', 'genuine', 'pack',
+            'offer', 'deal', 'sale', 'discount', 'price', 'buy', 'get',
+        }
+        
+        words = [w for w in normalized_title.split() if w not in junk_words]
+        
+        # Build fingerprint: brand + variant + storage + color
+        fp_components = [brand]
+        
+        if words:
+            # Add first 3 meaningful words
+            fp_components.extend(words[:3])
+        
+        if self.variant_type:
+            fp_components.append(self.variant_type)
+        
+        if self.storage_gb:
+            fp_components.append(f"{self.storage_gb}gb")
+        
+        if self.color:
+            fp_components.append(self.color.lower())
+        
+        fp_string = ' '.join(filter(None, fp_components))
+        self._cached_variant_fingerprint = hashlib.sha256(fp_string.encode()).hexdigest()[:32]
+        
+        return self._cached_variant_fingerprint
+    
     def get_fingerprint(self) -> str:
         """
-        Generate unique fingerprint for product deduplication
+        Generate unique fingerprint for product deduplication (BACKWARD COMPATIBLE)
+        
+        Now uses variant fingerprint for better cross-platform matching
         🔧 FIX: This is now a method, not a conflicting property
         """
         if self.ai_essence:
@@ -291,13 +512,8 @@ class ProductData:
         if self._cached_fingerprint:
             return self._cached_fingerprint
         
-        # Generate from title
-        normalized = self.title.lower()
-        normalized = re.sub(r'[^a-z0-9\s]', '', normalized)
-        words = sorted(normalized.split())
-        
-        fp_string = f"{(self.brand or 'unknown').lower()}_{' '.join(words[:10])}"
-        self._cached_fingerprint = hashlib.sha256(fp_string.encode()).hexdigest()[:32]
+        # Use variant fingerprint as primary fingerprint
+        self._cached_fingerprint = self.get_variant_fingerprint()
         
         return self._cached_fingerprint
     
@@ -351,6 +567,9 @@ class ProductData:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database storage"""
+        # Auto-detect variants before exporting
+        self.detect_all_variants()
+        
         return {
             "external_id": self.external_id,
             "title": self.title,
@@ -370,7 +589,18 @@ class ProductData:
             "subcategory": self.subcategory,
             "specifications": self.specifications,
             "platform_name": self.platform_name,
-            "fingerprint": self.get_fingerprint(),
+            # =====================================================================
+            # PHASE 1: Enhanced fingerprints
+            # =====================================================================
+            "fingerprint": self.get_fingerprint(),           # Variant FP (primary)
+            "variant_fingerprint": self.get_variant_fingerprint(),  # Explicit variant FP
+            "base_fingerprint": self.get_base_fingerprint(),         # Series FP
+            # Variant metadata
+            "variant_type": self.variant_type,
+            "storage_gb": self.storage_gb,
+            "color": self.color,
+            "condition": self.condition.value if self.condition else "new",
+            # AI fields
             "ai_essence": self.ai_essence,
             "ai_tags": self.ai_tags,
             "ai_quality_score": self.ai_quality_score,

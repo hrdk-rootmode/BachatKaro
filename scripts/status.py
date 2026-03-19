@@ -28,6 +28,8 @@ import sys
 import os
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
+import glob
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -236,6 +238,78 @@ async def get_revenue_stats() -> dict:
     return stats
 
 
+async def get_cross_platform_mining_stats() -> dict:
+    """Get cross-platform mining statistics from latest audit log"""
+    stats = {
+        "status": "no_runs",
+        "processed": 0,
+        "quality_gate_skipped": 0,
+        "stored": 0,
+        "ai_verified": 0,
+        "ai_rejected": 0,
+        "ai_contradictions": 0,
+        "retries": 0,
+        "image_validations": 0,
+        "essence_validations": 0,
+        "errors": 0,
+        "platforms_matched": {},
+        "last_run": None,
+    }
+    
+    try:
+        # Find latest mining_audit_*.json file
+        audit_files = glob.glob("mining_audit_*.json")
+        
+        if not audit_files:
+            return stats
+        
+        # Get most recent audit file
+        latest_file = max(audit_files, key=os.path.getctime)
+        
+        with open(latest_file, 'r', encoding='utf-8') as f:
+            audit_data = json.load(f)
+        
+        # Extract summary stats
+        if "stats" in audit_data:
+            s = audit_data["stats"]
+            stats.update({
+                "processed": s.get("processed", 0),
+                "quality_gate_skipped": s.get("quality_gate_skipped", 0),
+                "stored": s.get("stored", 0),
+                "ai_verified": s.get("ai_verified", 0),
+                "ai_rejected": s.get("ai_rejected", 0),
+                "ai_contradictions": s.get("ai_contradictions", 0),
+                "retries": s.get("retries", 0),
+                "image_validations": s.get("image_validation_fixed", 0),
+                "essence_validations": s.get("essence_validation_fixed", 0),
+                "errors": s.get("errors", 0),
+            })
+        
+        # Extract platform matches
+        if "matches" in audit_data and isinstance(audit_data["matches"], list):
+            for match in audit_data["matches"]:
+                platform = match.get("platform", "unknown").lower()
+                if platform not in stats["platforms_matched"]:
+                    stats["platforms_matched"][platform] = 0
+                stats["platforms_matched"][platform] += 1
+        
+        # Get timestamp from filename (mining_audit_YYYYMMDD_HHMMSS.json)
+        file_name = os.path.basename(latest_file)
+        if "mining_audit_" in file_name:
+            time_str = file_name.replace("mining_audit_", "").replace(".json", "")
+            try:
+                stats["last_run"] = datetime.strptime(time_str, "%Y%m%d_%H%M%S").isoformat()
+            except ValueError:
+                stats["last_run"] = file_name
+        
+        stats["status"] = "success"
+        
+    except Exception as e:
+        stats["status"] = f"error: {str(e)[:50]}"
+    
+    return stats
+
+
 def print_dashboard(data: dict):
     """Print beautiful terminal dashboard"""
     print("\n" + "═" * 70)
@@ -292,6 +366,36 @@ def print_dashboard(data: dict):
     print(f"   MRR:          ₹{revenue.get('mrr', 0):,.2f}")
     print(f"   Aff. Clicks:  {revenue.get('affiliate_clicks_today', 0)}")
     
+    # Cross-Platform Mining
+    mining = data.get("mining", {})
+    if mining.get("status") != "no_runs":
+        print("\n⛏️ CROSS-PLATFORM MINING")
+        print("─" * 40)
+        print(f"   Status:       {mining.get('status')}")
+        if mining.get("last_run"):
+            print(f"   Last Run:     {mining.get('last_run')}")
+        print(f"   Processed:    {mining.get('processed', 0)}")
+        print(f"   Quality Skip: {mining.get('quality_gate_skipped', 0)}")
+        print(f"   Stored:       {mining.get('stored', 0)} ✅")
+        print(f"   AI Verified:  {mining.get('ai_verified', 0)} 🤖")
+        print(f"   AI Rejected:  {mining.get('ai_rejected', 0)}")
+        print(f"   Contradicts:  {mining.get('ai_contradictions', 0)}")
+        print(f"   Retries:      {mining.get('retries', 0)}")
+        print(f"   Img Fixups:   {mining.get('image_validations', 0)}")
+        print(f"   Ess. Fixups:  {mining.get('essence_validations', 0)}")
+        print(f"   Errors:       {mining.get('errors', 0)}")
+        
+        # Platform breakdown
+        platforms_matched = mining.get("platforms_matched", {})
+        if platforms_matched:
+            print(f"   Matches by platform:")
+            for platform, count in sorted(platforms_matched.items()):
+                print(f"      • {platform.capitalize():12} {count} matched")
+    else:
+        print("\n⛏️ CROSS-PLATFORM MINING")
+        print("─" * 40)
+        print("   Status:       No runs yet (run: python scripts/cross_platform_miner.py)")
+    
     print("\n" + "═" * 70)
 
 
@@ -304,6 +408,7 @@ async def collect_all_stats() -> dict:
         "redis": await get_redis_stats(),
         "groq": await get_groq_stats(),
         "revenue": await get_revenue_stats(),
+        "mining": await get_cross_platform_mining_stats(),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
