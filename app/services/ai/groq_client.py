@@ -16,6 +16,7 @@ Version: 2.0.0 - Production Grade
 """
 
 from typing import Optional, Dict, Any, List, Tuple
+import asyncio
 import httpx
 import json
 import logging
@@ -287,6 +288,125 @@ RULES:
 
 
 # =============================================================================
+# STRUCTURED OUTPUT PROMPTS V2.0
+# =============================================================================
+
+PRODUCT_NORMALIZATION_PROMPT_V2 = """You are a STRICT product data normalizer for an Indian e-commerce platform.
+
+INPUT: Product context with title, price, platform, category, specifications
+OUTPUT: Return ONLY valid JSON with EXACTLY this structure:
+
+{
+    "essence": "brand model variant in lowercase, max 80 chars",
+    "category": "Electronics|Fashion|Beauty|Home|Grocery|General",
+    "subcategory": "specific type or null",
+    "tags": ["5-8 lowercase keywords"],
+    "brand": {
+        "value": "extracted brand name or null",
+        "confidence": 0.85,
+        "source": "explicit|inferred|unavailable"
+    },
+    "color": {
+        "value": "canonical color name or null",
+        "confidence": 0.90,
+        "source": "explicit|variant|title|unavailable"
+    },
+    "specifications": {
+        "ram_gb": 8,
+        "storage_gb": 256,
+        "processor": "Snapdragon 8 Gen 2",
+        "display_size": 6.7,
+        "model": "Pro Max"
+    },
+    "quality_score": 85,
+    "extraction_warnings": ["any issues or empty array"]
+}
+
+CRITICAL RULES:
+1. If uncertain about ANY value, use null with confidence < 0.40
+2. NEVER guess or hallucinate - only extract from provided context
+3. REJECT these as invalid and use null: "null", "none", "n/a", "na", "unknown", "not available", "-", "undefined", "not specified"
+4. Normalize colors to canonical forms:
+     - "grey" -> "gray"
+     - "space grey" -> "gray"
+     - "midnight black" -> "black"
+     - "ocean blue" -> "blue"
+5. Use recognized brand names when possible
+6. Extract specs from title when explicit data missing
+7. Confidence levels:
+     - 0.9-1.0: Explicit field in API/JSON
+     - 0.7-0.9: Inferred from structured data
+     - 0.4-0.7: Extracted from title/description
+     - <0.4: Uncertain, prefer null
+
+RESPOND WITH VALID JSON ONLY. No explanations, no markdown."""
+
+
+SELECTOR_HEALING_PROMPT_V2 = """You are a CSS selector expert for web scraping resilience.
+
+TASK: Generate a robust CSS selector for: {field_description}
+Platform: {platform_name}
+Failed selector: {failed_selector}
+
+Context hints:
+- Common patterns: {field_patterns}
+- HTML hints: {html_hints}
+
+Return ONLY this JSON structure:
+{{
+    "selector": "css selector string",
+    "confidence": 0.85,
+    "strategy": "semantic|attribute|data-testid|itemprop|class|fallback",
+    "rationale": "brief 10-word explanation"
+}}
+
+SELECTOR QUALITY RULES (Priority Order):
+1. BEST: [data-testid], [itemprop], [aria-label], [id] (semantic/attribute)
+2. GOOD: Semantic tags with attributes (h1.product-title, button[type=\"submit\"])
+3. ACCEPTABLE: Stable class names (not random/hashed)
+4. AVOID: Deep chains (>3 levels), position-based (:nth-child), dynamic classes
+
+ANTI-PATTERNS TO REJECT:
+- Brittle: div > div > div > span.a1b2c3
+- Position-based: li:nth-child(3)
+- Overly specific: div.container > section.main > article.product > div.details > h1.title
+- Random classes: div.css-1h4j2k3
+
+If no reliable selector exists, return:
+{{
+    "selector": "",
+    "confidence": 0.0,
+    "strategy": "unavailable",
+    "rationale": "no stable selector found in HTML"
+}}
+
+RESPOND WITH VALID JSON ONLY."""
+
+
+INVALID_VALUES = {
+        "null", "none", "n/a", "na", "unknown", "not available",
+        "-", "", "undefined", "not specified", "n.a.", "nil",
+        "blank", "tbd", "tba", "not applicable"
+}
+
+COLOR_CANONICAL_MAP = {
+        "grey": "gray",
+        "space grey": "gray",
+        "space gray": "gray",
+        "midnight black": "black",
+        "jet black": "black",
+        "ocean blue": "blue",
+        "sky blue": "blue",
+        "rose gold": "gold",
+        "champagne gold": "gold",
+        "silver white": "silver",
+        "off white": "white",
+        "cream": "white",
+        "beige": "white",
+}
+
+
+# =============================================================================
 # CIRCUIT BREAKER (Prevents Infinite Failures)
 # =============================================================================
 
@@ -508,74 +628,78 @@ class GroqClient:
         # Try each key in order
         last_error = None
         for attempt_feature, api_key, is_priority in candidates:
-            try:
-                # Check quota for this key
-                if not await self._check_quota(attempt_feature):
-                    if is_priority:
+            for key_attempt in range(1, 4):
+                try:
+                    # Check quota for this key
+                    if not await self._check_quota(attempt_feature):
+                        if is_priority:
+                            logger.warning(
+                                f"⚠️ Feature '{feature.value}' quota exhausted, "
+                                f"falling back to {attempt_feature.value}"
+                            )
+                        else:
+                            logger.debug(
+                                f"Skipping {attempt_feature.value} (quota exhausted)"
+                            )
+                        break
+
+                    # Make API call
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json"
+                    }
+
+                    payload = {
+                        "model": self.model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+
+                    if json_mode:
+                        payload["response_format"] = {"type": "json_object"}
+
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        response = await client.post(self.base_url, headers=headers, json=payload)
+                        response.raise_for_status()
+
+                        data = response.json()
+                        result = data["choices"][0]["message"]["content"]
+
+                        # Increment usage for the key that succeeded
+                        await self._increment_usage(attempt_feature)
+
+                        if attempt_feature != feature and not is_priority:
+                            logger.info(
+                                f"✅ {attempt_feature.value} key used (fallback from {feature.value})"
+                            )
+
+                        return result.strip()
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        backoff_s = min(2 ** (key_attempt - 1), 4)
                         logger.warning(
-                            f"⚠️ Feature '{feature.value}' quota exhausted, "
-                            f"falling back to {attempt_feature.value}"
+                            f"🚫 Rate limit on {attempt_feature.value} key (429), "
+                            f"retry {key_attempt}/3 after {backoff_s}s"
                         )
+                        last_error = f"Rate limit ({attempt_feature.value})"
+                        if key_attempt < 3:
+                            await asyncio.sleep(backoff_s)
+                            continue
                     else:
-                        logger.debug(
-                            f"Skipping {attempt_feature.value} (quota exhausted)"
+                        logger.warning(
+                            f"⚠️ Groq API error {e.response.status_code} on {attempt_feature.value}"
                         )
-                    continue
-                
-                # Make API call
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-                
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                
-                if json_mode:
-                    payload["response_format"] = {"type": "json_object"}
-                
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(self.base_url, headers=headers, json=payload)
-                    response.raise_for_status()
-                    
-                    data = response.json()
-                    result = data["choices"][0]["message"]["content"]
-                    
-                    # Increment usage for the key that succeeded
-                    await self._increment_usage(attempt_feature)
-                    
-                    if attempt_feature != feature and not is_priority:
-                        logger.info(
-                            f"✅ {attempt_feature.value} key used (fallback from {feature.value})"
-                        )
-                    
-                    return result.strip()
-            
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
+                        last_error = f"API error {e.response.status_code}"
+                    break
+
+                except Exception as e:
                     logger.warning(
-                        f"🚫 Rate limit on {attempt_feature.value} key (code 429)"
+                        f"⚠️ Error with {attempt_feature.value} key: {str(e)[:100]}"
                     )
-                    last_error = f"Rate limit ({attempt_feature.value})"
-                else:
-                    logger.warning(
-                        f"⚠️ Groq API error {e.response.status_code} on {attempt_feature.value}"
-                    )
-                    last_error = f"API error {e.response.status_code}"
-                # Try next key
-                continue
-            
-            except Exception as e:
-                logger.warning(
-                    f"⚠️ Error with {attempt_feature.value} key: {str(e)[:100]}"
-                )
-                last_error = str(e)[:50]
-                # Try next key
-                continue
+                    last_error = str(e)[:50]
+                    break
         
         # All keys exhausted or failed
         logger.error(
@@ -595,94 +719,83 @@ class GroqClient:
         target_data: str,
         platform_name: str
     ) -> Optional[str]:
-        """
-        🚀 ENHANCED: Platform-specific selector healing
-        
-        Args:
-            html_snippet: HTML where selector failed (will be minified)
-            failed_selector: The selector that stopped working
-            target_data: What we're trying to extract (e.g., "product_price")
-            platform_name: Platform name for context-aware prompts
-            
-        Returns:
-            New CSS selector or None
-        """
+        """Enhanced selector healing with structured output."""
         platform_name = platform_name.lower()
-        
+
         # Check circuit breaker
         if not self.circuit_breaker.can_attempt(platform_name, target_data):
             logger.warning(f"🚫 Circuit breaker blocking healing for {platform_name}:{target_data}")
             return None
-        
-        # Check cache first
-        cache_key = f"selector:v2:{platform_name}:{target_data}:{hashlib.md5(failed_selector.encode()).hexdigest()[:8]}"
+
+        # Check cache
+        cache_key = f"selector:v3:{platform_name}:{target_data}:{hashlib.md5(failed_selector.encode()).hexdigest()[:8]}"
         cached = await redis_client.get(cache_key)
         if cached:
             logger.info(f"♻️ Using cached selector for {platform_name}:{target_data}")
             return cached
-        
-        # Get platform-specific prompt
-        platform_config = PLATFORM_SPECIFIC_PROMPTS.get(platform_name, DEFAULT_PLATFORM_PROMPT)
-        system_prompt = platform_config["system"]
-        field_hints = platform_config.get("field_hints", {})
-        
-        # Add field-specific hint if available
-        field_hint = field_hints.get(target_data, "")
-        if field_hint:
-            system_prompt += f"\n\nSPECIFIC HINT for {target_data}: {field_hint}"
-        
-        # Minify HTML
-        html_truncated = self._minify_html(html_snippet, max_length=4000)
+
+        from app.services.scraper.self_healing import DOMMinifier, UNIVERSAL_FIELD_PATTERNS
+
+        field_info = UNIVERSAL_FIELD_PATTERNS.get(target_data, {})
+        field_description = field_info.get("description", f"the {target_data.replace('_', ' ')}")
+        field_patterns = ", ".join(field_info.get("patterns", [])[:5])
+        html_hints = ", ".join(field_info.get("html_hints", [])[:5])
+
+        minified = DOMMinifier.minify(html_snippet, max_length=6000)
+
+        user_prompt = SELECTOR_HEALING_PROMPT_V2.format(
+            field_description=field_description,
+            platform_name=platform_name.upper(),
+            failed_selector=failed_selector,
+            field_patterns=field_patterns,
+            html_hints=html_hints
+        )
         
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": "You are a CSS selector expert. Return ONLY valid JSON."},
             {
                 "role": "user",
-                "content": f"""Platform: {platform_name.upper()}
-Field to extract: {target_data}
-Failed selector: {failed_selector}
-
-Analyze this HTML and provide a NEW CSS selector that will work:
-
-{html_truncated}
-
-Return ONLY the CSS selector string, nothing else."""
+                "content": f"{user_prompt}\n\nHTML:\n{minified[:4000]}"
             }
         ]
-        
+
         # Call AI
         result = await self._call_groq(
             messages,
             feature=GroqFeature.HEALING,
-            temperature=0.2,
-            max_tokens=150,
-            json_mode=False
+            temperature=0.15,
+            max_tokens=200,
+            json_mode=True
         )
-        
-        logger.info(f"🤖 AI response for {platform_name}:{target_data}: {result}")
-        
-        if result:
-            selector = self._clean_selector_response(result)
-            
-            if selector and self._is_valid_selector(selector):
-                # Record success
-                self.circuit_breaker.record_success(platform_name, target_data)
-                
-                # Cache for 7 days
-                await redis_client.set(cache_key, selector, ttl=self.CACHE_TTL_SECONDS)
-                
-                # Record in history
-                self._record_healing(platform_name, target_data, failed_selector, selector, True)
-                
-                logger.info(f"✅ AI healed selector for {platform_name}:{target_data}: {selector}")
-                return selector
-            else:
-                logger.warning(f"⚠️ Invalid selector from AI: {result}")
-        
+
+        parsed = self._parse_json_response(result, ["selector", "confidence"])
+
+        if not parsed:
+            self.circuit_breaker.record_failure(platform_name, target_data)
+            self._record_healing(platform_name, target_data, failed_selector, None, False)
+            return None
+
+        selector = str(parsed.get("selector", "")).strip()
+        confidence = float(parsed.get("confidence", 0.0))
+        strategy = parsed.get("strategy", "unknown")
+
+        logger.info(
+            f"🤖 AI selector suggestion: {selector[:50]} "
+            f"(confidence={confidence:.2f}, strategy={strategy})"
+        )
+
+        if selector and self._is_valid_selector(selector) and confidence >= 0.5:
+            await redis_client.set(cache_key, selector, ttl=self.CACHE_TTL_SECONDS)
+            self.circuit_breaker.record_success(platform_name, target_data)
+            self._record_healing(platform_name, target_data, failed_selector, selector, True)
+
+            logger.info(f"✅ AI healed selector for {platform_name}:{target_data}: {selector}")
+            return selector
+
         # Record failure
         self.circuit_breaker.record_failure(platform_name, target_data)
         self._record_healing(platform_name, target_data, failed_selector, None, False)
-        
+
         return None
     
     async def heal_entire_platform(
@@ -983,93 +1096,192 @@ Return ONLY the CSS selector string, nothing else."""
     # =========================================================================
     
     async def process_product(self, product_data) -> Dict[str, Any]:
-        """Enrich scraped product data using AI"""
-        cache_key = f"ai:product:{hashlib.md5(product_data.title.encode()).hexdigest()[:16]}"
-        
+        """Enhanced product processing with structured output and confidence."""
+        cache_key = f"ai:product:v2:{hashlib.md5(product_data.title.encode()).hexdigest()[:16]}"
+
         cached = await redis_client.get_json(cache_key)
         if cached:
+            logger.debug("Using cached enrichment")
             return cached
-        
-        if product_data.ai_processed and product_data.ai_essence:
-            return {
-                "essence": product_data.ai_essence,
-                "category": product_data.category or "General",
-                "subcategory": product_data.subcategory,
-                "tags": product_data.ai_tags,
-                "specifications": product_data.specifications,
-                "quality_score": product_data.ai_quality_score
-            }
-        
+
+        if not await self._check_quota(GroqFeature.DAILY_SCRAPE):
+            logger.warning("Quota exhausted, using fallback")
+            return self._generate_fallback_enrichment(product_data)
+
         context = product_data.to_ai_context(max_length=1500)
         context_json = json.dumps(context, default=str, ensure_ascii=False)
-        
+
         messages = [
-            {"role": "system", "content": self._get_product_processing_prompt()},
+            {"role": "system", "content": PRODUCT_NORMALIZATION_PROMPT_V2},
             {"role": "user", "content": context_json}
         ]
-        
+
         result = await self._call_groq(
             messages,
             feature=GroqFeature.DAILY_SCRAPE,
             temperature=0.1,
-            max_tokens=600,
+            max_tokens=800,
             json_mode=True
         )
-        
-        enriched = self._parse_ai_response(result, product_data)
-        await redis_client.set_json(cache_key, enriched, ttl=self.CACHE_TTL_SECONDS)
-        
+
+        enriched = self._parse_product_response(result, product_data)
+        if enriched:
+            await redis_client.set_json(cache_key, enriched, ttl=self.CACHE_TTL_SECONDS)
+
         return enriched
-    
-    def _get_product_processing_prompt(self) -> str:
-        """System prompt for product processing"""
-        return """You are a product data normalization engine for an Indian e-commerce platform.
 
-Analyze the input and return JSON with these keys:
-{
-  "essence": "brand model variant specs in lowercase, max 80 chars",
-  "category": "One of: Electronics, Fashion, Beauty, Home, Grocery, General",
-  "subcategory": "Specific type like Smartphones, Laptops, T-Shirts",
-  "tags": ["5-8 lowercase keywords"],
-  "specifications": {"brand": "...", "model": "...", "color": "..."},
-  "quality_score": 70
-}
+    def _parse_json_response(self, response: Optional[str], expected_keys: List[str]) -> Optional[Dict[str, Any]]:
+        """Robust JSON parsing with validation."""
+        if not response:
+            return None
 
-RESPOND WITH VALID JSON ONLY."""
-    
-    def _parse_ai_response(self, response: Optional[str], product_data) -> Dict[str, Any]:
-        """Parse AI response with fallback"""
-        fallback = {
+        try:
+            cleaned = response.strip()
+            cleaned = re.sub(r'^```json?\s*', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+            cleaned = cleaned.strip()
+
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, dict):
+                logger.warning(f"Response is not a dict: {type(parsed)}")
+                return None
+
+            missing_keys = [k for k in expected_keys if k not in parsed]
+            if missing_keys:
+                logger.warning(f"Missing keys in response: {missing_keys}")
+
+            return parsed
+
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}")
+            logger.debug(f"Raw response: {str(response)[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected parse error: {e}")
+            return None
+
+    def _validate_and_clean_value(self, value: Any, field_type: str = "string") -> Tuple[Any, bool]:
+        """Validate and clean extracted value."""
+        if value is None:
+            return None, True
+
+        if field_type == "string":
+            if not isinstance(value, str):
+                value = str(value)
+            cleaned = value.strip().lower()
+            if cleaned in INVALID_VALUES:
+                return None, False
+            return cleaned, True
+
+        if field_type == "number":
+            try:
+                return float(value), True
+            except (ValueError, TypeError):
+                return None, False
+
+        return value, True
+
+    def _canonicalize_color(self, color: Optional[str]) -> Optional[str]:
+        """Canonicalize color to standard form."""
+        if not color:
+            return None
+
+        color_lower = str(color).lower().strip()
+        if color_lower in INVALID_VALUES:
+            return None
+
+        return COLOR_CANONICAL_MAP.get(color_lower, color_lower)
+
+    def _parse_product_response(self, response: Optional[str], product_data) -> Dict[str, Any]:
+        """Parse and validate product enrichment response."""
+        expected_keys = ["essence", "category", "brand", "color", "quality_score"]
+        parsed = self._parse_json_response(response, expected_keys)
+
+        if not parsed:
+            logger.warning("Failed to parse AI response, using fallback")
+            return self._generate_fallback_enrichment(product_data)
+
+        brand_data = parsed.get("brand", {})
+        if isinstance(brand_data, dict):
+            brand_value, _ = self._validate_and_clean_value(brand_data.get("value"), "string")
+            brand_confidence = float(brand_data.get("confidence", 0.5))
+            brand_source = brand_data.get("source", "ai")
+        else:
+            brand_value, _ = self._validate_and_clean_value(brand_data, "string")
+            brand_confidence = 0.5
+            brand_source = "ai"
+
+        color_data = parsed.get("color", {})
+        if isinstance(color_data, dict):
+            color_value = self._canonicalize_color(color_data.get("value"))
+            color_confidence = float(color_data.get("confidence", 0.5))
+            color_source = color_data.get("source", "ai")
+        else:
+            color_value = self._canonicalize_color(color_data)
+            color_confidence = 0.5
+            color_source = "ai"
+
+        specs = parsed.get("specifications", {})
+        specs = specs if isinstance(specs, dict) else {}
+        tags = parsed.get("tags", [])
+        tags = tags if isinstance(tags, list) else []
+        warnings = parsed.get("extraction_warnings", [])
+        warnings = warnings if isinstance(warnings, list) else []
+
+        existing_specs = product_data.specifications if isinstance(product_data.specifications, dict) else {}
+        merged_specs = {**existing_specs, **specs}
+
+        enriched = {
+            "essence": (parsed.get("essence") or self._generate_fallback_essence(product_data)).lower()[:80],
+            "category": parsed.get("category") or "General",
+            "subcategory": parsed.get("subcategory"),
+            "tags": [str(t).lower().strip() for t in tags[:10] if str(t).strip()],
+            "quality_score": max(0, min(100, int(parsed.get("quality_score", 50)))),
+
+            "brand": brand_value,
+            "brand_confidence": max(0.0, min(1.0, brand_confidence)),
+            "brand_source": brand_source,
+
+            "color": color_value,
+            "color_confidence": max(0.0, min(1.0, color_confidence)),
+            "color_source": color_source,
+
+            "specifications": merged_specs,
+            "specs_confidence": 0.6 if specs else 0.0,
+            "specs_source": "ai" if specs else None,
+
+            "extraction_warnings": warnings,
+            "enriched_at": datetime.utcnow().isoformat(),
+            "enrichment_version": 2,
+        }
+
+        return enriched
+
+    def _generate_fallback_enrichment(self, product_data) -> Dict[str, Any]:
+        """Generate fallback enrichment when AI fails."""
+        return {
             "essence": self._generate_fallback_essence(product_data),
             "category": self._detect_category_fallback(product_data.title),
             "subcategory": None,
             "tags": self._generate_fallback_tags(product_data),
+            "quality_score": self._calculate_fallback_quality(product_data),
+
+            "brand": getattr(product_data, 'brand', None),
+            "brand_confidence": 0.3 if getattr(product_data, 'brand', None) else 0.0,
+            "brand_source": "title_heuristic",
+
+            "color": getattr(product_data, 'color', None),
+            "color_confidence": 0.3 if getattr(product_data, 'color', None) else 0.0,
+            "color_source": "title_heuristic",
+
             "specifications": product_data.specifications or {},
-            "quality_score": self._calculate_fallback_quality(product_data)
+            "specs_confidence": 0.4 if product_data.specifications else 0.0,
+            "specs_source": "dom",
+
+            "extraction_warnings": ["AI unavailable, using heuristics"],
+            "enriched_at": datetime.utcnow().isoformat(),
+            "enrichment_version": 2,
         }
-        
-        if not response:
-            return fallback
-        
-        try:
-            cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r'^```json?\s*', '', cleaned)
-                cleaned = re.sub(r'\s*```$', '', cleaned)
-            
-            parsed = json.loads(cleaned)
-            
-            return {
-                "essence": (parsed.get("essence") or fallback["essence"]).lower().strip(),
-                "category": parsed.get("category") or fallback["category"],
-                "subcategory": parsed.get("subcategory"),
-                "tags": [t.lower().strip() for t in parsed.get("tags", fallback["tags"])[:10]],
-                "specifications": parsed.get("specifications") or fallback["specifications"],
-                "quality_score": max(0, min(100, int(parsed.get("quality_score", 50))))
-            }
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"AI response parse error: {e}")
-            return fallback
     
     def _generate_fallback_essence(self, product_data) -> str:
         """Generate essence without AI"""

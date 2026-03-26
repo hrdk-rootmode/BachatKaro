@@ -22,6 +22,7 @@ from decimal import Decimal
 
 from app.core.database import get_db
 from app.core.redis_client import RedisClient, get_redis
+from app.core.config import settings
 from app.models import Product, ProductListing, User
 from app.models import Platform as PlatformModel
 from app.schemas import (
@@ -57,9 +58,27 @@ router = APIRouter()
 
 def calculate_search_cache_key(query: str, filters: dict) -> str:
     """Generate cache key for search query"""
-    filter_str = f"{filters.get('platforms', 'all')}_{filters.get('min_price', 0)}_{filters.get('max_price', 999999)}"
+    filter_str = (
+        f"{filters.get('platforms', 'all')}_{filters.get('min_price', 0)}_{filters.get('max_price', 999999)}"
+        f"_{getattr(settings, 'MIN_LISTING_CONFIDENCE', 0.6)}_{getattr(settings, 'CROMA_ENABLED', False)}"
+    )
     combined = f"{query.lower().strip()}_{filter_str}"
     return f"search:{hashlib.md5(combined.encode()).hexdigest()}"
+
+
+def _get_enabled_platforms() -> set[str]:
+    enabled = {"amazon", "flipkart", "meesho", "myntra", "nykaa", "croma"}
+    if not getattr(settings, "CROMA_ENABLED", False):
+        enabled.discard("croma")
+    return enabled
+
+
+def _listing_meets_quality(listing: ProductListing) -> bool:
+    min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
+    confidence = listing.extraction_confidence
+    if confidence is None:
+        return True
+    return confidence >= min_confidence
 
 
 # =============================================================================
@@ -114,7 +133,27 @@ async def get_product_listings(
     query = query.order_by(ProductListing.current_price.asc())
     
     result = await db.execute(query)
-    return list(result.scalars().all())
+    listings = list(result.scalars().all())
+
+    requested_platforms = {p.value for p in platforms} if platforms else None
+    enabled_platforms = _get_enabled_platforms()
+
+    filtered_listings = []
+    for listing in listings:
+        platform_name = (
+            listing.platform.name.lower()
+            if hasattr(listing, "platform") and listing.platform
+            else None
+        )
+        if platform_name and platform_name not in enabled_platforms:
+            continue
+        if requested_platforms and platform_name and platform_name not in requested_platforms:
+            continue
+        if not _listing_meets_quality(listing):
+            continue
+        filtered_listings.append(listing)
+
+    return filtered_listings
 
 
 def format_listing_response(listing: ProductListing, product: Product) -> ProductListingResponse:
@@ -144,7 +183,12 @@ def format_listing_response(listing: ProductListing, product: Product) -> Produc
         review_count=listing.review_count,
         image_url=product.image_url,  # ✅ Image comes from Product, not Listing
         in_stock=listing.in_stock,
-        last_scraped_at=listing.last_scraped or datetime.utcnow()
+        last_scraped_at=listing.last_scraped or datetime.utcnow(),
+        extraction_confidence=listing.extraction_confidence,
+        extraction_method=listing.extraction_method,
+        data_source=listing.data_source,
+        seller_name=listing.seller_name,
+        seller_rating=Decimal(str(listing.seller_rating)) if listing.seller_rating is not None else None,
     )
 
 
@@ -525,6 +569,15 @@ async def search_by_url(
                 "supported_platforms": url_detector.get_supported_platforms()
             }
         )
+
+    if url_analysis.platform_name == "croma" and not getattr(settings, "CROMA_ENABLED", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "platform_paused",
+                "message": "Croma is temporarily paused for quality rollout"
+            }
+        )
     
     # Step 3: Check database cache first
     cache_key = f"url_search:{hashlib.md5(url.encode()).hexdigest()}"
@@ -621,6 +674,21 @@ async def search_by_url(
         alternatives[0]
     )
     
+    enabled_platforms = _get_enabled_platforms()
+    min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
+
+    filtered_alternatives = [
+        p for p in alternatives
+        if p.platform_name.lower() in enabled_platforms
+        and (p.extraction_confidence is None or p.extraction_confidence >= min_confidence)
+    ]
+    if filtered_alternatives:
+        alternatives = filtered_alternatives
+        source_product = next(
+            (p for p in alternatives if url_analysis.platform_name in p.platform_name.lower()),
+            alternatives[0]
+        )
+
     other_alternatives = [
         p for p in alternatives
         if p.platform_name != source_product.platform_name
@@ -735,7 +803,11 @@ async def get_trending_products(
         result = await db.execute(
             select(Product)
             .join(ProductListing, Product.id == ProductListing.product_id)
-            .where(ProductListing.in_stock == True)
+            .where(
+                ProductListing.in_stock == True,
+                (ProductListing.extraction_confidence.is_(None) |
+                 (ProductListing.extraction_confidence >= float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))))
+            )
             .distinct(Product.id)  # Avoid duplicates from multiple listings
             .order_by(Product.id)
         )
@@ -773,18 +845,24 @@ async def get_trending_products(
             # Get best price for this product
             listing_result = await db.execute(
                 select(ProductListing)
+                .options(selectinload(ProductListing.platform))
                 .where(
                     ProductListing.product_id == product.id,
-                    ProductListing.in_stock == True
+                    ProductListing.in_stock == True,
+                    (ProductListing.extraction_confidence.is_(None) |
+                     (ProductListing.extraction_confidence >= float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))))
                 )
                 .order_by(ProductListing.current_price.asc())
                 .limit(1)
             )
             best_listing = listing_result.scalar_one_or_none()
+
+            if best_listing and best_listing.platform and best_listing.platform.name.lower() == "croma" and not getattr(settings, "CROMA_ENABLED", False):
+                continue
             
             best_price = float(best_listing.current_price) if best_listing else 0
             best_discount = int(best_listing.discount_percent or 0) if best_listing else None
-            best_platform = "amazon"  # Default
+            best_platform = best_listing.platform.name.lower() if best_listing and best_listing.platform else "amazon"
             
             # Get AI metadata
             ai_metadata = product.ai_metadata or {}
@@ -799,7 +877,7 @@ async def get_trending_products(
             
             # Build response object
             trending_item = TrendingProductResponse(
-                product_id=product.id,
+                product_id=str(product.id),  # ✅ FIX: Convert UUID to string
                 title=ai_metadata.get("essence", product.title),
                 # ✅ NEW: Variant fingerprinting fields
                 variant_fingerprint=product.variant_fingerprint,

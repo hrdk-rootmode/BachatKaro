@@ -84,6 +84,75 @@ PLATFORMS_TO_SEED = [
     },
 ]
 
+DEFAULT_PLATFORM_SELECTORS = {
+    "amazon": {
+        "search_product_container": "div[data-component-type='s-search-result']",
+        "product_title": "h2 a span",
+        "product_price": "span.a-price-whole",
+        "product_image": "img.s-image",
+        "product_rating": "span.a-icon-alt",
+        "review_count": "span.a-size-base.s-underline-text",
+        "product_url": "h2 a",
+        "brand": "h5.s-line-clamp-1",
+        "in_stock": "#availability",
+    },
+    "flipkart": {
+        "search_product_container": "div[data-id]",
+        "product_title": "a[title], div.KzDlHZ",
+        "product_price": "div.Nx9bqj, div._30jeq3",
+        "product_image": "img._53J4C-",
+        "product_rating": "div.XQDdHH, div._3LWZlK",
+        "review_count": "span.Wphh3N, span._2_R_DZ",
+        "product_url": "a.CGtC98, a._1fQZEK",
+        "brand": "div.syl9yP",
+        "in_stock": "div._16FRp0",
+    },
+    "myntra": {
+        "search_product_container": "li.product-base",
+        "product_title": "h3.product-brand, h4.product-product",
+        "product_price": "span.product-discountedPrice, span.product-price",
+        "product_image": "img.img-responsive",
+        "product_rating": "div.product-ratingsContainer span",
+        "review_count": "span.product-ratingsCount",
+        "product_url": "a",
+        "brand": "h3.product-brand",
+        "in_stock": "div.size-buttons-size-button",
+    },
+    "nykaa": {
+        "search_product_container": "div[id^='product-list-wrap'] a, div.css-1rd7vky",
+        "product_title": "div.css-xrzmfa, div.css-1hd2j4z",
+        "product_price": "span.css-111z9ua, span.css-17x46n5",
+        "product_image": "img",
+        "product_rating": "span.css-1j33oxj",
+        "review_count": "span.css-1jczs19",
+        "product_url": "a",
+        "brand": "div.css-1hd2j4z",
+        "in_stock": "button[type='button']",
+    },
+    "meesho": {
+        "search_product_container": "div[data-testid='product-card'], div.NewProductCardstyled__CardStyled-sc-6y2tys-0",
+        "product_title": "p[data-testid='product-card-title'], p.sc-eDvSVe",
+        "product_price": "h5[data-testid='product-card-price'], h5.sc-dkrFOg",
+        "product_image": "img",
+        "product_rating": "span[data-testid='product-card-rating'], span.sc-jSUZER",
+        "review_count": "span[data-testid='product-card-ratings-count']",
+        "product_url": "a",
+        "brand": "p[data-testid='product-card-title']",
+        "in_stock": "button, a",
+    },
+    "croma": {
+        "search_product_container": "div.product-item, li.product-item",
+        "product_title": "h3.product-title, a.product-title",
+        "product_price": "span.amount, span.final-price",
+        "product_image": "img",
+        "product_rating": "span.rating, div.rating",
+        "review_count": "span.review-count",
+        "product_url": "a[href*='/p/']",
+        "brand": "span.brand",
+        "in_stock": "button.add-to-cart",
+    },
+}
+
 SUBSCRIPTION_PLANS = [
     {
         "name": "free",
@@ -258,10 +327,13 @@ async def check_redis() -> bool:
         return False
 
 async def seed_platforms() -> int:
-    """Seed platform records"""
+    """Seed platform records with default selectors"""
     print("\n🌐 Seeding Platforms...")
     
     from sqlalchemy import select
+    from app.services.scraper.factory import PlatformFactory
+
+    factory = PlatformFactory()
     
     created = 0
     updated = 0
@@ -274,12 +346,29 @@ async def seed_platforms() -> int:
                     select(Platform).where(Platform.name == platform_data["name"])
                 )
                 existing = result.scalar_one_or_none()
+
+                default_selectors = DEFAULT_PLATFORM_SELECTORS.get(platform_data["name"], {})
                 
                 if existing:
                     # Update
                     existing.base_url = platform_data["base_url"]
                     existing.affiliate_tag = platform_data["affiliate_tag"]
                     existing.is_active = platform_data["is_active"]
+
+                    current_selectors = existing.selectors or {}
+                    for key, value in default_selectors.items():
+                        if key not in current_selectors:
+                            current_selectors[key] = value
+
+                    existing.selectors = current_selectors
+
+                    if not existing.healing_stats:
+                        existing.healing_stats = {
+                            "total_attempts": 0,
+                            "successful_heals": 0,
+                            "fields": {},
+                        }
+
                     updated += 1
                 else:
                     # Create
@@ -288,7 +377,13 @@ async def seed_platforms() -> int:
                         base_url=platform_data["base_url"],
                         affiliate_tag=platform_data["affiliate_tag"],
                         is_active=platform_data["is_active"],
-                        selectors={}
+                        selectors=default_selectors,
+                        selector_history=[],
+                        healing_stats={
+                            "total_attempts": 0,
+                            "successful_heals": 0,
+                            "fields": {},
+                        },
                     )
                     db.add(platform)
                     created += 1

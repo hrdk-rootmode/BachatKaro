@@ -5,6 +5,7 @@ Product Detail & Price History Routes
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
+from sqlalchemy.orm import selectinload
 from typing import List
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -12,6 +13,7 @@ import logging
 
 from app.core.database import get_db
 from app.core.redis_client import RedisClient, get_redis
+from app.core.config import settings
 from app.models import Product, ProductListing, PriceHistory, User
 from app.schemas import (
     ProductResponse,
@@ -24,6 +26,57 @@ from app.api.deps import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _is_listing_allowed(listing: ProductListing) -> bool:
+    if hasattr(listing, "platform") and listing.platform:
+        if listing.platform.name.lower() == "croma" and not getattr(settings, "CROMA_ENABLED", False):
+            return False
+
+    min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
+    if listing.extraction_confidence is not None and listing.extraction_confidence < min_confidence:
+        return False
+
+    return True
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def format_listing_response(listing: ProductListing, product: Product) -> ProductListingResponse:
+    """Format ProductListing ORM model to ProductListingResponse"""
+    # Get platform name from relationship (should be eager-loaded)
+    platform_name = "amazon"  # Default
+    if hasattr(listing, 'platform') and listing.platform:
+        platform_name = listing.platform.name.lower()
+    
+    try:
+        platform_enum = Platform[platform_name.upper()]
+    except (KeyError, AttributeError):
+        platform_enum = Platform.AMAZON
+    
+    return ProductListingResponse(
+        id=str(listing.id),  # ✅ Convert UUID to string
+        platform=platform_enum,
+        platform_product_id=listing.external_id or "",
+        url=listing.product_url or "",
+        title=product.title,  # ✅ Get from product parameter (already loaded)
+        current_price=listing.current_price,
+        original_price=listing.original_price,
+        discount_percentage=int(listing.discount_percent) if listing.discount_percent else None,
+        rating=listing.rating,
+        review_count=listing.review_count,
+        image_url=product.image_url,  # ✅ Get from product parameter (already loaded)
+        in_stock=listing.in_stock,
+        last_scraped_at=listing.last_scraped or datetime.now(),
+        extraction_confidence=listing.extraction_confidence,
+        extraction_method=listing.extraction_method,
+        data_source=listing.data_source,
+        seller_name=listing.seller_name,
+        seller_rating=Decimal(str(listing.seller_rating)) if listing.seller_rating is not None else None,
+        variant_fingerprint=listing.variant_fingerprint
+    )
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
@@ -53,8 +106,18 @@ async def get_product(
         select(ProductListing)
         .where(ProductListing.product_id == product_id)
         .order_by(ProductListing.current_price.asc())
+        .options(selectinload(ProductListing.platform))  # ✅ Eager-load platform relationship
     )
-    listings = list(result.scalars().all())
+    all_listings = result.scalars().all()
+    listings = [l for l in all_listings if l is not None and _is_listing_allowed(l)]
+
+    if not listings:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No high-confidence listings available for this product"
+        )
+    
+    logger.debug(f"Product {product_id}: Fetched {len(listings)} listings (total: {len(all_listings)})")
     
     # Get AI metadata
     ai_metadata = product.ai_metadata or {}
@@ -64,9 +127,16 @@ async def get_product(
     best_platform = "amazon"
     avg_price = None
     if listings:
-        best_listing = min(listings, key=lambda x: x.current_price)
-        best_price = best_listing.current_price
-        avg_price = sum(l.current_price for l in listings) / len(listings)
+        # Filter listings with valid prices
+        listings_with_price = [l for l in listings if l.current_price is not None]
+        if listings_with_price:
+            best_listing = min(listings_with_price, key=lambda x: x.current_price or 0)
+            best_price = float(best_listing.current_price or 0)
+            if hasattr(best_listing, "platform") and best_listing.platform:
+                best_platform = best_listing.platform.name.lower()
+            prices = [float(l.current_price) for l in listings_with_price if l.current_price]
+            if prices:
+                avg_price = sum(prices) / len(prices)
     
     price_trend = "stable"
     if avg_price and best_price:
@@ -76,7 +146,7 @@ async def get_product(
             price_trend = "up"
     
     response = ProductResponse(
-        id=product.id,
+        id=str(product.id),  # ✅ FIX: Convert UUID to string
         fingerprint=product.fingerprint,
         # ✅ NEW: Variant fingerprinting fields
         variant_fingerprint=product.variant_fingerprint,
@@ -96,8 +166,9 @@ async def get_product(
         ai_tags=ai_metadata.get("tags", []),
         created_at=product.created_at,
         listings=[
-            ProductListingResponse.model_validate(listing)
+            format_listing_response(listing, product)  # ✅ Use helper function with product data
             for listing in listings
+            if listing is not None  # ✅ CRITICAL: Filter None values
         ]
     )
     
@@ -135,10 +206,21 @@ async def get_price_history(
     # Get product listing - using JSONB price_history from ProductListing
     result = await db.execute(
         select(ProductListing)
-        .where(ProductListing.product_id == product_id)
-        .limit(1)
+        .where(
+            ProductListing.product_id == product_id,
+            ProductListing.in_stock == True
+        )
+        .options(selectinload(ProductListing.platform))
+        .order_by(ProductListing.last_scraped.desc().nullslast())
     )
-    listing = result.scalar_one_or_none()
+    all_listings = result.scalars().all()
+    listing = next(
+        (
+            l for l in all_listings
+            if l.platform and l.platform.name.lower() == platform.value and _is_listing_allowed(l)
+        ),
+        None,
+    )
     
     if not listing:
         raise HTTPException(
@@ -171,6 +253,9 @@ async def get_price_history(
     
     history_points.sort(key=lambda x: x.date)
     
+    # If no historical data exists, use fallback
+    has_historical_data = len([p for p in price_history_data if len(price_history_data) > 1]) > 0
+    
     if not history_points:
         history_points = [
             PriceHistoryPoint(
@@ -184,6 +269,12 @@ async def get_price_history(
     lowest_price = min(prices)
     highest_price = max(prices)
     average_price = sum(prices) / len(prices)
+    
+    # ✅ If only 1 data point, all three will be same - that's normal
+    logger.debug(
+        f"Price history for {product_id} on {platform}: "
+        f"Points: {len(history_points)}, Low: ₹{lowest_price}, High: ₹{highest_price}, Avg: ₹{average_price}"
+    )
     
     price_drop_percentage = None
     if highest_price > 0:

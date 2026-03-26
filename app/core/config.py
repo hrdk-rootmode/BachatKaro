@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     APP_NAME: str = "DealHunt"
     APP_VERSION: str = "1.0.0"
     ENVIRONMENT: str = Field(default="development")
-    DEBUG: bool = Field(default=True)
+    DEBUG: bool = Field(default=False)
+    SQL_ECHO: bool = Field(default=False)
     SECRET_KEY: str = Field(min_length=32)
     API_V1_PREFIX: str = "/api/v1"
     
@@ -161,6 +162,8 @@ class Settings(BaseSettings):
     # =============================================================================
     # SCRAPING
     # =============================================================================
+    MIN_LISTING_CONFIDENCE: float = 0.6
+    CROMA_ENABLED: bool = False
     PLAYWRIGHT_HEADLESS: bool = True
     SCRAPER_TIMEOUT: int = 30000  # milliseconds
     SCRAPER_MAX_RETRIES: int = 3

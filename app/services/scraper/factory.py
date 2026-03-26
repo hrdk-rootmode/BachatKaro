@@ -36,6 +36,7 @@ from app.services.scraper.base import (
     ProductCategory
 )
 from app.services.scraper.selector_cache import get_selector_cache
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,77 @@ class PlatformFactory:
     
     # Cache duration
     CACHE_DURATION_MINUTES = 30
+
+    # Baseline selector templates used when DB has empty selectors.
+    # Self-healing will refine these over time and persist improved values.
+    SELECTOR_TEMPLATES: Dict[str, Dict[str, str]] = {
+        "amazon": {
+            "search_product_container": "div[data-component-type='s-search-result']",
+            "product_title": "h2 a span",
+            "product_price": "span.a-price-whole",
+            "product_image": "img.s-image",
+            "product_rating": "span.a-icon-alt",
+            "review_count": "span.a-size-base.s-underline-text",
+            "product_url": "h2 a",
+            "brand": "h5.s-line-clamp-1",
+            "in_stock": "#availability",
+        },
+        "flipkart": {
+            "search_product_container": "div[data-id]",
+            "product_title": "a[title], div.KzDlHZ",
+            "product_price": "div.Nx9bqj, div._30jeq3",
+            "product_image": "img._53J4C-",
+            "product_rating": "div.XQDdHH, div._3LWZlK",
+            "review_count": "span.Wphh3N, span._2_R_DZ",
+            "product_url": "a.CGtC98, a._1fQZEK",
+            "brand": "div.syl9yP",
+            "in_stock": "div._16FRp0",
+        },
+        "myntra": {
+            "search_product_container": "li.product-base",
+            "product_title": "h3.product-brand, h4.product-product",
+            "product_price": "span.product-discountedPrice, span.product-price",
+            "product_image": "img.img-responsive",
+            "product_rating": "div.product-ratingsContainer span",
+            "review_count": "span.product-ratingsCount",
+            "product_url": "a",
+            "brand": "h3.product-brand",
+            "in_stock": "div.size-buttons-size-button",
+        },
+        "nykaa": {
+            "search_product_container": "div[id^='product-list-wrap'] a, div.css-1rd7vky",
+            "product_title": "div.css-xrzmfa, div.css-1hd2j4z",
+            "product_price": "span.css-111z9ua, span.css-17x46n5",
+            "product_image": "img",
+            "product_rating": "span.css-1j33oxj",
+            "review_count": "span.css-1jczs19",
+            "product_url": "a",
+            "brand": "div.css-1hd2j4z",
+            "in_stock": "button[type='button']",
+        },
+        "meesho": {
+            "search_product_container": "div[data-testid='product-card'], div.NewProductCardstyled__CardStyled-sc-6y2tys-0",
+            "product_title": "p[data-testid='product-card-title'], p.sc-eDvSVe",
+            "product_price": "h5[data-testid='product-card-price'], h5.sc-dkrFOg",
+            "product_image": "img",
+            "product_rating": "span[data-testid='product-card-rating'], span.sc-jSUZER",
+            "review_count": "span[data-testid='product-card-ratings-count']",
+            "product_url": "a",
+            "brand": "p[data-testid='product-card-title']",
+            "in_stock": "button, a",
+        },
+        "croma": {
+            "search_product_container": "div.product-item, li.product-item",
+            "product_title": "h3.product-title, a.product-title",
+            "product_price": "span.amount, span.final-price",
+            "product_image": "img",
+            "product_rating": "span.rating, div.rating",
+            "review_count": "span.review-count",
+            "product_url": "a[href*='/p/']",
+            "brand": "span.brand",
+            "in_stock": "button.add-to-cart",
+        },
+    }
     
     def __init__(self):
         """Initialize factory with auto-discovery and auto-integration"""
@@ -156,6 +228,7 @@ class PlatformFactory:
             f"{len(PlatformFactory._discovered)} platforms discovered, "
             f"{len(PlatformFactory._auto_integrated)} platforms auto-integrated with AI healing"
         )
+        self._log_platform_rollout_status()
     
     # =========================================================================
     # AUTO-DISCOVERY
@@ -323,6 +396,25 @@ class PlatformFactory:
     # =========================================================================
     # HANDLER CREATION
     # =========================================================================
+
+    def _is_platform_enabled(self, platform_name: str) -> bool:
+        """Apply rollout flags for temporarily paused platforms."""
+        if platform_name == "croma":
+            return bool(getattr(settings, "CROMA_ENABLED", False))
+        return True
+
+    def _log_platform_rollout_status(self):
+        """Log active vs paused platforms to make rollout state explicit at startup."""
+        discovered = sorted(PlatformFactory._discovered.keys())
+        if not discovered:
+            return
+
+        active = [p for p in discovered if self._is_platform_enabled(p)]
+        paused = [p for p in discovered if p not in active]
+
+        logger.info(f"🟢 Active platforms: {', '.join(active)}")
+        if paused:
+            logger.warning(f"⏸️ Paused platforms: {', '.join(paused)}")
     
     def get_handler_sync(
         self,
@@ -344,6 +436,9 @@ class PlatformFactory:
             # Handler has healing_engine and auto_healing_extraction!
         """
         platform_name = platform_name.lower().strip()
+
+        if not self._is_platform_enabled(platform_name):
+            raise ValueError(f"Platform '{platform_name}' is temporarily paused")
         
         # Check instance cache
         cache_key = f"{platform_name}_sync"
@@ -413,6 +508,9 @@ class PlatformFactory:
             handler = await factory.get_handler("amazon")
         """
         platform_name = platform_name.lower().strip()
+
+        if not self._is_platform_enabled(platform_name):
+            raise ValueError(f"Platform '{platform_name}' is temporarily paused")
         
         # Check cache first
         cache_key = f"{platform_name}_{'db' if db else 'sync'}_{force_type.value if force_type else 'auto'}"
@@ -420,7 +518,10 @@ class PlatformFactory:
         if not force_refresh and cache_key in PlatformFactory._instance_cache:
             if self._is_cache_valid(cache_key):
                 logger.debug(f"♻️ Returning cached handler for {platform_name}")
-                return PlatformFactory._instance_cache[cache_key]
+                cached = PlatformFactory._instance_cache[cache_key]
+                if db and hasattr(cached, "set_db_session"):
+                    cached.set_db_session(db)
+                return cached
         
         # Get scraper class
         scraper_class = self._get_scraper_class(platform_name)
@@ -460,6 +561,9 @@ class PlatformFactory:
         if not hasattr(handler, 'healing_engine'):
             logger.warning(f"⚠️ {platform_name} handler missing healing_engine, force-initializing")
             handler._initialize_healing_engine()
+
+        if db and hasattr(handler, "set_db_session"):
+            handler.set_db_session(db)
         
         # Cache it
         PlatformFactory._instance_cache[cache_key] = handler
@@ -558,11 +662,25 @@ class PlatformFactory:
         elif platform_name == "croma":
             affiliate_tag = getattr(settings, "AFFILIATE_CROMA_ID", None)
         
-        # Get cached selectors from file
-        cached_selectors = self._selector_cache.get_all(platform_name)
+        # Get cached selectors from file and normalize {field: {selector:..}} -> {field: selector}
+        cached_raw = self._selector_cache.get_all(platform_name)
+        cached_selectors = {}
+        for key, value in cached_raw.items():
+            if isinstance(value, dict):
+                selector = value.get("selector")
+                if selector:
+                    cached_selectors[key] = selector
+            elif isinstance(value, str):
+                cached_selectors[key] = value
         
-        # Merge with metadata selectors
-        selectors = {**metadata.get("selectors", {}), **cached_selectors}
+        template_selectors = self.SELECTOR_TEMPLATES.get(platform_name, {})
+
+        # Merge order: templates -> metadata selectors -> healed cache
+        selectors = {
+            **template_selectors,
+            **metadata.get("selectors", {}),
+            **cached_selectors,
+        }
         
         return PlatformConfig(
             id=0,  # Dummy ID for no-db mode
@@ -595,6 +713,34 @@ class PlatformFactory:
                 return None
             
             selectors = platform.selectors or {}
+            template_selectors = self.SELECTOR_TEMPLATES.get(platform_name, {})
+            metadata_selectors = self._get_platform_metadata(platform_name).get("selectors", {})
+
+            # Normalize healed selectors from file cache
+            cached_raw = self._selector_cache.get_all(platform_name)
+            cached_selectors = {}
+            for key, value in cached_raw.items():
+                if isinstance(value, dict):
+                    selector = value.get("selector")
+                    if selector:
+                        cached_selectors[key] = selector
+                elif isinstance(value, str):
+                    cached_selectors[key] = value
+
+            merged_selectors = {
+                **template_selectors,
+                **metadata_selectors,
+                **selectors,
+                **cached_selectors,
+            }
+
+            if merged_selectors != selectors:
+                platform.selectors = merged_selectors
+                await db.commit()
+                selectors = merged_selectors
+                logger.info(
+                    f"🧩 Bootstrapped selectors for {platform_name}: {len(selectors)} fields"
+                )
             
             return PlatformConfig(
                 id=platform.id,
@@ -609,6 +755,10 @@ class PlatformFactory:
             )
         except Exception as e:
             logger.error(f"❌ Error loading platform config from DB: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             return None
     
     # =========================================================================

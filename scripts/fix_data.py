@@ -269,6 +269,91 @@ def has_specs_in_title_but_empty(title: str, specs: Dict) -> bool:
     return False
 
 
+def infer_subcategory_from_title(title: str, category: Optional[str], specs: Optional[Dict[str, Any]] = None) -> str:
+    """Heuristic subcategory inference used for backfilling null subcategory."""
+    title_lower = (title or "").lower()
+    category_lower = (category or "").lower().strip()
+    specs = specs or {}
+
+    if any(k in title_lower for k in ["cover", "case", "tempered glass", "screen guard", "charger", "cable", "power bank"]):
+        return "Mobile Accessories"
+    if any(k in title_lower for k in ["laptop sleeve", "laptop bag", "mouse", "keyboard", "dock", "usb hub"]):
+        return "Laptop Accessories"
+
+    if category_lower == "electronics":
+        if any(k in title_lower for k in ["iphone", "smartphone", "mobile", "5g phone"]):
+            return "Mobiles"
+        if any(k in title_lower for k in ["laptop", "notebook", "macbook"]):
+            return "Laptops"
+        if any(k in title_lower for k in ["tablet", "ipad", "tab "]):
+            return "Tablets"
+        if any(k in title_lower for k in ["smartwatch", "watch", "band"]):
+            return "Wearables"
+        if any(k in title_lower for k in ["headphone", "earbud", "earphone", "speaker"]):
+            return "Audio"
+        if "screen_size" in specs and float(specs.get("screen_size") or 0) >= 30:
+            return "Televisions"
+        return "Other Electronics"
+
+    if category_lower == "fashion":
+        if any(k in title_lower for k in ["tshirt", "t-shirt", "shirt", "kurta", "top", "dress", "saree"]):
+            return "Apparel"
+        if any(k in title_lower for k in ["jeans", "trouser", "pants", "palazzo", "leggings"]):
+            return "Bottomwear"
+        if any(k in title_lower for k in ["sneaker", "shoes", "sandals", "chappal", "heels", "loafers"]):
+            return "Footwear"
+        if any(k in title_lower for k in ["handbag", "wallet", "belt", "ring", "earring", "necklace", "bracelet", "watch"]):
+            return "Fashion Accessories"
+        return "Other Fashion"
+
+    if category_lower == "home & kitchen":
+        if any(k in title_lower for k in ["mixer", "grinder", "air fryer", "pressure cooker", "cookware", "kettle", "gas stove"]):
+            return "Kitchen Appliances"
+        if any(k in title_lower for k in ["bedsheet", "curtain", "blanket", "pillow"]):
+            return "Home Furnishing"
+        if any(k in title_lower for k in ["organizer", "storage", "basket", "rack"]):
+            return "Home Organization"
+        return "Other Home & Kitchen"
+
+    if category_lower == "accessories":
+        if any(k in title_lower for k in ["cover", "case", "tempered", "charger", "cable", "power bank"]):
+            return "Mobile Accessories"
+        if any(k in title_lower for k in ["sleeve", "mouse", "keyboard", "dock", "hub", "webcam"]):
+            return "Laptop Accessories"
+        if any(k in title_lower for k in ["backpack", "bag", "wallet", "belt"]):
+            return "Bags & Wallets"
+        return "Other Accessories"
+
+    if category_lower == "books":
+        if any(k in title_lower for k in ["python", "programming", "system design", "machine learning"]):
+            return "Technology"
+        if any(k in title_lower for k in ["upsc", "jee", "neet", "exam"]):
+            return "Exam Preparation"
+        if any(k in title_lower for k in ["fiction", "novel", "story"]):
+            return "Fiction"
+        if any(k in title_lower for k in ["business", "biography", "self help"]):
+            return "Non-Fiction"
+        return "General Books"
+
+    if category_lower == "beauty":
+        if any(k in title_lower for k in ["lipstick", "foundation", "serum", "cream", "face wash", "makeup"]):
+            return "Makeup & Skincare"
+        if any(k in title_lower for k in ["shampoo", "conditioner", "hair", "oil"]):
+            return "Hair Care"
+        if any(k in title_lower for k in ["perfume", "deodorant", "fragrance"]):
+            return "Fragrances"
+        return "Other Beauty"
+
+    if category_lower == "sports":
+        if any(k in title_lower for k in ["running", "shoes", "sneakers"]):
+            return "Sports Footwear"
+        if any(k in title_lower for k in ["cricket", "bat", "football", "gym", "yoga"]):
+            return "Sports Equipment"
+        return "Other Sports"
+
+    return "General"
+
+
 # =============================================================================
 # COMPREHENSIVE SCANNER
 # =============================================================================
@@ -1003,6 +1088,64 @@ async def fix_ai_metadata(limit: int = 100, dry_run: bool = False) -> Dict[str, 
     return stats
 
 
+async def fix_subcategories(limit: int = 500, dry_run: bool = False) -> Dict[str, int]:
+    """Backfill null/blank subcategory values from title + category heuristics."""
+    header(f"[SUBCAT] Fixing Subcategories (limit={limit}, dry_run={dry_run})")
+
+    stats = {
+        "scanned": 0,
+        "updated": 0,
+        "already_present": 0,
+        "errors": 0,
+    }
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(Product)
+            .where(or_(Product.subcategory == None, Product.subcategory == ""))
+            .limit(limit)
+        )
+        products = result.scalars().all()
+
+        print(f"\n   Found {len(products)} products with null subcategory\n")
+
+        batch = 0
+        for i, product in enumerate(products, 1):
+            stats["scanned"] += 1
+
+            try:
+                if product.subcategory and str(product.subcategory).strip():
+                    stats["already_present"] += 1
+                    continue
+
+                inferred = infer_subcategory_from_title(
+                    title=product.title,
+                    category=product.category,
+                    specs=product.specifications or {},
+                )
+
+                print(f"   [{i}] {product.title[:55]}...")
+                ok(f"subcategory -> {inferred}")
+
+                if not dry_run:
+                    product.subcategory = inferred
+
+                stats["updated"] += 1
+                batch += 1
+
+                if batch >= 50 and not dry_run:
+                    await db.commit()
+                    batch = 0
+            except Exception as e:
+                stats["errors"] += 1
+                err(f"[{i}] Error: {e}")
+
+        if not dry_run and batch > 0:
+            await db.commit()
+
+    return stats
+
+
 async def delete_garbage_products(dry_run: bool = False) -> Dict[str, int]:
     """
     Delete products that are complete garbage or unfixable.
@@ -1129,6 +1272,10 @@ async def main(args):
     if args.fix_ai or args.fix_all:
         r = await fix_ai_metadata(limit=args.limit // 2, dry_run=args.dry_run)
         print_fix_summary("AI RE-ENRICHMENT", r)
+
+    if args.fix_subcategories or args.fix_all:
+        r = await fix_subcategories(limit=args.limit * 2, dry_run=args.dry_run)
+        print_fix_summary("SUBCATEGORY BACKFILL", r)
     
     if args.delete_garbage:
         r = await delete_garbage_products(dry_run=args.dry_run)
@@ -1151,6 +1298,7 @@ if __name__ == "__main__":
     parser.add_argument("--fix-specs", action="store_true", help="Extract specs from titles")
     parser.add_argument("--fix-images", action="store_true", help="Fix image URLs")
     parser.add_argument("--fix-ai", action="store_true", help="Re-enrich with AI")
+    parser.add_argument("--fix-subcategories", action="store_true", help="Backfill null subcategory")
     parser.add_argument("--delete-garbage", action="store_true", help="Delete unfixable products")
     parser.add_argument("--dry-run", action="store_true", help="Preview without saving")
     parser.add_argument("--limit", type=int, default=200, help="Batch size")
@@ -1159,7 +1307,7 @@ if __name__ == "__main__":
     
     # Default to scan if nothing specified
     if not any([args.fix_all, args.fix_brands, args.fix_specs, 
-                args.fix_images, args.fix_ai, args.delete_garbage,
+            args.fix_images, args.fix_ai, args.fix_subcategories, args.delete_garbage,
                 args.health_score]):
         args.scan = True
     

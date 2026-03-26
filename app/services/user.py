@@ -54,7 +54,8 @@ class UserService:
     @staticmethod
     async def create_from_firebase_token(
         db: AsyncSession,
-        token_data: dict
+        token_data: dict,
+        hardware_id: str = "auto_created"
     ) -> Optional[User]:
         """
         Auto-create user from verified Firebase token data
@@ -72,6 +73,7 @@ class UserService:
                 - email: User email
                 - name: User display name (optional)
                 - picture: User photo URL (optional)
+            hardware_id: Hardware ID from device (default: "auto_created")
         
         Returns:
             New User object if created successfully, None if disabled
@@ -129,7 +131,7 @@ class UserService:
                 photo_url=token_data.get('picture'),
                 plan=settings.AUTO_USER_DEFAULT_PLAN,
                 referral_code=referral_code,
-                hardware_id="auto_created",
+                hardware_id=hardware_id,
                 is_blocked=False,
                 # Set default values explicitly
                 notification_preferences={

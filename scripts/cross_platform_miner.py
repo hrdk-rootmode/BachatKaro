@@ -122,6 +122,7 @@ class MinerConfig:
     # AI Settings
     MAX_AI_CALLS_PER_PLATFORM = 3
     MIN_AI_CONFIDENCE_SCORE = 0.90
+    GOOD_FUZZY_NO_AI_THRESHOLD = 0.90
     
     # Scraping Settings
     SCRAPE_TIMEOUT = max(10, int(settings.SCRAPER_TIMEOUT / 1000))
@@ -651,6 +652,30 @@ ACCESSORY_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+ACCESSORY_KIND_PATTERNS = {
+    'cover': re.compile(r'\b(cover|case|back\s*cover|flip\s*cover|wallet\s*case|bumper|skin)\b', re.IGNORECASE),
+    'screen_protector': re.compile(r'\b(screen\s*guard|screen\s*protector|tempered\s*glass|lens\s*protector|camera\s*protector)\b', re.IGNORECASE),
+    'charger_cable': re.compile(r'\b(charger|adapter|cable|cord|wireless\s*charger|car\s*charger)\b', re.IGNORECASE),
+    'holder_mount': re.compile(r'\b(holder|stand|mount|grip|ring\s*holder|kickstand)\b', re.IGNORECASE),
+    'audio_accessory': re.compile(r'\b(earbud\s*case|headphone\s*case|audio\s*cable)\b', re.IGNORECASE),
+}
+
+PRODUCT_TYPE_PATTERNS = {
+    'phone': re.compile(r'\b(phone|smartphone|iphone|mobile|galaxy\s*s\d+|pixel\s*\d+|oneplus)\b', re.IGNORECASE),
+    'laptop': re.compile(r'\b(laptop|notebook|macbook|thinkpad|ideapad|vivobook|zenbook)\b', re.IGNORECASE),
+    'tablet': re.compile(r'\b(tablet|ipad|tab)\b', re.IGNORECASE),
+    'watch': re.compile(r'\b(smart\s*watch|watch|fitness\s*band)\b', re.IGNORECASE),
+    'tv': re.compile(r'\b(tv|television|oled|qled|smart\s*tv)\b', re.IGNORECASE),
+    'earbuds': re.compile(r'\b(earbuds|earphones|headphones|airpods|neckband)\b', re.IGNORECASE),
+    'shirt': re.compile(r'\b(t[\s\-]?shirt|shirt|polo)\b', re.IGNORECASE),
+    'jeans': re.compile(r'\b(jeans|denim)\b', re.IGNORECASE),
+    'dress': re.compile(r'\b(dress|gown)\b', re.IGNORECASE),
+    'kurti': re.compile(r'\b(kurti|kurta|saree)\b', re.IGNORECASE),
+    'shoes': re.compile(r'\b(shoes|sneakers|sandals|slippers|loafers)\b', re.IGNORECASE),
+    'book': re.compile(r'\b(book|paperback|hardcover|kindle\s*edition)\b', re.IGNORECASE),
+    'appliance': re.compile(r'\b(refrigerator|fridge|washing\s*machine|air\s*fryer|mixer|grinder|microwave)\b', re.IGNORECASE),
+}
+
 # Refurbished patterns
 REFURBISHED_PATTERNS = re.compile(
     r'\b('
@@ -769,6 +794,7 @@ GARMENT_TYPE_PATTERNS = re.compile(
     r'T[\s\-]?Shirt|Tshirt|Shirt|Top|Blouse|Kurti|Kurta|'
     r'Dress|Gown|Maxi|Mini|Midi|A[\s\-]?Line|'
     r'Jeans|Trousers|Pants|Shorts|Skirt|Leggings|Jeggings|'
+    r'Shoes|Sneakers|Sandals|Slippers|Loafers|Heels|Boots|'
     r'Saree|Sari|Lehenga|Salwar|Suit|'
     r'Jacket|Blazer|Coat|Sweater|Sweatshirt|Hoodie|Cardigan|'
     r'Tracksuit|Joggers|Activewear|Sportswear'
@@ -854,6 +880,15 @@ def extract_product_line(title: str, brand: Optional[str] = None) -> Optional[st
     match = GENERIC_PRODUCT_LINE_PATTERN.search(title)
     if match:
         return match.group(1).strip()
+
+    # Structured fallback for common line-series terms.
+    generic = re.search(
+        r'\b(?:series|line|edition|collection)\s+([A-Za-z0-9][A-Za-z0-9\-]{1,24})\b',
+        title,
+        re.IGNORECASE,
+    )
+    if generic:
+        return generic.group(1).strip()
     
     return None
 
@@ -879,6 +914,13 @@ def extract_model(title: str, brand: Optional[str] = None) -> Optional[str]:
         )
         if match:
             return match.group(1).strip()
+
+    # Generic fallback (e.g. SM-S928B, MZB0..., WH-1000XM5).
+    fallback = re.search(r'\b([A-Z]{1,4}[\-]?[A-Z0-9]{2,}[A-Z0-9\-]*)\b', title)
+    if fallback:
+        candidate = fallback.group(1).strip()
+        if any(ch.isdigit() for ch in candidate) and len(candidate) >= 4:
+            return candidate
     
     return None
 
@@ -1080,6 +1122,33 @@ def is_refurbished(title: str) -> bool:
     return bool(REFURBISHED_PATTERNS.search(title)) if title else False
 
 
+def get_accessory_kind(title: str) -> Optional[str]:
+    """Classify accessory subtype to block cover-vs-charger mismatches."""
+    if not title:
+        return None
+
+    for kind, pattern in ACCESSORY_KIND_PATTERNS.items():
+        if pattern.search(title):
+            return kind
+
+    return None
+
+
+def detect_product_type(title: str, specs: Optional[ProductSpecs] = None) -> Optional[str]:
+    """Infer concrete product type from title/specs."""
+    if not title:
+        return "accessory" if specs and specs.is_accessory else None
+
+    for product_type, pattern in PRODUCT_TYPE_PATTERNS.items():
+        if pattern.search(title):
+            return product_type
+
+    if specs and specs.is_accessory:
+        return "accessory"
+
+    return None
+
+
 def is_junk_title(title: str) -> bool:
     """Check if title is a junk/status message."""
     if not title:
@@ -1109,6 +1178,20 @@ def determine_category_type(category: Optional[str], title: str) -> ProductCateg
     
     category_lower = category.lower()
     title_lower = title.lower()
+
+    # Resolve watches before generic electronics accessory terms to avoid
+    # classifying smartwatch bands/straps as pure electronics.
+    if any(x in category_lower for x in ['watch', 'wearable']):
+        return ProductCategoryType.WATCHES
+    if any(x in title_lower for x in ['smartwatch', 'smart watch', 'fitness band', 'watch']):
+        return ProductCategoryType.WATCHES
+
+    # Accessories that are primarily electronics should be treated as electronics.
+    if any(x in title_lower for x in [
+        'power bank', 'charger', 'usb', 'type c', 'cable', 'earbuds', 'earphones',
+        'headphone', 'bluetooth speaker', 'back cover', 'phone case', 'tempered glass'
+    ]):
+        return ProductCategoryType.ELECTRONICS
     
     # Electronics
     if any(x in category_lower for x in ['phone', 'mobile', 'laptop', 'computer', 'tablet', 'electronics']):
@@ -1116,14 +1199,8 @@ def determine_category_type(category: Optional[str], title: str) -> ProductCateg
     if any(x in title_lower for x in ['smartphone', 'laptop', 'tablet', 'iphone', 'galaxy', 'pixel', 'macbook']):
         return ProductCategoryType.ELECTRONICS
     
-    # Watches
-    if any(x in category_lower for x in ['watch', 'wearable']):
-        return ProductCategoryType.WATCHES
-    if any(x in title_lower for x in ['smartwatch', 'smart watch', 'fitness band', 'watch']):
-        return ProductCategoryType.WATCHES
-    
     # Fashion
-    if any(x in category_lower for x in ['fashion', 'clothing', 'apparel', 'footwear', 'accessories']):
+    if any(x in category_lower for x in ['fashion', 'clothing', 'apparel', 'footwear']):
         return ProductCategoryType.FASHION
     if any(x in title_lower for x in ['shirt', 'dress', 'jeans', 'kurta', 'saree', 'shoes', 'sneakers']):
         return ProductCategoryType.FASHION
@@ -1276,7 +1353,9 @@ def check_quality_gate(
     
     # Fashion: need garment type at minimum
     if category_type == ProductCategoryType.FASHION:
-        if not specs.garment_type and identity_score < 3:
+        fashion_keywords = ['shoes', 'sneakers', 'sandals', 'slippers', 'loafers', 'heels', 'boot']
+        has_fashion_keyword = any(x in title.lower() for x in fashion_keywords)
+        if not specs.garment_type and not has_fashion_keyword and identity_score < 3:
             return QualityGateResult(
                 False,
                 "Fashion: No garment type detected",
@@ -1309,78 +1388,101 @@ def generate_search_query(
     
     # Build query parts using ORIGINAL brand (not normalized)
     parts = []
+    seen = set()
+
+    def append_unique(value: Optional[str]):
+        if not value:
+            return
+        token = str(value).strip()
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        parts.append(token)
     
     # Use original brand for search (POCO, not Xiaomi)
     if specs.original_brand:
-        parts.append(specs.original_brand)
+        append_unique(specs.original_brand)
     elif specs.brand:
-        parts.append(specs.brand)
+        append_unique(specs.brand)
     
     # Add product line (Phoenix, Hunter, Galaxy S, etc.)
     if specs.product_line:
-        parts.append(specs.product_line)
+        append_unique(specs.product_line)
     
     # Add model number
     if specs.model:
-        parts.append(specs.model)
+        append_unique(specs.model)
     
     # Add variant
     if specs.generation:
-        parts.append(specs.generation)
+        append_unique(specs.generation)
+
+    # Add fashion identity terms early to avoid weak queries like "Blue solid men".
+    if specs.category_type == ProductCategoryType.FASHION:
+        if specs.garment_type:
+            append_unique(specs.garment_type)
+        if specs.material:
+            append_unique(specs.material)
     
     # Platform-specific additions
     if target_platform == "meesho":
         # Meesho: simpler queries
         if len(parts) < 2 and essence:
-            parts = essence.split()[:3]
+            for token in essence.split()[:3]:
+                append_unique(token)
         return " ".join(parts[:4])
     
     elif target_platform == "flipkart":
         # Flipkart: brand + product-line + key spec
         if specs.storage_gb and specs.category_type == ProductCategoryType.ELECTRONICS:
-            parts.append(f"{specs.storage_gb}GB")
+            append_unique(f"{specs.storage_gb}GB")
         if len(parts) < 3 and essence:
             # Add words from essence to reach minimum
             essence_words = essence.split()
             for w in essence_words:
-                if w.lower() not in ' '.join(parts).lower():
-                    parts.append(w)
-                    if len(parts) >= 3:
-                        break
+                append_unique(w)
+                if len(parts) >= 3:
+                    break
         return " ".join(parts[:max_words])
     
     elif target_platform == "myntra":
         # Myntra: fashion-focused
         if specs.category_type == ProductCategoryType.FASHION:
             if specs.garment_type:
-                parts.append(specs.garment_type)
+                append_unique(specs.garment_type)
             if specs.gender:
-                parts.insert(0, specs.gender)  # Gender first for fashion
+                gender = specs.gender.strip()
+                if gender and gender.lower() not in seen:
+                    parts.insert(0, gender)  # Gender first for fashion
+                    seen.add(gender.lower())
         return " ".join(parts[:5])
     
     else:
         # Amazon / default: specific query
         if specs.storage_gb:
-            parts.append(f"{specs.storage_gb}GB")
+            append_unique(f"{specs.storage_gb}GB")
         if specs.network:
-            parts.append(specs.network)
+            append_unique(specs.network)
         if specs.color:
-            parts.append(specs.color)
+            append_unique(specs.color)
     
     # Ensure minimum words
     if len(parts) < 3:
         if essence:
-            essence_words = [w for w in essence.split() 
-                          if w.lower() not in ' '.join(parts).lower()]
-            parts.extend(essence_words[:3 - len(parts)])
+            for w in essence.split():
+                append_unique(w)
+                if len(parts) >= 3:
+                    break
         else:
             # Fallback to title words
             title_words = re.findall(r'\b[a-zA-Z0-9]+\b', product.title)
             for w in title_words[:5]:
-                if w.lower() not in ' '.join(parts).lower():
-                    parts.append(w)
-                    if len(parts) >= 4:
-                        break
+                append_unique(w)
+                if len(parts) >= 4:
+                    break
     
     return " ".join(parts[:max_words])
 
@@ -1413,6 +1515,8 @@ def filter_junk_results(products: List[ProductData]) -> Tuple[List[ProductData],
 def tier1_spec_reject(
     source: ProductSpecs,
     target: ProductSpecs,
+    source_title: str = "",
+    target_title: str = "",
     source_is_accessory_category: bool = False,
 ) -> Tuple[bool, str, MatchResult]:
     """
@@ -1427,9 +1531,23 @@ def tier1_spec_reject(
     
     Returns: (passed, reason, result)
     """
+    source_type = detect_product_type(source_title, source)
+    target_type = detect_product_type(target_title, target)
+
     # Reject accessories (but not if source is same category)
     if target.is_accessory and not source_is_accessory_category:
         return (False, f"Accessory: '{target.raw_title[:40]}...'", MatchResult.ACCESSORY_REJECTED)
+
+    # Accessory subtype mismatch (e.g., cover vs charger).
+    if source.is_accessory and target.is_accessory:
+        source_kind = get_accessory_kind(source_title)
+        target_kind = get_accessory_kind(target_title)
+        if source_kind and target_kind and source_kind != target_kind:
+            return (False, f"Accessory kind mismatch: {source_kind} vs {target_kind}", MatchResult.SPECS_MISMATCH)
+
+    # Cross-type mismatch (phone vs laptop, shirt vs shoes, etc.).
+    if source_type and target_type and source_type != target_type:
+        return (False, f"Product type mismatch: {source_type} vs {target_type}", MatchResult.SPECS_MISMATCH)
     
     # Reject refurbished vs new
     if target.is_refurbished and not source.is_refurbished:
@@ -2121,7 +2239,9 @@ async def scrape_platform(
             passed, reason, tier1_result = tier1_spec_reject(
                 source_specs, 
                 target_specs,
-                source_is_accessory_category
+                source_title=source_specs.full_title,
+                target_title=s_title,
+                source_is_accessory_category=source_is_accessory_category,
             )
             
             if not passed:
@@ -2147,8 +2267,13 @@ async def scrape_platform(
             # TIER 3: AI verification
             final_score = score
             ai_verified = False
-            
-            if use_ai and ai_calls < MinerConfig.MAX_AI_CALLS_PER_PLATFORM:
+
+            # High-confidence fuzzy matches can pass without AI to reduce AI load.
+            should_call_ai = use_ai and ai_calls < MinerConfig.MAX_AI_CALLS_PER_PLATFORM
+            if score >= MinerConfig.GOOD_FUZZY_NO_AI_THRESHOLD:
+                should_call_ai = False
+
+            if should_call_ai:
                 ai_calls += 1
                 result.ai_calls += 1
                 
@@ -2237,6 +2362,17 @@ async def scrape_platform(
                 f"On Windows, Playwright subprocess creation is limited."
             )
         return result
+    except ValueError as e:
+        msg = str(e)
+        if "temporarily paused" in msg.lower():
+            result.error = msg
+            logger.info(f"[{platform_name}] Skipped: {msg}")
+            return result
+
+        result.error = msg[:60]
+        stats.errors += 1
+        logger.exception(f"[{platform_name}] Search error: {query}")
+        return result
     except Exception as e:
         result.error = str(e)[:60]
         stats.errors += 1
@@ -2278,6 +2414,10 @@ async def process_orphan_products(
     if category_filter:
         print(f"  Category: {category_filter}")
     print(f"{'=' * 70}\n")
+
+    if target_platforms and ("croma" in target_platforms) and not getattr(settings, "CROMA_ENABLED", False):
+        print("⚠️ Croma requested but currently paused (CROMA_ENABLED=false). Skipping croma.")
+        target_platforms = [p for p in target_platforms if p != "croma"]
     
     stats = MiningStats()
     
@@ -2336,6 +2476,10 @@ async def process_orphan_products(
             
             available = ProductCategory.get_platforms_for_category(cat_enum)
             available = [p for p in available if p in MinerConfig.SUPPORTED_PLATFORMS]
+
+            # Respect rollout flag for paused platforms.
+            if not getattr(settings, "CROMA_ENABLED", False):
+                available = [p for p in available if p != "croma"]
             
             # Exclude source platform
             if existing_platform and existing_platform in available:
@@ -2392,34 +2536,74 @@ async def process_orphan_products(
                 print(f"  📊 Identity Score: {quality_result.identity_score}/10")
             
             # Process each platform
-            for platform_name in available:
-                stats.platforms_scraped[platform_name] = stats.platforms_scraped.get(platform_name, 0) + 1
-                
-                query = generate_search_query(db_product, platform_name, source_specs)
-                print(f"\n  🌐 {platform_name.upper()} → '{query}'")
-                
-                platform_result = await scrape_platform(
-                    platform_name=platform_name,
-                    query=query,
-                    db=db,
-                    source_specs=source_specs,
-                    source_essence=source_essence,
-                    db_product=db_product,
-                    use_ai=use_ai,
-                    min_score=min_score,
-                    verbose=verbose,
-                    stats=stats,
-                    source_is_accessory_category=source_is_accessory_category,
+            if parallel and len(available) > 1:
+                platform_queries = []
+                for platform_name in available:
+                    stats.platforms_scraped[platform_name] = stats.platforms_scraped.get(platform_name, 0) + 1
+                    query = generate_search_query(db_product, platform_name, source_specs)
+                    platform_queries.append((platform_name, query))
+                    print(f"\n  🌐 {platform_name.upper()} → '{query}'")
+
+                semaphore = asyncio.Semaphore(MinerConfig.MAX_CONCURRENT_PLATFORMS)
+
+                async def run_one(platform_name: str, query: str) -> PlatformResult:
+                    async with semaphore:
+                        return await scrape_platform(
+                            platform_name=platform_name,
+                            query=query,
+                            db=db,
+                            source_specs=source_specs,
+                            source_essence=source_essence,
+                            db_product=db_product,
+                            use_ai=use_ai,
+                            min_score=min_score,
+                            verbose=verbose,
+                            stats=stats,
+                            source_is_accessory_category=source_is_accessory_category,
+                        )
+
+                platform_results = await asyncio.gather(
+                    *(run_one(platform_name, query) for platform_name, query in platform_queries)
                 )
-                
-                if platform_result.error:
-                    print(f"    ⚠️ {platform_result.error}")
-                elif platform_result.success:
-                    print(f"    📥 {platform_result.candidates_checked} candidates")
-                    if platform_result.pre_filtered > 0 and verbose:
-                        print(f"    🚫 Pre-filtered: {platform_result.pre_filtered}")
-                    if not platform_result.match_found:
-                        print(f"    ❌ No match on {platform_name}")
+
+                for platform_result in platform_results:
+                    if platform_result.error:
+                        print(f"    ⚠️ {platform_result.error}")
+                    elif platform_result.success:
+                        print(f"    📥 {platform_result.candidates_checked} candidates")
+                        if platform_result.pre_filtered > 0 and verbose:
+                            print(f"    🚫 Pre-filtered: {platform_result.pre_filtered}")
+                        if not platform_result.match_found:
+                            print(f"    ❌ No match on {platform_result.platform}")
+            else:
+                for platform_name in available:
+                    stats.platforms_scraped[platform_name] = stats.platforms_scraped.get(platform_name, 0) + 1
+
+                    query = generate_search_query(db_product, platform_name, source_specs)
+                    print(f"\n  🌐 {platform_name.upper()} → '{query}'")
+
+                    platform_result = await scrape_platform(
+                        platform_name=platform_name,
+                        query=query,
+                        db=db,
+                        source_specs=source_specs,
+                        source_essence=source_essence,
+                        db_product=db_product,
+                        use_ai=use_ai,
+                        min_score=min_score,
+                        verbose=verbose,
+                        stats=stats,
+                        source_is_accessory_category=source_is_accessory_category,
+                    )
+
+                    if platform_result.error:
+                        print(f"    ⚠️ {platform_result.error}")
+                    elif platform_result.success:
+                        print(f"    📥 {platform_result.candidates_checked} candidates")
+                        if platform_result.pre_filtered > 0 and verbose:
+                            print(f"    🚫 Pre-filtered: {platform_result.pre_filtered}")
+                        if not platform_result.match_found:
+                            print(f"    ❌ No match on {platform_name}")
             
             # Browser cleanup between products
             try:
@@ -2456,20 +2640,66 @@ def parse_platforms(s: str) -> Optional[List[str]]:
     for p in platforms:
         if p not in valid:
             raise ValueError(f"Invalid platform: {p}. Valid: {', '.join(valid)}")
+
+    if not getattr(settings, "CROMA_ENABLED", False) and "croma" in platforms:
+        logger.warning("Croma is paused (CROMA_ENABLED=false). It will be skipped.")
+
     return platforms
 
 
-def setup_logging(debug: bool = False):
+def setup_logging(debug: bool = False, quiet: bool = False):
     """Setup logging configuration."""
-    log_level = logging.DEBUG if debug else getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO)
+    if debug:
+        log_level = logging.DEBUG
+    elif quiet:
+        log_level = logging.WARNING
+    else:
+        log_level = getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO)
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
     )
     if not debug:
         # Suppress SQLAlchemy logs
-        logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
-        logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
+        for name in ['sqlalchemy.engine', 'sqlalchemy.engine.Engine', 'sqlalchemy.pool']:
+            lgr = logging.getLogger(name)
+            lgr.setLevel(logging.WARNING)
+            lgr.propagate = False
+            lgr.disabled = True
+
+        # Suppress noisy scraper/platform logs for cleaner miner output.
+        noisy_loggers = [
+            'app.services.scraper',
+            'app.services.scraper.factory',
+            'app.services.scraper.browser',
+            'app.services.scraper.selector_cache',
+            'app.services.scraper.rate_limiter',
+            'app.services.scraper.self_healing',
+            'app.services.ai.groq_client',
+            'app.core.redis_client',
+            'httpx',
+            'httpcore',
+            'urllib3',
+            'aiohttp',
+            'platforms',
+            'platforms.amazon',
+            'platforms.flipkart',
+            'platforms.meesho',
+            'platforms.myntra',
+            'platforms.nykaa',
+            'platforms.croma',
+        ]
+        noisy_level = logging.ERROR if quiet else logging.WARNING
+        for name in noisy_loggers:
+            logging.getLogger(name).setLevel(noisy_level)
+
+        # Also disable engine echo chatter when app runs in DEBUG mode.
+        try:
+            from app.core.database import engine as db_engine
+            db_engine.echo = False
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -2500,7 +2730,7 @@ Examples:
     args = parser.parse_args()
     
     # Setup logging
-    setup_logging(args.debug)
+    setup_logging(debug=args.debug, quiet=args.quiet)
     
     tp = None
     if args.platforms:

@@ -199,7 +199,7 @@ class NykaaScraper(BasePlatformHandler):
         return products
     
     def _parse_product_item(self, item: Dict[str, Any]) -> Optional[ProductData]:
-        """Parse single product from JSON"""
+        """Parse single product from JSON with confidence"""
         try:
             product_id = str(item.get('id') or item.get('productId') or item.get('sku') or '')
             if not product_id:
@@ -229,13 +229,38 @@ class NykaaScraper(BasePlatformHandler):
                 item.get('thumbnail') or
                 item.get('primaryImage')
             )
-            
-            # Brand
+
+            # Brand with confidence
             brand = item.get('brandName') or item.get('brand') or ''
+            brand_confidence = 0.90 if brand else 0.0
+            brand_source = "api" if brand else None
+
+            # Color/Shade with confidence
+            color = None
+            color_confidence = 0.0
+            color_source = None
+
+            shades = item.get('shades') or item.get('variants') or []
+            if shades and isinstance(shades, list):
+                shade_info = shades[0] if isinstance(shades[0], dict) else {}
+                color = shade_info.get('name') or shade_info.get('shade') or shade_info.get('color')
+                if color:
+                    color_confidence = 0.88
+                    color_source = "api"
+
+            if not color:
+                color = item.get('shade') or item.get('color') or item.get('variant')
+                if color:
+                    color_confidence = 0.85
+                    color_source = "api"
             
             # Rating
             rating = item.get('rating') or item.get('averageRating')
             review_count = item.get('reviewCount') or item.get('ratingCount')
+            try:
+                parsed_review_count = int(str(review_count).replace(',', '').strip()) if review_count is not None else None
+            except (TypeError, ValueError):
+                parsed_review_count = None
             
             # URL
             slug = item.get('slug') or item.get('productUrl') or ''
@@ -244,7 +269,7 @@ class NykaaScraper(BasePlatformHandler):
             else:
                 product_url = f"{self.BASE_URL}/p/{product_id}"
             
-            return ProductData(
+            product = ProductData(
                 external_id=product_id,
                 title=title.strip()[:200],
                 current_price=Decimal(str(price)),
@@ -252,14 +277,21 @@ class NykaaScraper(BasePlatformHandler):
                 product_url=self.build_affiliate_url(product_url),
                 platform_name="nykaa",
                 image_url=image_url,
-                brand=brand,
                 rating=float(rating) if rating else None,
-                review_count=int(review_count) if review_count else None,
+                review_count=parsed_review_count,
                 category="Beauty",
                 in_stock=True,
                 extraction_method=ExtractionMethod.API_INTERCEPTED,
                 data_source=HandlerType.SCRAPER
             )
+
+            if brand:
+                product.set_attribute_with_confidence("brand", brand, brand_source, brand_confidence)
+
+            if color:
+                product.set_attribute_with_confidence("color", color, color_source, color_confidence)
+
+            return product
         
         except Exception as e:
             logger.debug(f"Parse product error: {e}")
@@ -353,6 +385,11 @@ class NykaaScraper(BasePlatformHandler):
                     ))
                 except:
                     continue
+
+            if not products:
+                healed_product = await self._extract_search_with_ai_healing(page_obj)
+                if healed_product:
+                    products.append(healed_product)
             
             logger.info(f"✅ DOM extracted {len(products)} products")
         
@@ -360,6 +397,61 @@ class NykaaScraper(BasePlatformHandler):
             logger.error(f"DOM extraction error: {e}")
         
         return products
+
+    async def _extract_search_with_ai_healing(self, page_obj) -> Optional[ProductData]:
+        """Last-resort search extraction using universal self-healing selectors."""
+        try:
+            healed = await self.auto_healing_extraction(
+                page_obj,
+                await page_obj.content(),
+                fields=["product_title", "product_price", "product_url", "product_image", "brand", "product_rating", "review_count"],
+                test_timeout=4.0,
+            )
+
+            title = healed.get("product_title")
+            price = healed.get("product_price")
+            if not title or price is None:
+                return None
+
+            price_value = Decimal(str(price))
+            if price_value <= 0:
+                return None
+
+            url = healed.get("product_url") or ""
+            if url and not str(url).startswith("http"):
+                url = f"{self.BASE_URL}{url}" if str(url).startswith("/") else f"{self.BASE_URL}/{url}"
+
+            product_id = self.extract_product_id(url) if url else None
+            if not product_id:
+                product_id = hashlib.md5(f"{title}-{price_value}".encode()).hexdigest()[:16]
+
+            rating = healed.get("product_rating")
+            review_count = healed.get("review_count")
+            try:
+                review_count = int(str(review_count).replace(",", "").strip()) if review_count is not None else None
+            except (TypeError, ValueError):
+                review_count = None
+
+            logger.info("🤖 Nykaa AI healing recovered a search result")
+            return ProductData(
+                external_id=product_id,
+                title=str(title)[:200],
+                current_price=price_value,
+                product_url=self.build_affiliate_url(url) if url else "",
+                platform_name="nykaa",
+                image_url=healed.get("product_image"),
+                brand=healed.get("brand"),
+                rating=float(rating) if rating is not None else None,
+                review_count=review_count,
+                category="Beauty",
+                in_stock=True,
+                extraction_method=ExtractionMethod.AI_HEALED,
+                data_source=HandlerType.SCRAPER,
+                raw_data={"source": "ai_healed_search", "stats": healed.get("_extraction_stats", {})},
+            )
+        except Exception as e:
+            logger.debug(f"AI-healed Nykaa search extraction failed: {e}")
+            return None
     
     # =========================================================================
     # PRODUCT DETAILS
@@ -503,6 +595,7 @@ class NykaaScraper(BasePlatformHandler):
     ) -> Optional[ProductData]:
         """Fallback: DOM extraction"""
         try:
+            used_ai_healing = False
             product_data = await page_obj.evaluate('''() => {
                 const result = { title: null, price: null, image: null };
                 
@@ -519,7 +612,22 @@ class NykaaScraper(BasePlatformHandler):
             }''')
             
             if not product_data.get('title') or not product_data.get('price'):
-                return None
+                healed = await self.auto_healing_extraction(
+                    page_obj,
+                    await page_obj.content(),
+                    fields=["product_title", "product_price", "product_image", "brand", "product_rating", "review_count"],
+                    test_timeout=4.0,
+                )
+                if healed.get("product_title") and healed.get("product_price"):
+                    used_ai_healing = True
+                    product_data["title"] = healed.get("product_title")
+                    product_data["price"] = str(healed.get("product_price"))
+                    product_data["image"] = healed.get("product_image") or product_data.get("image")
+                    product_data["brand"] = healed.get("brand")
+                    product_data["rating"] = healed.get("product_rating")
+                    product_data["reviewCount"] = healed.get("review_count")
+                else:
+                    return None
             
             if not product_id:
                 product_id = hashlib.md5(product_url.encode()).hexdigest()[:16]
@@ -531,9 +639,12 @@ class NykaaScraper(BasePlatformHandler):
                 product_url=self.build_affiliate_url(product_url),
                 platform_name="nykaa",
                 image_url=product_data.get('image'),
+                brand=product_data.get('brand'),
+                rating=float(product_data['rating']) if product_data.get('rating') else None,
+                review_count=int(str(product_data['reviewCount']).replace(',', '')) if product_data.get('reviewCount') else None,
                 category="Beauty",
                 in_stock=True,
-                extraction_method=ExtractionMethod.DOM_JAVASCRIPT,
+                extraction_method=ExtractionMethod.AI_HEALED if used_ai_healing else ExtractionMethod.DOM_JAVASCRIPT,
                 data_source=HandlerType.SCRAPER
             )
         except:

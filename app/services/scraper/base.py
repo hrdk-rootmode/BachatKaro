@@ -68,6 +68,18 @@ class ExtractionMethod(str, Enum):
     REGEX_FALLBACK = "regex_fallback"   # Regex from raw text
 
 
+EXTRACTION_CONFIDENCE_MAP: Dict[ExtractionMethod, float] = {
+    ExtractionMethod.API_NATIVE: 0.98,
+    ExtractionMethod.API_INTERCEPTED: 0.95,
+    ExtractionMethod.JSON_LD: 0.92,
+    ExtractionMethod.NEXT_DATA: 0.9,
+    ExtractionMethod.DOM_SELECTOR: 0.78,
+    ExtractionMethod.DOM_JAVASCRIPT: 0.72,
+    ExtractionMethod.AI_HEALED: 0.66,
+    ExtractionMethod.REGEX_FALLBACK: 0.55,
+}
+
+
 # =============================================================================
 # PRODUCT CATEGORY (For smart platform routing)
 # =============================================================================
@@ -205,12 +217,15 @@ class ProductData:
     
     # Product details
     brand: Optional[str] = None
+    brand_confidence: Optional[float] = None
+    brand_source: Optional[str] = None
     category: Optional[str] = None
     subcategory: Optional[str] = None
-    condition: ProductCondition = ProductCondition.NEW
     
     # Additional data
     specifications: Dict[str, Any] = field(default_factory=dict)
+    specs_confidence: Optional[float] = None
+    specs_source: Optional[str] = None
     seller_name: Optional[str] = None
     seller_rating: Optional[float] = None
     
@@ -218,6 +233,7 @@ class ProductData:
     scraped_at: datetime = field(default_factory=datetime.utcnow)
     data_source: HandlerType = HandlerType.SCRAPER
     extraction_method: ExtractionMethod = ExtractionMethod.DOM_SELECTOR
+    extraction_confidence: Optional[float] = None
     raw_data: Dict[str, Any] = field(default_factory=dict)
     
     # =========================================================================
@@ -240,6 +256,8 @@ class ProductData:
     variant_type: Optional[str] = None  # "pro", "plus", "ultra", "max", "standard"
     storage_gb: Optional[int] = None    # 128, 256, 512, 1024
     color: Optional[str] = None         # "blue", "black", "pink", "green"
+    color_confidence: Optional[float] = None
+    color_source: Optional[str] = None
     condition: ProductCondition = ProductCondition.NEW  # "new", "refurbished"
     
     def __post_init__(self):
@@ -289,6 +307,15 @@ class ProductData:
                 self.review_count = int(self.review_count)
             except (TypeError, ValueError):
                 self.review_count = None
+
+        # Fill confidence from extraction method if scraper didn't provide one
+        if self.extraction_confidence is None:
+            self.extraction_confidence = EXTRACTION_CONFIDENCE_MAP.get(self.extraction_method, 0.5)
+        else:
+            try:
+                self.extraction_confidence = max(0.0, min(1.0, float(self.extraction_confidence)))
+            except (TypeError, ValueError):
+                self.extraction_confidence = EXTRACTION_CONFIDENCE_MAP.get(self.extraction_method, 0.5)
     
     # =========================================================================
     # PHASE 1: ENHANCED FINGERPRINTING WITH VARIANT DETECTION
@@ -564,6 +591,69 @@ class ProductData:
             context["html_snippet"] = self.raw_html[:max_length]
         
         return context
+
+    def set_attribute_with_confidence(
+        self,
+        attribute: str,
+        value: Any,
+        source: str,
+        confidence: Optional[float] = None,
+    ) -> None:
+        """Set attribute with automatic confidence and source tracking."""
+        if value is None:
+            return
+
+        source_confidence = {
+            "api": 0.95,
+            "next_data": 0.90,
+            "json_ld": 0.88,
+            "api_intercepted": 0.92,
+            "dom": 0.70,
+            "ai": 0.60,
+            "title_heuristic": 0.35,
+            "fallback": 0.20,
+        }
+
+        conf = confidence if confidence is not None else source_confidence.get(source, 0.5)
+        setattr(self, attribute, value)
+        setattr(self, f"{attribute}_confidence", conf)
+        setattr(self, f"{attribute}_source", source)
+
+    def get_extraction_summary(self) -> Dict[str, Any]:
+        """Return confidence/source summary for key extracted attributes."""
+        return {
+            "brand": {
+                "value": getattr(self, "brand", None),
+                "confidence": getattr(self, "brand_confidence", 0.0),
+                "source": getattr(self, "brand_source", None),
+            },
+            "color": {
+                "value": getattr(self, "color", None),
+                "confidence": getattr(self, "color_confidence", 0.0),
+                "source": getattr(self, "color_source", None),
+            },
+            "specs": {
+                "value": getattr(self, "specifications", {}),
+                "confidence": getattr(self, "specs_confidence", 0.0),
+                "source": getattr(self, "specs_source", None),
+            },
+            "overall_confidence": self._calculate_overall_confidence(),
+        }
+
+    def _calculate_overall_confidence(self) -> float:
+        """Calculate overall extraction confidence from available attributes."""
+        confidences: List[float] = []
+
+        if getattr(self, "brand_confidence", None) is not None:
+            confidences.append(float(getattr(self, "brand_confidence")))
+
+        if getattr(self, "color_confidence", None) is not None:
+            confidences.append(float(getattr(self, "color_confidence")))
+
+        if getattr(self, "specs_confidence", None) is not None:
+            confidences.append(float(getattr(self, "specs_confidence")))
+
+        return sum(confidences) / len(confidences) if confidences else 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database storage"""
@@ -604,9 +694,12 @@ class ProductData:
             "ai_essence": self.ai_essence,
             "ai_tags": self.ai_tags,
             "ai_quality_score": self.ai_quality_score,
+            "extraction_confidence": self.extraction_confidence,
             "extraction_method": self.extraction_method.value if self.extraction_method else None,
             "scraped_at": self.scraped_at.isoformat() if self.scraped_at else None,
-            "data_source": self.data_source.value if self.data_source else None
+            "data_source": self.data_source.value if self.data_source else None,
+            "seller_name": self.seller_name,
+            "seller_rating": self.seller_rating,
         }
 
 
@@ -959,6 +1052,7 @@ class BasePlatformHandler(ABC):
         self.platform_name = config.name
         self.base_url = config.base_url
         self.affiliate_tag = config.affiliate_tag
+        self._db_session = None
         
         # Health tracking
         self._request_count = 0
@@ -983,6 +1077,42 @@ class BasePlatformHandler(ABC):
         logger.info(f"✅ Initialized {self.__class__.__name__} for {self.platform_name}")
         if self._debug_enabled:
             logger.debug(f"🔧 Config: {config.name} | {config.base_url}")
+
+    def set_db_session(self, session):
+        """Attach DB session so healing results can be persisted to PostgreSQL."""
+        self._db_session = session
+        if self.healing_engine is not None:
+            setattr(self.healing_engine, "db_session", session)
+
+    async def persist_healed_selectors(self, fields: Optional[List[str]] = None) -> bool:
+        """Persist best healed selectors to cache + DB when available."""
+        if self.healing_engine is None:
+            return False
+
+        try:
+            from app.services.ai.groq_client import groq_client
+        except Exception:
+            return False
+
+        target_fields = fields or list(getattr(self.healing_engine, "healed_selectors", {}).keys())
+        selectors_to_save: Dict[str, str] = {}
+
+        for field in target_fields:
+            candidates = getattr(self.healing_engine, "healed_selectors", {}).get(field, [])
+            if not candidates:
+                continue
+            best = candidates[0]
+            if best and best.selector and best.health.value in ["excellent", "good", "degraded"]:
+                selectors_to_save[field] = best.selector
+
+        if not selectors_to_save:
+            return False
+
+        return await groq_client.persist_healed_selectors(
+            platform_name=self.platform_name,
+            selectors=selectors_to_save,
+            db_session=self._db_session,
+        )
     
     # =========================================================================
     # 🚀 UNIVERSAL HEALING ENGINE AUTO-INITIALIZATION
@@ -1110,6 +1240,9 @@ class BasePlatformHandler(ABC):
                 if self.healing_engine is None:
                     logger.warning(f"⚠️ No healing engine for {field_name}, skipping")
                     continue
+
+                if getattr(self.healing_engine, "db_session", None) is None and self._db_session is not None:
+                    setattr(self.healing_engine, "db_session", self._db_session)
                 
                 async def test_selector(selector: str) -> bool:
                     try:
@@ -1179,6 +1312,12 @@ class BasePlatformHandler(ABC):
             f"📊 Extraction: {extraction_stats['successful']}/{extraction_stats['total_fields']} | "
             f"AI: {extraction_stats['ai_generated']} | Time: {extraction_stats['total_time_ms']}ms"
         )
+
+        if extraction_stats["ai_generated"] > 0:
+            try:
+                await self.persist_healed_selectors(fields)
+            except Exception as e:
+                logger.debug(f"Healed selector persistence skipped: {e}")
         
         extracted["_extraction_stats"] = extraction_stats
         return extracted

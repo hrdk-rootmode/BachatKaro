@@ -11,8 +11,8 @@ import logging
 import hashlib
 import os
 import time
-import jwt
-import requests
+import json
+import base64
 
 from app.core.config import settings
 
@@ -117,32 +117,51 @@ security_scheme = HTTPBearer()
 
 
 # =============================================================================
-# TOKEN VERIFICATION
+# TOKEN VERIFICATION WITH CLOCK SKEW TOLERANCE
 # =============================================================================
+
+def decode_token_without_verification(token: str) -> dict:
+    """
+    Decode JWT token without verification (for clock skew handling)
+    """
+    try:
+        # Split the JWT token
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {}
+        
+        # Decode the payload (add padding if needed)
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += '=' * padding
+        
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception as e:
+        logger.error(f"Failed to decode token: {e}")
+        return {}
+
+
 async def verify_firebase_token(
     credentials: HTTPAuthorizationCredentials = Security(security_scheme)
 ) -> dict:
     """
-    Verify Firebase ID token from Authorization header
-    
-    Returns:
-        dict: Decoded token with user info
-        
-    Raises:
-        HTTPException: If token is invalid or expired
+    Verify Firebase ID token with clock skew tolerance
     """
-    # Check if Firebase is initialized
     if not firebase_initialized:
         raise HTTPException(
             status_code=503,
-            detail="Authentication service unavailable. Please try again later."
+            detail="Authentication service unavailable."
         )
     
     token = credentials.credentials
+    logger.info(f"🔐 Token verification starting - token length: {len(token)}")
     
     try:
-        # Try standard Firebase verification first
-        decoded_token = auth.verify_id_token(token)
+        # Try standard verification first
+        decoded_token = auth.verify_id_token(token, check_revoked=False)
+        logger.info(f"✅ Standard verification successful for user: {decoded_token.get('email')}")
         return {
             "uid": decoded_token["uid"],
             "email": decoded_token.get("email"),
@@ -152,50 +171,43 @@ async def verify_firebase_token(
             "admin": decoded_token.get("admin", False),
         }
         
-    except auth.ExpiredIdTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token has expired. Please login again."
-        )
-    except auth.RevokedIdTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token has been revoked. Please login again."
-        )
     except Exception as e:
-        error_msg = str(e)
+        error_msg = str(e).lower()
+        logger.warning(f"⚠️ Standard verification failed: {str(e)}")
         
-        # If it's a "token used too early" error (clock skew), try to verify with more tolerance
-        if "used too early" in error_msg.lower() or "iat" in error_msg.lower():
-            logger.warning(f"⚠️ Clock skew detected, attempting lenient verification: {error_msg}")
+        # Check if it's a clock skew issue
+        if "token used too early" in error_msg or "iat" in error_msg or "before" in error_msg:
+            logger.warning(f"⏰ Clock skew detected, trying fallback verification")
             
-            try:
-                # Decode without verification first to inspect
-                unverified = jwt.decode(token, options={"verify_signature": False})
-                token_iat = unverified.get("iat", 0)
+            # Decode token without verification
+            unverified = decode_token_without_verification(token)
+            
+            if unverified.get("uid"):
+                # Check if the skew is reasonable (within 5 seconds)
                 current_time = int(time.time())
-                clock_skew = token_iat - current_time
+                token_iat = unverified.get("iat", 0)
+                skew = token_iat - current_time
                 
-                logger.warning(f"Token iat: {token_iat}, Server time: {current_time}, Skew: {clock_skew}s")
+                logger.info(f"⏱️  Clock skew: {skew} seconds (token iat: {token_iat}, server time: {current_time})")
                 
-                # If skew is reasonable (less than 30 seconds), accept the token
-                if abs(clock_skew) <= 30:
-                    logger.info(f"✅ Accepting token with clock skew tolerance ({clock_skew}s)")
+                if abs(skew) <= 5:  # Allow 5 seconds of clock difference
+                    logger.info(f"✅ Accepting token with {skew}s clock skew for user: {unverified.get('email')}")
                     return {
-                        "uid": unverified["uid"],
-                        "email": unverified.get("email"),  
+                        "uid": unverified["sub"] if "sub" in unverified else unverified.get("user_id"),
+                        "email": unverified.get("email"),
                         "email_verified": unverified.get("email_verified", False),
                         "name": unverified.get("name"),
                         "picture": unverified.get("picture"),
                         "admin": unverified.get("admin", False),
                     }
-            except Exception as decode_error:
-                logger.error(f"Failed to decode token: {decode_error}")
+                else:
+                    logger.error(f"❌ Clock skew too large: {skew} seconds (max allowed: 5s)")
         
-        logger.error(f"Token verification error: {error_msg}")
+        # For other errors or large clock skew
+        logger.error(f"❌ Token verification failed: {type(e).__name__}: {str(e)}")
         raise HTTPException(
             status_code=401,
-            detail="Authentication failed. Please login again."
+            detail="Invalid or expired token"
         )
 
 

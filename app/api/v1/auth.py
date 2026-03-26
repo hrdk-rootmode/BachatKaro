@@ -617,7 +617,7 @@ async def get_user_stats(
     # Calculate searches remaining based on plan
     plan_limits = {
         UserPlan.FREE: 10,
-        UserPlan.BASIC: 50,
+        UserPlan.PRO: 50,
         UserPlan.PREMIUM: -1  # Unlimited
     }
     
@@ -640,7 +640,7 @@ async def get_user_stats(
     # Calculate watchlist limit
     watchlist_limits = {
         UserPlan.FREE: 5,
-        UserPlan.BASIC: 20,
+        UserPlan.PRO: 20,
         UserPlan.PREMIUM: 50
     }
     watchlist_limit = watchlist_limits.get(user.plan, 5)

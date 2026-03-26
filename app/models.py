@@ -16,12 +16,11 @@ from app.core.database import Base
 
 
 # =============================================================================
-# TABLE 1: PLATFORMS
+# TABLE 1: PLATFORMS - UPDATED
 # =============================================================================
 class Platform(Base):
     """
-    Stores platform configurations (Amazon, Flipkart, etc.)
-    Dynamic scraping rules stored in JSONB for flexibility
+    Stores platform configurations with self-healing history
     """
     __tablename__ = "platforms"
     
@@ -31,15 +30,19 @@ class Platform(Base):
     affiliate_tag = Column(String(100))
     
     # Dynamic selectors for self-healing scraper
-    selectors = Column(JSONB, nullable=False, default={
-        "search_url_template": "",
-        "product_title": "",
-        "product_price": "",
-        "product_image": "",
-        "product_rating": "",
-        "product_url": "",
-        "healed_selectors": []  # AI-suggested alternatives
+    selectors = Column(JSONB, nullable=False, default={})
+    
+    # =========================================================================
+    # 🆕 SELF-HEALING TRACKING
+    # =========================================================================
+    selector_history = Column(JSONB, default=[])  # List of healing events
+    last_healed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    healing_stats = Column(JSONB, default={
+        "total_attempts": 0,
+        "successful_heals": 0,
+        "fields": {}
     })
+    # =========================================================================
     
     is_active = Column(Boolean, default=True, index=True)
     scrape_delay_seconds = Column(Integer, default=2)
@@ -52,58 +55,63 @@ class Platform(Base):
     
     __table_args__ = (
         Index('idx_platforms_active', 'is_active'),
+        Index('idx_platforms_last_healed', 'last_healed_at'),  # NEW
     )
-
 
 # =============================================================================
 # TABLE 2: PRODUCTS (Master Catalog)
 # =============================================================================
+
 class Product(Base):
     """
     Master product catalog with deduplication
-    Enhanced fingerprinting system:
-    - fingerprint: Primary fingerprint (variant-level)
-    - variant_fingerprint: Explicit variant fingerprint (iPhone 15 Pro 256GB)
-    - base_fingerprint: Series-level fingerprint (iPhone 15)
-    - Ensures same product from multiple platforms are linked
+    Enhanced with confidence and provenance tracking
     """
     __tablename__ = "products"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # PHASE 1 FIX: Remove unique constraint - variant_fingerprint is the new unique identifier
-    # Multiple products can now have same fingerprint (cross-platform variants)
     fingerprint = Column(String(64), nullable=False, index=True)
     
-    # =========================================================================
-    # PHASE 2: Enhanced Fingerprinting Columns
-    # =========================================================================
-    variant_fingerprint = Column(String(64), nullable=True, index=True)  # iPhone 15 Pro 256GB Blue
-    base_fingerprint = Column(String(64), nullable=True, index=True)     # iPhone 15 series
+    # Enhanced Fingerprinting
+    variant_fingerprint = Column(String(64), nullable=True, index=True)
+    base_fingerprint = Column(String(64), nullable=True, index=True)
     
-    # Variant detection metadata
-    variant_type = Column(String(100), nullable=True)   # "pro", "plus", "max", "ultra"
-    storage_gb = Column(Integer, nullable=True)         # 256, 512, 1024
-    color = Column(String(50), nullable=True)           # "blue", "black", "pink"
-    condition = Column(String(50), nullable=True, default="new")  # "new", "refurbished"
+    # Variant metadata
+    variant_type = Column(String(100), nullable=True)
+    storage_gb = Column(Integer, nullable=True)
+    color = Column(String(50), nullable=True)
+    condition = Column(String(50), nullable=True, default="new")
     
-    # =========================================================================
     # Original Product Fields
-    # =========================================================================
     title = Column(String(500), nullable=False)
     brand = Column(String(100), index=True)
     category = Column(String(100), index=True)
     subcategory = Column(String(100))
     image_url = Column(Text)
-    
-    # Product specifications as flexible JSON
     specifications = Column(JSONB, default={})
+    
+    # =========================================================================
+    # 🆕 CONFIDENCE & PROVENANCE TRACKING
+    # =========================================================================
+    brand_confidence = Column(Float, nullable=True, index=True)
+    brand_source = Column(String(50), nullable=True)  # api|next_data|json_ld|dom|ai|title_heuristic
+    
+    color_confidence = Column(Float, nullable=True, index=True)
+    color_source = Column(String(50), nullable=True)
+    
+    specs_confidence = Column(Float, nullable=True)
+    specs_source = Column(String(50), nullable=True)
+    
+    last_enriched_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    enrichment_version = Column(Integer, default=1)
+    # =========================================================================
     
     # AI-generated metadata
     ai_metadata = Column(JSONB, default={
-        "tags": [],  # ["gaming", "laptop", "rtx"]
-        "quality_score": 0,  # 0-100
-        "essence": "",  # "iPhone 15 Pro 256GB"
-        "deal_score": 0  # Price vs market average
+        "tags": [],
+        "quality_score": 0,
+        "essence": "",
+        "deal_score": 0
     })
     
     # Engagement statistics
@@ -128,14 +136,13 @@ class Product(Base):
         Index('idx_products_storage_color', 'storage_gb', 'color'),
         Index('idx_products_category', 'category'),
         Index('idx_products_brand', 'brand'),
-        # Full-text search on title
+        Index('idx_products_brand_confidence', 'brand_confidence'),  # NEW
+        Index('idx_products_color_confidence', 'color_confidence'),  # NEW
+        Index('idx_products_last_enriched', 'last_enriched_at'),     # NEW
         Index('idx_products_title_search', 'title', postgresql_using='gin', postgresql_ops={'title': 'gin_trgm_ops'}),
-        # GIN index for AI tags array
         Index('idx_products_ai_tags', 'ai_metadata', postgresql_using='gin'),
-        # Index for trending products
         Index('idx_products_stats_views', func.cast(stats['views'], Integer).desc()),
     )
-
 
 # =============================================================================
 # TABLE 3: PRODUCT_LISTINGS (Platform-Specific Links)
@@ -183,6 +190,11 @@ class ProductListing(Base):
     
     # Scraping metadata
     last_scraped = Column(DateTime(timezone=True), index=True)
+    extraction_confidence = Column(Float, nullable=True, index=True)
+    extraction_method = Column(String(32), nullable=True)
+    data_source = Column(String(32), nullable=True)
+    seller_name = Column(String(255), nullable=True)
+    seller_rating = Column(Float, nullable=True)
     scrape_error_count = Column(Integer, default=0)
     last_error = Column(Text)
     
@@ -200,6 +212,7 @@ class ProductListing(Base):
         Index('idx_listings_variant_fp', 'variant_fingerprint'),
         Index('idx_listings_price', 'current_price'),
         Index('idx_listings_scraped', 'last_scraped'),
+        Index('idx_listings_platform_confidence', 'platform_id', 'extraction_confidence'),
         Index('idx_listings_stock', 'in_stock', postgresql_where=Column('in_stock') == True),
     )
 

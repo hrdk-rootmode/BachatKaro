@@ -419,9 +419,17 @@ async def _run_seed_products():
         if current_dir not in sys.path:
             sys.path.insert(0, current_dir)
         
-        # Import and run the seed function
+        # Import and run seeding with explicit hardened defaults.
         from scripts.seed import seed_smart_rotate
-        result = await seed_smart_rotate()
+        result = await seed_smart_rotate(
+            categories=["Electronics", "Fashion", "Home & Kitchen", "Accessories", "Books"],
+            products_per_category=4,
+            enable_ai=True,
+            enable_cross_match=True,
+            timeout_seconds=60,
+            query_interval_seconds=8.0,
+            cooldown_buffer_seconds=12,
+        )
         
         return {"success": True, "output": str(result)}
         

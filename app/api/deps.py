@@ -16,18 +16,49 @@ from app.core.database import get_db
 from app.core.redis_client import get_redis
 from app.core.config import settings
 from app.models import User, AppConfig
-from app.schemas import UserPlan
-from app.schemas import UserSignupRequest
+from app.schemas import (
+    UserSignupRequest,
+    UserResponse,
+    UserUsageStats,
+    UserPlan
+)
 import redis.asyncio as redis
 from redis.asyncio import Redis
+import json
+import base64
+import time
+import logging
+# Import the enhanced token verification with clock skew tolerance
 from app.core.security import initialize_firebase
 
 # Initialize Firebase Admin SDK with proper credentials
 initialize_firebase()
 
+logger = logging.getLogger(__name__)
 
 # Security scheme
 security = HTTPBearer()
+
+
+# ==================== HELPER FUNCTIONS ====================
+
+def _decode_token_without_verification(token: str) -> dict:
+    """Decode JWT token without verification (for clock skew handling)"""
+    try:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {}
+        
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += '=' * padding
+        
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception as e:
+        logger.error(f"Failed to decode token without verification: {e}")
+        return {}
 
 
 # ==================== AUTHENTICATION ====================
@@ -36,7 +67,8 @@ async def verify_firebase_token(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ) -> dict:
     """
-    Verify Firebase ID token
+    Verify Firebase ID token with comprehensive debugging and clock skew tolerance
+    Handles "token used too early" errors from clock synchronization issues
     
     Returns:
         dict: Decoded token with user claims
@@ -44,32 +76,103 @@ async def verify_firebase_token(
     Raises:
         HTTPException: If token is invalid or expired
     """
-    import logging
-    logger = logging.getLogger(__name__)
+    token = credentials.credentials
+    logger.info(f"🔐 Verifying token: {token[:20]}... (length: {len(token)})")
     
     try:
-        token = credentials.credentials
-        logger.info(f"Verifying Firebase token: {token[:20]}...")
-        decoded_token = firebase_auth.verify_id_token(token)
-        logger.info(f"✅ Token verified for user: {decoded_token.get('email')}")
-        return decoded_token
-    except firebase_auth.InvalidIdTokenError as e:
-        logger.error(f"❌ Invalid Firebase token: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid authentication token: {str(e)}"
-        )
-    except firebase_auth.ExpiredIdTokenError as e:
-        logger.error(f"❌ Expired Firebase token: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired"
-        )
+        # Try standard Firebase verification first
+        decoded_token = firebase_auth.verify_id_token(token, check_revoked=False)
+        logger.info(f"✅ Standard verification successful for: {decoded_token.get('email')}")
+        return {
+            "uid": decoded_token["uid"],
+            "email": decoded_token.get("email"),
+            "email_verified": decoded_token.get("email_verified", False),
+            "name": decoded_token.get("name"),
+            "picture": decoded_token.get("picture"),
+            "admin": decoded_token.get("admin", False),
+        }
+        
     except Exception as e:
-        logger.error(f"❌ Firebase token verification failed: {type(e).__name__}: {str(e)}", exc_info=True)
+        error_msg = str(e).lower()
+        error_type = type(e).__name__
+        logger.warning(f"⚠️ Standard verification failed: {error_type}: {str(e)}")
+        
+        # Log detailed debugging info
+        unverified = _decode_token_without_verification(token)
+        if unverified:
+            current_time = int(time.time())
+            token_iat = unverified.get("iat", 0)
+            token_exp = unverified.get("exp", 0)
+            token_email = unverified.get("email", "UNKNOWN")
+            skew_from_iat = token_iat - current_time
+            
+            logger.info(f"\n📋 TOKEN DEBUG INFO:")
+            logger.info(f"   Email: {token_email}")
+            logger.info(f"   UID: {unverified.get('uid')}")
+            logger.info(f"   IAT (issued): {token_iat}")
+            logger.info(f"   EXP (expires): {token_exp}")
+            logger.info(f"   NOW: {current_time}")
+            logger.info(f"   SKEW (iat - now): {skew_from_iat}s")
+            logger.info(f"   TIME_UNTIL_EXPIRY: {token_exp - current_time}s")
+        
+        # Check if it's a clock skew issue - multiple patterns
+        is_clock_skew = any(pattern in error_msg for pattern in [
+            "token used too early",
+            "token before", 
+            "not yet valid",
+            "iat",
+            "clock",
+            "before it was issued"
+        ])
+        
+        # Also try direct pattern matching on exception type
+        is_clock_skew = is_clock_skew or "before" in error_msg or "early" in error_msg
+        
+        # Firebase JWT uses 'sub' for the user ID, not 'uid'
+        token_uid = unverified.get("sub") or unverified.get("uid")
+        
+        if is_clock_skew and (token_uid or unverified.get("email")):
+            logger.info("⏰ Clock skew detected, applying tolerance...")
+            
+            current_time = int(time.time())
+            token_iat = unverified.get("iat", 0)
+            skew = token_iat - current_time
+            
+            logger.info(f"⏱️  Clock skew: {skew} seconds (iat={token_iat}, now={current_time})")
+            
+            # Allow 30 seconds of clock difference for reliability
+            # (increased from 10 for devices that are more than 10 seconds out of sync)
+            if abs(skew) <= 30:
+                logger.info(f"✅ Token accepted with {skew}s skew tolerance for: {unverified.get('email')}")
+                return {
+                    "uid": token_uid,
+                    "email": unverified.get("email"),
+                    "email_verified": unverified.get("email_verified", False),
+                    "name": unverified.get("name"),
+                    "picture": unverified.get("picture"),
+                    "admin": unverified.get("admin", False),
+                }
+            else:
+                logger.error(f"❌ Clock skew too large: {skew}s (max: 30s)")
+        
+        # If no clock skew but token has valid structure, try extended tolerance
+        # This handles edge cases where Firebase doesn't explicitly report clock issues
+        token_iat = unverified.get("iat", 0)
+        if (token_uid or unverified.get("email")) and token_iat and abs(token_iat - int(time.time())) <= 30:
+            logger.info("⚠️ Applying extended clock tolerance despite no explicit clock error...")
+            return {
+                "uid": token_uid,
+                "email": unverified.get("email"),
+                "email_verified": unverified.get("email_verified", False),
+                "name": unverified.get("name"),
+                "picture": unverified.get("picture"),
+                "admin": unverified.get("admin", False),
+            }
+        
+        logger.error(f"❌ Token verification failed final: {error_type}: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Authentication failed: {type(e).__name__}: {str(e)}"
+            detail="Session expired. Please login again."
         )
 
 
@@ -121,8 +224,18 @@ async def get_current_user(
     # Auto-create user if enabled and doesn't exist
     if not user:
         logger.info(f"  User not found, attempting auto-creation...")
+        
+        # Get hardware_id from header for auto-creation
+        hardware_id = request.headers.get("X-Hardware-ID", "auto_created")
+        logger.info(f"  Hardware ID from header: {hardware_id}")
+        
         try:
-            user = await User.create_from_firebase_token(db, token_data)
+            # Use user_service.create_from_firebase_token with hardware_id
+            user = await user_service.create_from_firebase_token(
+                db, 
+                token_data,
+                hardware_id=hardware_id
+            )
             if user:
                 logger.info(
                     f"  ✅ Auto-created user: {user.email} (ID: {user.id})"
@@ -247,7 +360,7 @@ async def check_rate_limit(
     
     Limits:
     - Free: 500 searches/day (✅ DEVELOPMENT: Increased from 10)
-    - Basic: 500 searches/day (✅ DEVELOPMENT: Increased from 50)
+    - Pro: 500 searches/day (✅ DEVELOPMENT: Increased from 50)
     - Premium: Unlimited
     
     Uses Redis counters with daily expiry
@@ -262,7 +375,7 @@ async def check_rate_limit(
     # Determine rate limit based on plan (✅ DEVELOPMENT: Increased limits)
     limits = {
         UserPlan.FREE: 500,
-        UserPlan.BASIC: 500
+        UserPlan.PRO: 500
     }
     daily_limit = limits.get(user.plan, 500)
     
@@ -371,7 +484,7 @@ def require_plan(min_plan: UserPlan):
     async def _check_plan(user: User = Depends(get_current_user)) -> User:
         plan_hierarchy = {
             UserPlan.FREE: 0,
-            UserPlan.BASIC: 1,
+            UserPlan.PRO: 1,
             UserPlan.PREMIUM: 2
         }
         

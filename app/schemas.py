@@ -26,7 +26,7 @@ import re
 
 class UserPlan(str, Enum):
     FREE = "free"
-    BASIC = "basic"
+    PRO = "pro"
     PREMIUM = "premium"
 
 
@@ -182,12 +182,34 @@ class SearchByURLRequest(BaseModel):
         return v
 
 
+class AttributeConfidence(BaseModel):
+    """Attribute with confidence and source tracking."""
+    value: Optional[str] = None
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    source: Optional[str] = None  # api|next_data|json_ld|dom|ai|title_heuristic
+
+
+class ProductBase(BaseModel):
+    """Base product schema used by richer response models."""
+    title: str
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    color: Optional[str] = None
+    image_url: Optional[str] = None
+    specifications: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ProductListingResponse(BaseModel):
     """✅ FIXED: Changed id to str, standardized field names
     ✅ NEW: Added variant_fingerprint for cross-platform matching"""
     model_config = ConfigDict(from_attributes=True)
     
     id: str  # ✅ UUID as string
+    # Optional relational fields for admin/detail views
+    product_id: Optional[str] = None
+    platform_id: Optional[int] = None
+    platform_name: Optional[str] = None
     platform: Platform
     platform_product_id: str
     url: str
@@ -195,11 +217,18 @@ class ProductListingResponse(BaseModel):
     current_price: Decimal
     original_price: Optional[Decimal]
     discount_percentage: Optional[int]
+    # Alias-compatible field used by some endpoints/jobs
+    discount_percent: Optional[Decimal] = None
     rating: Optional[Decimal]
     review_count: Optional[int]  # ✅ Standardized (was reviews_count)
     image_url: Optional[str]
     in_stock: bool
     last_scraped_at: datetime
+    extraction_confidence: Optional[float] = Field(None, ge=0, le=1)
+    extraction_method: Optional[str] = None
+    data_source: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_rating: Optional[Decimal] = None
     # ✅ NEW: Variant fingerprinting for cross-platform linking
     variant_fingerprint: Optional[str] = Field(None, description="Exact variant fingerprint for cross-platform matching")
 
@@ -219,6 +248,22 @@ class ProductResponse(BaseModel):
     storage_gb: Optional[int] = Field(None, description="Storage capacity in GB")
     color: Optional[str] = Field(None, description="Product color")
     condition: Optional[str] = Field(None, description="Product condition (new, refurbished, used)")
+    # Product base info
+    title: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    image_url: Optional[str] = None
+    specifications: Dict[str, Any] = Field(default_factory=dict)
+    # Confidence and provenance
+    brand_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    brand_source: Optional[str] = None
+    color_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    color_source: Optional[str] = None
+    specs_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    specs_source: Optional[str] = None
+    last_enriched_at: Optional[datetime] = None
+    enrichment_version: Optional[int] = None
     # Price and trending
     best_price: Decimal
     best_platform: Platform
@@ -228,8 +273,20 @@ class ProductResponse(BaseModel):
     ai_generated_essence: str
     ai_extracted_specs: Dict[str, Any]
     ai_tags: List[str]
+    ai_metadata: Dict[str, Any] = Field(default_factory=dict)
+    stats: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+    updated_at: Optional[datetime] = None
     listings: List[ProductListingResponse]
+
+
+class ProductWithListings(ProductResponse):
+    """Product response with listing aggregates."""
+    listings: List[ProductListingResponse] = Field(default_factory=list)
+    min_price: Optional[Decimal] = None
+    max_price: Optional[Decimal] = None
+    platform_count: int = 0
+    best_deal_platform: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -280,6 +337,31 @@ class PriceHistoryResponse(BaseModel):
     highest_price: Decimal
     average_price: Decimal
     price_drop_percentage: Optional[Decimal]
+
+
+# ==================== REFRESH PRICE SCHEMAS ====================
+
+class PlatformPriceSnapshot(BaseModel):
+    """Price snapshot for a single platform"""
+    platform: Platform
+    current_price: Decimal
+    original_price: Optional[Decimal]
+    discount_percentage: Optional[int]
+    in_stock: bool
+    last_updated_at: datetime
+
+
+class RefreshPriceResponse(BaseModel):
+    """Response when refreshing product prices"""
+    product_id: str
+    best_price: Decimal
+    best_platform: Platform
+    all_platforms: List[PlatformPriceSnapshot]
+    last_updated_at: datetime
+    freshness_status: str  # 'fresh' (< 2h), 'stale' (2-12h), 'very_stale' (> 12h)
+    price_change: Optional[Decimal] = None  # How much changed since last update
+    refresh_in_progress: bool = False
+    can_refresh_again_at: Optional[datetime] = None  # When can user refresh again
 
 
 # ==================== WATCHLIST SCHEMAS ====================
@@ -396,7 +478,7 @@ class SubscriptionPlanResponse(BaseModel):
 
 class CreateOrderRequest(BaseModel):
     """Request to create Razorpay order"""
-    plan_id: str = Field(..., pattern="^(basic|premium|pro)$")
+    plan_id: str = Field(..., pattern="^(pro|premium)$")
 
 
 class CreateOrderResponse(BaseModel):
@@ -667,7 +749,7 @@ class PromotionCreate(BaseModel):
     # Targeting
     target_platforms: List[str] = []
     target_categories: List[str] = []
-    target_user_plan: List[UserPlan] = [UserPlan.FREE, UserPlan.BASIC]
+    target_user_plan: List[UserPlan] = [UserPlan.FREE, UserPlan.PRO]
     target_min_users: int = Field(default=0, ge=0)
     target_max_users: Optional[int] = None
     
@@ -973,7 +1055,7 @@ class GooglePlayWebhookPayload(BaseModel):
 
 class CreateOrderRequestV2(BaseModel):
     """Request to create payment order (supports both platforms)"""
-    plan_id: str = Field(..., pattern="^(pro|premium|basic)$")  # ✅ Added basic
+    plan_id: str = Field(..., pattern="^(pro|premium)$")
     platform: PaymentPlatform = Field(default=PaymentPlatform.WEB)
 
 

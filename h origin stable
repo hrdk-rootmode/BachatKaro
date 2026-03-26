@@ -1,0 +1,73 @@
+[33mcommit 329a6b85fd16e5a10feba639cd31ae556a4f09dd[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mstable[m[33m)[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Thu Mar 19 13:24:24 2026 +0530
+
+    Testing limits, varients, status Upgrade
+    
+    # Conflicts:
+    #       scripts/MASTER_SCRIPTS.md
+
+[33mcommit 05659a9736a065f42ec2af1e18dc7171dbbe8427[m[33m ([m[1;31morigin/stable[m[33m)[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Tue Mar 17 11:52:09 2026 +0530
+
+    Update email in sign-in script to test user
+
+[33mcommit 56a4fabd8dcfa710368904201bcaa92930da5c2e[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Tue Mar 17 11:51:34 2026 +0530
+
+    Update API key in MASTER_SCRIPTS.md
+    
+    Replaced hardcoded API key with placeholder for security.
+
+[33mcommit ad412ecd8999e9a84793e5b908f607e7218b6a47[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Tue Mar 17 10:31:17 2026 +0530
+
+    fixed auth, deps, config and user cause Auth
+
+[33mcommit 50f64d2810352d6900d702985d5ed2025f28331d[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Fri Mar 13 18:37:00 2026 +0530
+
+    feat: Add deployment script for scheduler restart
+
+[33mcommit 50187c47b03e53a24b3bfee047dd1b844d49c9eb[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Fri Mar 13 17:44:23 2026 +0530
+
+    feat: Add branch control and error notifications to scheduler
+    
+    - Add SCHEDULER_BRANCH configuration (defaults to 'current')
+    - Implement error notification system with email support
+    - Add branch validation to all scheduled jobs
+    - Fix daily_scrape.py with --force-all flag
+    - Update .env.example with scheduler configuration
+    - Jobs now log branch info and send error alerts
+    
+    Fixes issues where scheduler ran on wrong branch and had no error reporting
+
+[33mcommit c90955cb2e0c7ea962d8f70b1ca9aff10e7cac46[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Fri Mar 13 10:47:36 2026 +0530
+
+    comprehensive data cleaning, optimize filtering quality
+
+[33mcommit 8b341041111e48543d95922b16f53af97211f598[m[33m ([m[1;32mcopilot-worktree-2026-03-12T13-30-19[m[33m)[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Wed Mar 11 18:52:39 2026 +0530
+
+    Stable products fetching
+
+[33mcommit e4214498782b19e2753459a19937738bcd4748ae[m[33m ([m[1;31morigin/main[m[33m, [m[1;32mmain[m[33m)[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Fri Feb 27 14:26:46 2026 +0530
+
+    Data Seeding and fixed platforms and ai contifuration done
+
+[33mcommit 07cbc554cb167ca93d6a9464114c22402f0d8de6[m
+Author: hrdk-rootmode <animecreator01012026@gmail.com>
+Date:   Mon Feb 23 15:08:01 2026 +0530
+
+    first commit

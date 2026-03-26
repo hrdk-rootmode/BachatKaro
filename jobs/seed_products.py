@@ -136,6 +136,15 @@ async def _find_and_save_cross_platform(source_product, db):
         print(f"      ⚠️ Cross-platform check failed: {e}")
 
 
+def _is_seedable_product(product) -> bool:
+    """Guard against saving broken or unavailable listings."""
+    if not getattr(product, "product_url", None):
+        return False
+    if getattr(product, "in_stock", True) is False:
+        return False
+    return True
+
+
 # =============================================================================
 # SEEDING FUNCTIONS
 # =============================================================================
@@ -190,6 +199,9 @@ async def seed_quick() -> Dict[str, int]:
                     if products_saved >= 2: break  # Only grab 2 per platform
                     
                     try:
+                        if not _is_seedable_product(p):
+                            continue
+
                         # 🛡️ Quality Gate
                         specs = extract_specs(p.title, category=category)
                         passed, gate_reason = check_quality_gate(p.title, specs)
@@ -211,7 +223,7 @@ async def seed_quick() -> Dict[str, int]:
                         print(f"   ✅ [Base] {saved.title[:45]}... (₹{product.current_price:,.0f})")
                         
                         # ⚡ Cross-Platform Compare
-                        await _find_and_compare_cross_platform(product, db)
+                        await _find_and_save_cross_platform(product, db)
                         print("") # spacing
                         
                     except Exception as e:
@@ -262,6 +274,9 @@ async def seed_smart_rotate(categories: List[str] = None, products_per_category:
                             if products_saved >= products_per_category: break
                             
                             try:
+                                if not _is_seedable_product(product):
+                                    continue
+
                                 product.category = category
                                 product = await enrichment_service.enrich_product(product)
                                 
@@ -346,6 +361,9 @@ async def seed_full(limit: int = 100) -> Dict[str, int]:
                         for p in result.products:
                             if products_saved >= cat_limit: break
                             try:
+                                if not _is_seedable_product(p):
+                                    continue
+
                                 # Quality Gate
                                 specs = extract_specs(p.title, category=category)
                                 passed, _ = check_quality_gate(p.title, specs)
@@ -361,7 +379,7 @@ async def seed_full(limit: int = 100) -> Dict[str, int]:
                                 print(f"      ✅ [{products_saved}/{cat_limit}] {saved.title[:45]}... (₹{product.current_price:,.0f})")
                                 
                                 # ⚡ Cross-Platform Match
-                                await _find_and_compare_cross_platform(product, db)
+                                await _find_and_save_cross_platform(product, db)
                                 print("") # spacing
                                 
                             except Exception: pass
@@ -379,6 +397,9 @@ async def seed_full(limit: int = 100) -> Dict[str, int]:
                     for p in result.products:
                         if products_saved >= trend_limit: break
                         try:
+                            if not _is_seedable_product(p):
+                                continue
+
                             # Quality Gate
                             specs = extract_specs(p.title, category="General")
                             passed, _ = check_quality_gate(p.title, specs)
@@ -394,7 +415,7 @@ async def seed_full(limit: int = 100) -> Dict[str, int]:
                             print(f"      🔥 [{products_saved}/{trend_limit}] {saved.title[:45]}... (₹{product.current_price:,.0f})")
                             
                             # ⚡ Cross-Platform Match
-                            await _find_and_compare_cross_platform(product, db)
+                            await _find_and_save_cross_platform(product, db)
                             print("") # spacing
                             
                         except Exception: pass
@@ -446,6 +467,15 @@ async def main(args):
         print("❌ Please specify a mode: --quick, --smart-rotate, or --full")
         return
     print_summary(results, start_time)
+
+
+async def run_seed_products() -> Dict[str, Any]:
+    """Scheduler/manual entrypoint for legacy seed job."""
+    try:
+        results = await seed_smart_rotate(categories=["Electronics", "Fashion", "Home & Kitchen"], products_per_category=4)
+        return {"success": True, "results": results, "mode": "smart_rotate"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":

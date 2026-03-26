@@ -289,9 +289,9 @@ class MyntraScraper(BasePlatformHandler):
         return None
     
     def _parse_product_item(self, item: Dict[str, Any]) -> Optional[ProductData]:
-        """Parse single product from JSON"""
+        """Parse single product from JSON with confidence tracking"""
         try:
-            # Extract product ID
+            # Product ID
             product_id = (
                 str(item.get('productId') or 
                     item.get('product_id') or 
@@ -302,23 +302,26 @@ class MyntraScraper(BasePlatformHandler):
             if not product_id:
                 return None
             
-            # Extract title/name
+            # Title/Name
             title = (
                 item.get('productName') or 
                 item.get('name') or 
                 item.get('productDisplayName') or
                 item.get('title') or ''
             )
-            
-            # Combine brand + name
+
+            # Brand with confidence
             brand = item.get('brand') or item.get('brandName') or ''
+            brand_confidence = 0.92 if brand else 0.0
+            brand_source = "api" if brand else None
+
             if brand and title and brand.lower() not in title.lower():
                 title = f"{brand} {title}"
             
             if not title:
                 return None
             
-            # Extract price
+            # Price
             price_data = item.get('price') or item.get('prices') or {}
             if isinstance(price_data, dict):
                 current_price = (
@@ -340,7 +343,7 @@ class MyntraScraper(BasePlatformHandler):
             if not current_price:
                 return None
             
-            # Extract discount
+            # Discount
             discount = (
                 item.get('discount') or 
                 item.get('discountPercent') or 
@@ -350,7 +353,7 @@ class MyntraScraper(BasePlatformHandler):
                 match = re.search(r'(\d+)', discount)
                 discount = int(match.group(1)) if match else 0
             
-            # Extract image
+            # Image
             images = item.get('images') or item.get('searchImage') or item.get('image') or []
             if isinstance(images, list) and images:
                 image_url = images[0].get('src') if isinstance(images[0], dict) else images[0]
@@ -362,8 +365,25 @@ class MyntraScraper(BasePlatformHandler):
             # Fix image URL
             if image_url and not image_url.startswith('http'):
                 image_url = f"https:{image_url}" if image_url.startswith('//') else f"https://assets.myntassets.com{image_url}"
+
+            # Color with confidence (API)
+            color = None
+            color_confidence = 0.0
+            color_source = None
+
+            color_options = item.get('colorOptions') or item.get('colours') or []
+            if color_options and isinstance(color_options, list):
+                color = color_options[0].get('colorName') if isinstance(color_options[0], dict) else str(color_options[0])
+                color_confidence = 0.88
+                color_source = "api"
+
+            if not color:
+                color = item.get('colour') or item.get('color') or item.get('baseColour')
+                if color:
+                    color_confidence = 0.85
+                    color_source = "api"
             
-            # Extract rating
+            # Rating
             rating_data = item.get('rating') or {}
             if isinstance(rating_data, dict):
                 rating = rating_data.get('averageRating') or rating_data.get('average') or rating_data.get('value')
@@ -371,11 +391,15 @@ class MyntraScraper(BasePlatformHandler):
             else:
                 rating = item.get('averageRating')
                 review_count = item.get('ratingCount')
+            try:
+                parsed_review_count = int(str(review_count).replace(',', '').strip()) if review_count is not None else None
+            except (TypeError, ValueError):
+                parsed_review_count = None
             
             # Build product URL
             product_url = f"{self.BASE_URL}/{product_id}"
-            
-            return ProductData(
+
+            product = ProductData(
                 external_id=product_id,
                 title=title.strip()[:200],
                 current_price=Decimal(str(current_price)),
@@ -385,8 +409,7 @@ class MyntraScraper(BasePlatformHandler):
                 platform_name="myntra",
                 image_url=image_url,
                 rating=float(rating) if rating else None,
-                review_count=int(review_count) if review_count else None,
-                brand=brand.strip() if brand else None,
+                review_count=parsed_review_count,
                 category="Fashion",
                 in_stock=True,
                 stock_status=StockStatus.IN_STOCK,
@@ -394,6 +417,14 @@ class MyntraScraper(BasePlatformHandler):
                 data_source=HandlerType.SCRAPER,
                 raw_data={"source": "api_intercepted"}
             )
+
+            if brand:
+                product.set_attribute_with_confidence("brand", brand.strip(), brand_source, brand_confidence)
+
+            if color:
+                product.set_attribute_with_confidence("color", color, color_source, color_confidence)
+
+            return product
         
         except Exception as e:
             logger.debug(f"Parse product item error: {e}")
@@ -512,6 +543,11 @@ class MyntraScraper(BasePlatformHandler):
                     ))
                 except Exception as e:
                     logger.debug(f"DOM product parsing error: {e}")
+
+            if not products:
+                healed_product = await self._extract_search_with_ai_healing(page_obj)
+                if healed_product:
+                    products.append(healed_product)
             
             logger.info(f"✅ DOM extraction found {len(products)} products")
         
@@ -519,6 +555,62 @@ class MyntraScraper(BasePlatformHandler):
             logger.error(f"DOM extraction error: {e}")
         
         return products
+
+    async def _extract_search_with_ai_healing(self, page_obj) -> Optional[ProductData]:
+        """Last-resort search extraction using universal self-healing selectors."""
+        try:
+            html_content = await page_obj.content()
+            healed = await self.auto_healing_extraction(
+                page_obj,
+                html_content,
+                fields=["product_title", "product_price", "product_url", "product_image", "brand", "product_rating", "review_count"],
+                test_timeout=4.0,
+            )
+
+            title = healed.get("product_title")
+            price = healed.get("product_price")
+            if not title or price is None:
+                return None
+
+            price_value = Decimal(str(price))
+            if price_value <= 0:
+                return None
+
+            url = healed.get("product_url") or ""
+            if url and not str(url).startswith("http"):
+                url = f"{self.BASE_URL}{url}" if str(url).startswith("/") else f"{self.BASE_URL}/{url}"
+
+            product_id = self.extract_product_id(url) if url else None
+            if not product_id:
+                product_id = hashlib.md5(f"{title}-{price_value}".encode()).hexdigest()[:16]
+
+            rating = healed.get("product_rating")
+            review_count = healed.get("review_count")
+            try:
+                review_count = int(str(review_count).replace(",", "").strip()) if review_count is not None else None
+            except (TypeError, ValueError):
+                review_count = None
+
+            logger.info("🤖 Myntra AI healing recovered a search result")
+            return ProductData(
+                external_id=product_id,
+                title=str(title)[:200],
+                current_price=price_value,
+                product_url=self.build_affiliate_url(url) if url else "",
+                platform_name="myntra",
+                image_url=healed.get("product_image"),
+                brand=healed.get("brand"),
+                rating=float(rating) if rating is not None else None,
+                review_count=review_count,
+                category="Fashion",
+                in_stock=True,
+                extraction_method=ExtractionMethod.AI_HEALED,
+                data_source=HandlerType.SCRAPER,
+                raw_data={"source": "ai_healed_search", "stats": healed.get("_extraction_stats", {})},
+            )
+        except Exception as e:
+            logger.debug(f"AI-healed search extraction failed: {e}")
+            return None
     
     # =========================================================================
     # PRODUCT DETAILS
@@ -692,6 +784,7 @@ class MyntraScraper(BasePlatformHandler):
     ) -> Optional[ProductData]:
         """Fallback: Extract product from DOM"""
         try:
+            used_ai_healing = False
             product_data = await page_obj.evaluate('''() => {
                 const result = {
                     title: null,
@@ -754,7 +847,22 @@ class MyntraScraper(BasePlatformHandler):
             }''')
             
             if not product_data.get('title') or not product_data.get('price'):
-                return None
+                healed = await self.auto_healing_extraction(
+                    page_obj,
+                    await page_obj.content(),
+                    fields=["product_title", "product_price", "product_image", "brand", "product_rating", "review_count"],
+                    test_timeout=4.0,
+                )
+                if healed.get("product_title") and healed.get("product_price"):
+                    used_ai_healing = True
+                    product_data["title"] = healed.get("product_title")
+                    product_data["price"] = str(healed.get("product_price"))
+                    product_data["image"] = healed.get("product_image") or product_data.get("image")
+                    product_data["brand"] = healed.get("brand") or product_data.get("brand")
+                    product_data["rating"] = healed.get("product_rating") or product_data.get("rating")
+                    product_data["reviewCount"] = healed.get("review_count") or product_data.get("reviewCount")
+                else:
+                    return None
             
             if not product_id:
                 product_id = hashlib.md5(product_url.encode()).hexdigest()[:16]
@@ -772,7 +880,7 @@ class MyntraScraper(BasePlatformHandler):
                 review_count=int(product_data['reviewCount']) if product_data.get('reviewCount') else None,
                 category="Fashion",
                 in_stock=True,
-                extraction_method=ExtractionMethod.DOM_JAVASCRIPT,
+                extraction_method=ExtractionMethod.AI_HEALED if used_ai_healing else ExtractionMethod.DOM_JAVASCRIPT,
                 data_source=HandlerType.SCRAPER
             )
         

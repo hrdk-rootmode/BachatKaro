@@ -28,7 +28,8 @@ from app.services.scraper.base import (
     ProductData,
     SearchResult,
     HandlerType,
-    StockStatus
+    StockStatus,
+    ExtractionMethod,
 )
 from app.services.scraper.browser import get_browser_manager
 from app.services.scraper.rate_limiter import RateLimiter, ThreatLevel
@@ -283,6 +284,7 @@ class GenericAIScraper(BasePlatformHandler):
                 in_stock=in_stock,
                 stock_status=StockStatus.IN_STOCK if in_stock else StockStatus.OUT_OF_STOCK,
                 data_source=HandlerType.SCRAPER,
+                extraction_method=ExtractionMethod.JSON_LD,
                 raw_data={"json_ld": data}
             )
         
@@ -373,6 +375,7 @@ Rules:
                 review_count=int(data["review_count"]) if data.get("review_count") else None,
                 in_stock=data.get("in_stock", True),
                 data_source=HandlerType.SCRAPER,
+                extraction_method=ExtractionMethod.AI_HEALED,
                 raw_data={"ai_extracted": data}
             )
         

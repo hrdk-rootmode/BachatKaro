@@ -18,12 +18,35 @@ import json
 import logging
 import hashlib
 import threading
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List, Tuple
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
+
+
+def _is_selector_cacheable(selector: str) -> bool:
+    """Basic safety checks before persisting a healed selector."""
+    if not selector:
+        return False
+
+    s = selector.strip()
+    if len(s) < 2 or len(s) > 300:
+        return False
+
+    # Avoid obvious malformed or executable payloads.
+    if any(x in s.lower() for x in ["javascript:", "<script", "function(", "=>"]):
+        return False
+
+    if any(ch in s for ch in ['{', '}', ';']):
+        return False
+
+    if re.search(r"\s{2,}", s):
+        return False
+
+    return True
 
 
 # =============================================================================
@@ -366,6 +389,12 @@ class SelectorCache:
             method: How selector was obtained (healed, ai_generated, manual, promoted)
         """
         with self._lock:
+            if not _is_selector_cacheable(selector):
+                logger.warning(
+                    f"⚠️ Skipping invalid selector cache write for {platform}.{selector_name}: {str(selector)[:60]}"
+                )
+                return
+
             platform = platform.lower()
             
             if platform not in self._cache:

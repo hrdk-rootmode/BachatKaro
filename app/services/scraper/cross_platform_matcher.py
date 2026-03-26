@@ -166,9 +166,35 @@ GARMENT_TYPE_PATTERNS = re.compile(
 ACCESSORY_PATTERNS = re.compile(
     r'\b(cover|case|screen guard|protector|tempered glass|charger|cable|'
     r'holder|stand|skin|pouch|adapter|back cover|flip cover|earphone|'
-    r'strap|band|sleeve|bag|mount|for\s+\w+)\b',
+    r'strap|band|sleeve|bag|mount|phone case|camera lens protector|'
+    r'keyboard cover|laptop skin|watch strap)\b',
     re.I
 )
+
+ACCESSORY_KIND_PATTERNS = {
+    'cover': re.compile(r'\b(cover|case|back cover|flip cover|phone case|laptop skin)\b', re.I),
+    'screen_protector': re.compile(r'\b(screen guard|protector|tempered glass|lens protector)\b', re.I),
+    'charger_cable': re.compile(r'\b(charger|cable|adapter)\b', re.I),
+    'holder_mount': re.compile(r'\b(holder|stand|mount)\b', re.I),
+    'wearable_strap': re.compile(r'\b(strap|band|watch strap)\b', re.I),
+    'audio_accessory': re.compile(r'\b(earphone|earbud case|headphone case)\b', re.I),
+}
+
+PRODUCT_TYPE_PATTERNS = {
+    'phone': re.compile(r'\b(phone|smartphone|iphone|galaxy\s*s\d+|pixel\s*\d+|oneplus|mobile)\b', re.I),
+    'laptop': re.compile(r'\b(laptop|notebook|macbook|thinkpad|ideapad|vivobook|zenbook)\b', re.I),
+    'tablet': re.compile(r'\b(tablet|ipad|tab)\b', re.I),
+    'watch': re.compile(r'\b(smart\s*watch|watch)\b', re.I),
+    'tv': re.compile(r'\b(tv|television|qled|oled|smart\s*tv)\b', re.I),
+    'earbuds': re.compile(r'\b(earbuds|earphones|headphones|airpods|neckband)\b', re.I),
+    'shirt': re.compile(r'\b(t[\s\-]?shirt|shirt|polo)\b', re.I),
+    'jeans': re.compile(r'\b(jeans|denim)\b', re.I),
+    'dress': re.compile(r'\b(dress|gown)\b', re.I),
+    'kurti': re.compile(r'\b(kurti|kurta|saree)\b', re.I),
+    'shoes': re.compile(r'\b(shoes|sneakers|sandals|slippers|loafers)\b', re.I),
+    'book': re.compile(r'\b(book|paperback|hardcover|kindle\s*edition)\b', re.I),
+    'appliance': re.compile(r'\b(refrigerator|fridge|washing machine|air fryer|mixer|grinder|microwave)\b', re.I),
+}
 
 REFURBISHED_PATTERNS = re.compile(
     r'\b(renewed|refurbished|refurb|used|pre[\s\-]?owned|open[\s\-]?box)\b',
@@ -261,6 +287,33 @@ def is_accessory(title: str) -> bool:
     return bool(ACCESSORY_PATTERNS.search(title)) if title else False
 
 
+def get_accessory_kind(title: str) -> Optional[str]:
+    """Classify accessory subtype to prevent case-vs-charger mismatches."""
+    if not title:
+        return None
+
+    for kind, pattern in ACCESSORY_KIND_PATTERNS.items():
+        if pattern.search(title):
+            return kind
+
+    return None
+
+
+def detect_product_type(title: str, specs: Optional[ProductSpecs] = None) -> Optional[str]:
+    """Infer the core product type from title/specs for strict cross-type rejection."""
+    if not title:
+        return None
+
+    for product_type, pattern in PRODUCT_TYPE_PATTERNS.items():
+        if pattern.search(title):
+            return product_type
+
+    if specs and specs.is_accessory:
+        return "accessory"
+
+    return None
+
+
 def is_refurbished(title: str) -> bool:
     """Check if product is refurbished"""
     return bool(REFURBISHED_PATTERNS.search(title)) if title else False
@@ -308,8 +361,10 @@ def check_quality_gate(title: str, specs: ProductSpecs) -> Tuple[bool, str]:
     if len(words) < 2:
         return False, f"Too few words ({len(words)})"
     
+    category_type = (specs.category_type or "").lower()
+
     # Electronics/watches need brand OR model
-    if specs.category_type in ("electronics", "watches"):
+    if category_type in ("electronics", "watches"):
         if not specs.brand and not specs.product_line and not specs.storage_gb:
             return False, "No brand/model/specs detected for electronics"
             
@@ -322,6 +377,10 @@ def check_quality_gate(title: str, specs: ProductSpecs) -> Tuple[bool, str]:
     # NEW: Reject if title is literally just the brand name (e.g. "VANGULL...")
     if specs.brand and title_lower.replace(specs.brand.lower(), '').strip() == "":
         return False, "Title is just the brand name"
+
+    # Explicitly block accessory-like titles from passing as core electronics.
+    if category_type in ("electronics", "watches") and specs.is_accessory:
+        return False, "Accessory title in electronics flow"
     
     return True, "OK"
 
@@ -345,17 +404,17 @@ class CrossPlatformMatcher:
     - seed.py continues to work
     """
     
-    MIN_SIMILARITY_SCORE = 0.70  # Raised from 0.55
+    MIN_SIMILARITY_SCORE = 0.65  # Slightly relaxed to recover true positives
     ESSENCE_MATCH_SCORE = 1.0
     MAX_CONCURRENT_SEARCHES = 4
     SEARCH_TIMEOUT_SECONDS = 30
     
     # Price tolerances by category
     PRICE_TOLERANCE = {
-        'electronics': 0.30,
+        'electronics': 0.45,
         'fashion': 0.60,
-        'watches': 0.40,
-        'general': 0.40,
+        'watches': 0.50,
+        'general': 0.50,
     }
     
     SCREEN_SIZE_TOLERANCE = 0.3  # inches
@@ -414,7 +473,19 @@ class CrossPlatformMatcher:
             return [source_product]  # Return source only
         
         alternatives = [source_product]
-        found_fingerprints = {source_product.fingerprint}
+        seen_platforms = {source_product.platform_name.lower()}
+        seen_listing_keys = {
+            (
+                source_product.platform_name.lower(),
+                (source_product.external_id or source_product.product_url or source_product.fingerprint or "").lower(),
+            )
+        }
+
+        def listing_key(product: ProductData) -> Tuple[str, str]:
+            return (
+                product.platform_name.lower(),
+                (product.external_id or product.product_url or product.fingerprint or "").lower(),
+            )
         
         logger.info(
             f"Finding alternatives for: {source_product.title[:50]}... "
@@ -432,9 +503,12 @@ class CrossPlatformMatcher:
             )
             
             for match in db_matches:
-                if match.fingerprint not in found_fingerprints:
+                key = listing_key(match)
+                platform_name = match.platform_name.lower()
+                if key not in seen_listing_keys and platform_name not in seen_platforms:
                     alternatives.append(match)
-                    found_fingerprints.add(match.fingerprint)
+                    seen_listing_keys.add(key)
+                    seen_platforms.add(platform_name)
             
             if db_matches:
                 logger.info(f"Found {len(db_matches)} DB matches")
@@ -446,13 +520,16 @@ class CrossPlatformMatcher:
                 source_specs,
                 db,
                 skip_platforms,
-                found_fingerprints
+                seen_listing_keys
             )
             
             for match in live_matches:
-                if match.fingerprint not in found_fingerprints:
+                key = listing_key(match)
+                platform_name = match.platform_name.lower()
+                if key not in seen_listing_keys and platform_name not in seen_platforms:
                     alternatives.append(match)
-                    found_fingerprints.add(match.fingerprint)
+                    seen_listing_keys.add(key)
+                    seen_platforms.add(platform_name)
                     
                     if len(alternatives) >= max_results:
                         break
@@ -570,7 +647,12 @@ class CrossPlatformMatcher:
                 )
                 
                 # Tier 1: Hard reject
-                passed, reject_reason = self._tier1_spec_reject(source_specs, target_specs)
+                passed, reject_reason = self._tier1_spec_reject(
+                    source_specs,
+                    target_specs,
+                    source_title=source_product.title,
+                    target_title=product.title,
+                )
                 if not passed:
                     logger.debug(f"DB listing rejected: {reject_reason}")
                     continue
@@ -611,7 +693,7 @@ class CrossPlatformMatcher:
         source_specs: ProductSpecs,
         db: Optional[Any],
         skip_platforms: Set[str],
-        found_fingerprints: Set[str]
+        seen_listing_keys: Set[Tuple[str, str]]
     ) -> List[ProductData]:
         """Search live with v4.0 query generation"""
         category = ProductCategory.detect_from_query(source_product.title)
@@ -651,7 +733,14 @@ class CrossPlatformMatcher:
         for result in results:
             if isinstance(result, Exception):
                 continue
-            if result and result.fingerprint not in found_fingerprints:
+            if not result:
+                continue
+
+            key = (
+                result.platform_name.lower(),
+                (result.external_id or result.product_url or result.fingerprint or "").lower(),
+            )
+            if key not in seen_listing_keys:
                 matches.append(result)
         
         return matches
@@ -706,6 +795,19 @@ class CrossPlatformMatcher:
                     source_specs,
                     search_result.products
                 )
+
+                # Fall back to page 2 when page 1 has no eligible candidate.
+                if not best_match:
+                    second_page = await asyncio.wait_for(
+                        handler.search(query, page=2),
+                        timeout=self.SEARCH_TIMEOUT_SECONDS
+                    )
+                    if second_page and second_page.success and second_page.products:
+                        best_match = await self._find_best_match_v4(
+                            source_product,
+                            source_specs,
+                            second_page.products
+                        )
                 
                 return best_match
             
@@ -725,6 +827,8 @@ class CrossPlatformMatcher:
         """Enhanced matching with 4-tier logic"""
         best_match = None
         best_score = 0
+        scored_candidates: List[Tuple[ProductData, ProductSpecs, float]] = []
+        preprocessed_candidates: List[Tuple[ProductData, ProductSpecs]] = []
         
         for candidate in candidates:
             # Quality gate
@@ -733,36 +837,156 @@ class CrossPlatformMatcher:
                 float(candidate.current_price) if candidate.current_price else None,
                 candidate.category or "general"
             )
+            preprocessed_candidates.append((candidate, target_specs))
             
             passed, reason = check_quality_gate(candidate.title, target_specs)
             if not passed:
                 continue
             
             # Tier 1: Spec hard-reject
-            passed, reject_reason = self._tier1_spec_reject(source_specs, target_specs)
+            passed, reject_reason = self._tier1_spec_reject(
+                source_specs,
+                target_specs,
+                source_title=source.title,
+                target_title=candidate.title,
+            )
             if not passed:
                 logger.debug(f"Rejected: {reject_reason}")
                 continue
             
             # Tier 2: Fuzzy score
             score = self._tier2_fuzzy_score(source, source_specs, candidate, target_specs)
+            scored_candidates.append((candidate, target_specs, score))
             
             if score >= self.MIN_SIMILARITY_SCORE and score > best_score:
                 best_match = candidate
                 best_score = score
+
+        # Recovery pass: if strict pass found nothing, allow a guarded relaxed reject policy.
+        if not best_match:
+            relaxed_threshold = max(0.55, self.MIN_SIMILARITY_SCORE - 0.08)
+            for candidate, target_specs in preprocessed_candidates:
+                passed, _ = check_quality_gate(candidate.title, target_specs)
+                if not passed:
+                    continue
+
+                passed, reject_reason = self._tier1_spec_reject(
+                    source_specs,
+                    target_specs,
+                    source_title=source.title,
+                    target_title=candidate.title,
+                    relaxed=True,
+                )
+                if not passed:
+                    logger.debug(f"Relaxed reject: {reject_reason}")
+                    continue
+
+                score = self._tier2_fuzzy_score(source, source_specs, candidate, target_specs)
+                scored_candidates.append((candidate, target_specs, score))
+                if score >= relaxed_threshold and score > best_score:
+                    best_match = candidate
+                    best_score = score
+
+        # Tier 3: AI disambiguation for ambiguous titles across platforms.
+        # This keeps recall for naming differences while reducing false positives.
+        if scored_candidates and (not best_match or best_score < 0.82):
+            ai_best = await self._tier3_ai_disambiguate(source, source_specs, scored_candidates)
+            if ai_best:
+                return ai_best
         
         return best_match
+
+    async def _tier3_ai_disambiguate(
+        self,
+        source: ProductData,
+        source_specs: ProductSpecs,
+        scored_candidates: List[Tuple[ProductData, ProductSpecs, float]],
+    ) -> Optional[ProductData]:
+        """Use AI normalization (essence/tags) to resolve close matches safely."""
+        if not scored_candidates:
+            return None
+
+        # Keep token usage low by checking only the strongest candidates.
+        ranked = sorted(scored_candidates, key=lambda item: item[2], reverse=True)[:3]
+
+        if not source.ai_essence:
+            source = await self.enrich_with_ai(source)
+
+        best_candidate: Optional[ProductData] = None
+        best_combined_score = 0.0
+
+        for candidate, target_specs, rule_score in ranked:
+            if not candidate.ai_essence:
+                candidate = await self.enrich_with_ai(candidate)
+
+            essence_similarity = 0.0
+            if source.ai_essence and candidate.ai_essence:
+                essence_similarity = self._sequence_similarity(
+                    source.ai_essence.lower(),
+                    candidate.ai_essence.lower(),
+                )
+
+            source_tags = {t.lower() for t in (source.ai_tags or [])}
+            target_tags = {t.lower() for t in (candidate.ai_tags or [])}
+            tag_overlap = 0.0
+            if source_tags and target_tags:
+                union = source_tags.union(target_tags)
+                tag_overlap = (len(source_tags.intersection(target_tags)) / len(union)) if union else 0.0
+
+            # Preserve strict non-match rules even after AI enrichment.
+            passed, _ = self._tier1_spec_reject(
+                source_specs,
+                target_specs,
+                source_title=source.title,
+                target_title=candidate.title,
+            )
+            if not passed:
+                continue
+
+            combined_score = (rule_score * 0.65) + (essence_similarity * 0.30) + (tag_overlap * 0.05)
+
+            if combined_score > best_combined_score and combined_score >= max(0.62, self.MIN_SIMILARITY_SCORE):
+                best_candidate = candidate
+                best_combined_score = combined_score
+
+        return best_candidate
     
     def _tier1_spec_reject(
         self,
         source: ProductSpecs,
-        target: ProductSpecs
+        target: ProductSpecs,
+        source_title: str = "",
+        target_title: str = "",
+        relaxed: bool = False,
     ) -> Tuple[bool, str]:
         """Tier 1: Hard spec rejection"""
+
+        source_type = detect_product_type(source_title or "", source)
+        target_type = detect_product_type(target_title or "", target)
+
+        # Fallback to title-driven type inference if model field is unavailable.
+        if not source_type:
+            source_type = "accessory" if source.is_accessory else None
+        if not target_type:
+            target_type = "accessory" if target.is_accessory else None
         
         # Accessory mismatch
         if target.is_accessory and not source.is_accessory:
             return False, "Target is accessory"
+
+        if source.is_accessory and not target.is_accessory:
+            return False, "Source is accessory, target is core product"
+
+        # Reject accessory subtype mismatches (e.g. cover vs charger).
+        if source.is_accessory and target.is_accessory:
+            source_kind = get_accessory_kind(source_title or "")
+            target_kind = get_accessory_kind(target_title or "")
+            if source_kind and target_kind and source_kind != target_kind:
+                return False, f"Accessory kind: {source_kind} vs {target_kind}"
+
+        # Reject clear product-type mismatch (phone vs laptop, shirt vs shoes, etc.).
+        if source_type and target_type and source_type != target_type:
+            return False, f"Product type: {source_type} vs {target_type}"
         
         # Refurbished vs new
         if target.is_refurbished and not source.is_refurbished:
@@ -781,7 +1005,7 @@ class CrossPlatformMatcher:
                 return False, f"Product-line: {source.product_line} vs {target.product_line}"
         
         # RAM mismatch
-        if source.ram_gb and target.ram_gb and source.ram_gb != target.ram_gb:
+        if not relaxed and source.ram_gb and target.ram_gb and source.ram_gb != target.ram_gb:
             return False, f"RAM: {source.ram_gb}GB vs {target.ram_gb}GB"
         
         # Storage mismatch
@@ -794,7 +1018,7 @@ class CrossPlatformMatcher:
                 return False, f"Screen: {source.screen_size}\" vs {target.screen_size}\""
         
         # Critical variant mismatch
-        if source.generation or target.generation:
+        if not relaxed and (source.generation or target.generation):
             sg = set((source.generation or "").lower().split())
             tg = set((target.generation or "").lower().split())
             sc = sg.intersection(CRITICAL_VARIANTS)
@@ -803,7 +1027,7 @@ class CrossPlatformMatcher:
                 return False, f"Variant: {source.generation or 'Std'} vs {target.generation or 'Std'}"
         
         # Price check
-        if source.price and target.price and source.price > 0 and target.price > 0:
+        if not relaxed and source.price and target.price and source.price > 0 and target.price > 0:
             tolerance = self.PRICE_TOLERANCE.get(source.category_type, 0.40)
             ratio = target.price / source.price
             if ratio < (1 - tolerance) or ratio > (1 + tolerance):

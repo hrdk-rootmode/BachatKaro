@@ -242,6 +242,8 @@ async def _scrape_platform(
         "scraped": 0,
         "updated": 0,
         "failed": 0,
+        "marked_out_of_stock": 0,
+        "skipped_low_confidence": 0,
         "price_changes": 0,
         "errors": []
     }
@@ -249,6 +251,11 @@ async def _scrape_platform(
     consecutive_errors = 0
     
     for i, listing in enumerate(listings, 1):
+        min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
+        if listing.extraction_confidence is not None and listing.extraction_confidence < min_confidence:
+            stats["skipped_low_confidence"] += 1
+            continue
+
         # Skip platform if too many errors
         if consecutive_errors >= MAX_ERRORS_BEFORE_SKIP:
             logger.warning(f"⚠️ Skipping {platform_name} after {consecutive_errors} errors")
@@ -257,7 +264,21 @@ async def _scrape_platform(
         
         try:
             # Scrape product price
-            new_price = await _scrape_product_price(platform_name, listing)
+            new_price, scraped_in_stock = await _scrape_product_price(platform_name, listing)
+
+            if scraped_in_stock is not None:
+                listing.in_stock = scraped_in_stock
+
+            # Explicit out-of-stock is a valid scrape result; keep it out of failed bucket.
+            if scraped_in_stock is False:
+                listing.last_scraped = datetime.now(pytz.UTC)
+                listing.scrape_error_count = 0
+                listing.last_error = None
+                stats["scraped"] += 1
+                stats["updated"] += 1
+                stats["marked_out_of_stock"] += 1
+                consecutive_errors = 0
+                continue
             
             if new_price is not None:
                 old_price = listing.current_price
@@ -333,20 +354,25 @@ async def _scrape_platform(
 async def _scrape_product_price(
     platform_name: str,
     listing: ProductListing
-) -> Optional[float]:
+) -> tuple[Optional[float], Optional[bool]]:
     """
     Scrape current price for a product
     
     In development mode: Returns simulated price
     In production: Uses actual scraper
+
+    Returns:
+        (price, in_stock)
+        - price can be None when unavailable or scraping fails
+        - in_stock is None when availability cannot be determined
     """
     # Development/Mock mode
     if settings.DEBUG or settings.ENVIRONMENT == "development":
         if listing.current_price:
             # Simulate small price variations for testing
             variation = random.uniform(-0.05, 0.05)
-            return round(float(listing.current_price) * (1 + variation), 2)
-        return None
+            return round(float(listing.current_price) * (1 + variation), 2), True
+        return None, listing.in_stock
     
     # Production: Use actual scraper
     try:
@@ -354,14 +380,20 @@ async def _scrape_product_price(
         
         handler = await get_platform_handler(platform_name)
         if not handler:
-            return None
+            return None, None
         
         product_data = await handler.get_product(listing.product_url)
+
+        if not product_data:
+            return None, None
+
+        if getattr(product_data, "in_stock", True) is False:
+            return None, False
         
         if product_data and product_data.current_price:
-            return float(product_data.current_price)
+            return float(product_data.current_price), getattr(product_data, "in_stock", True)
         
-        return None
+        return None, getattr(product_data, "in_stock", None)
         
     except Exception as e:
         logger.debug(f"Scraper error for {platform_name}: {e}")

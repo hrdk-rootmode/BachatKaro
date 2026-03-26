@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Test Backend Health",
+			"type": "shell",
+			"command": "curl",
+			"args": [
+				"-s",
+				"-w",
+				"\\n%{http_code}\\n",
+				"http://10.175.109.203:8000/api/v1/search/trending"
+			]
+		}
+	]
+}

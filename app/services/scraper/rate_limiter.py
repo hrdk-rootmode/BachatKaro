@@ -274,6 +274,22 @@ class RateLimiter:
             min_delay_seconds=4.0,
             max_delay_seconds=9.0,
             failure_threshold=2
+        ),
+        "nykaa": RateLimitConfig(
+            requests_per_minute=9,
+            requests_per_hour=130,
+            requests_per_day=1200,
+            min_delay_seconds=4.5,
+            max_delay_seconds=10.0,
+            failure_threshold=2
+        ),
+        "croma": RateLimitConfig(
+            requests_per_minute=8,
+            requests_per_hour=110,
+            requests_per_day=1000,
+            min_delay_seconds=5.0,
+            max_delay_seconds=11.0,
+            failure_threshold=2
         )
     }
     

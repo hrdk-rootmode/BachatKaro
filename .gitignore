@@ -3,12 +3,21 @@ verify_*.py
 venv/
 __pycache__/
 *.pyc
-alembic/
 # scripts/test_*.py
 firebase-adminsdk.json
 # test_*.py
 debug_output/
 results/
 *.md
+run_logs/
+
+alembic/README.md
+alembic/script.py.mako
 
 test_search_*.py
+mining_*.json
+tmp_check_healing_stats.py
+tmp_color_backfill.py
+tmp_color_check.py
+tmp_db_check.py
+cache/

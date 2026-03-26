@@ -828,7 +828,7 @@ async def get_subscription_status(
     # Map plan to UserPlan enum
     plan_mapping = {
         "free": UserPlan.FREE,
-        "pro": UserPlan.BASIC,
+        "pro": UserPlan.PRO,
         "premium": UserPlan.PREMIUM
     }
     user_plan = plan_mapping.get(plan, UserPlan.FREE)

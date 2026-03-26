@@ -466,6 +466,7 @@ class UniversalSelfHealingEngine:
         # Platform learning
         self._learned_patterns: Dict[str, List[str]] = {}
         self._platform_characteristics: Dict[str, Any] = {}
+        self.db_session = None
         
         # Load existing healed selectors
         self._load_healed_selectors()
@@ -824,7 +825,7 @@ class UniversalSelfHealingEngine:
             selector = await groq_client.suggest_selector_fix(
                 html_snippet=minified_html[:8000],
                 failed_selector=str(failed_selector),
-                target_data=field_description,
+                target_data=field,
                 platform_name=self.platform_name
             )
             
@@ -946,13 +947,14 @@ class UniversalSelfHealingEngine:
         selector: str,
         method: HealingMethod
     ) -> None:
-        """Save newly discovered selector"""
+        """Save newly discovered selector to cache and database."""
         if field not in self.healed_selectors:
             self.healed_selectors[field] = []
         
         # Check if already exists
         for existing in self.healed_selectors[field]:
             if existing.selector == selector:
+                logger.debug(f"Selector already exists for {field}")
                 return
         
         healed = HealedSelector(
@@ -977,8 +979,180 @@ class UniversalSelfHealingEngine:
             selector,
             method.value
         )
+
+        await self._persist_to_database(field, selector, method)
         
         logger.info(f"💾 Saved healed selector: {self.platform_name}.{field}")
+
+    async def _persist_to_database(
+        self,
+        field: str,
+        selector: str,
+        method: HealingMethod
+    ) -> bool:
+        """Persist a healed selector to database platforms table."""
+        try:
+            from app.services.ai.groq_client import groq_client
+
+            selectors_to_save = {field: selector}
+            success = await groq_client.persist_healed_selectors(
+                platform_name=self.platform_name,
+                selectors=selectors_to_save,
+                db_session=self.db_session,
+            )
+
+            if success:
+                logger.info(f"💾 Persisted to DB: {self.platform_name}.{field}")
+
+            return success
+        except Exception as e:
+            logger.error(f"❌ DB persistence failed: {e}")
+            return False
+
+    async def persist_all_healed_selectors(self, db_session=None) -> int:
+        """Persist all current healed selectors to database."""
+        if not self.healed_selectors:
+            return 0
+
+        try:
+            from app.services.ai.groq_client import groq_client
+
+            active_session = db_session or self.db_session
+            selectors_to_save: Dict[str, str] = {}
+
+            for field, selector_list in self.healed_selectors.items():
+                if not selector_list:
+                    continue
+
+                best = selector_list[0]
+                if best.health.value in ["excellent", "good", "degraded"]:
+                    selectors_to_save[field] = best.selector
+
+            if not selectors_to_save:
+                return 0
+
+            success = await groq_client.persist_healed_selectors(
+                platform_name=self.platform_name,
+                selectors=selectors_to_save,
+                db_session=active_session,
+            )
+
+            if success:
+                logger.info(
+                    f"💾 Persisted {len(selectors_to_save)} selectors "
+                    f"for {self.platform_name} to database"
+                )
+                return len(selectors_to_save)
+
+            return 0
+        except Exception as e:
+            logger.error(f"❌ Bulk persistence failed: {e}")
+            return 0
+
+    async def update_platform_healing_stats(self, db_session=None) -> bool:
+        """Update platform healing statistics in database."""
+        active_session = db_session or self.db_session
+        if not active_session:
+            return False
+
+        try:
+            from sqlalchemy import select
+            from app.models import Platform
+
+            result = await active_session.execute(
+                select(Platform).where(Platform.name == self.platform_name)
+            )
+            platform = result.scalar_one_or_none()
+
+            if not platform:
+                logger.warning(f"Platform {self.platform_name} not found in database")
+                return False
+
+            healing_stats = {
+                "total_attempts": sum(self._healing_attempts.values()),
+                "successful_heals": len(self.healed_selectors),
+                "fields": {},
+                "last_updated": datetime.utcnow().isoformat(),
+            }
+
+            for field, selector_list in self.healed_selectors.items():
+                if not selector_list:
+                    continue
+
+                total_success = sum(s.success_count for s in selector_list)
+                total_fail = sum(s.fail_count for s in selector_list)
+
+                healing_stats["fields"][field] = {
+                    "attempts": self._healing_attempts.get(field, 0),
+                    "selectors_count": len(selector_list),
+                    "total_successes": total_success,
+                    "total_failures": total_fail,
+                    "best_health": selector_list[0].health.value if selector_list else "unknown",
+                }
+
+            platform.healing_stats = healing_stats
+            platform.last_healed_at = datetime.utcnow()
+
+            await active_session.commit()
+            logger.info(f"📊 Updated healing stats for {self.platform_name}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Stats update failed: {e}")
+            try:
+                await active_session.rollback()
+            except Exception:
+                pass
+            return False
+
+    async def append_to_selector_history(
+        self,
+        field: str,
+        old_selector: str,
+        new_selector: str,
+        reason: str,
+        db_session=None,
+    ) -> bool:
+        """Append healing event to platform selector history."""
+        active_session = db_session or self.db_session
+        if not active_session:
+            return False
+
+        try:
+            from sqlalchemy import select
+            from app.models import Platform
+
+            result = await active_session.execute(
+                select(Platform).where(Platform.name == self.platform_name)
+            )
+            platform = result.scalar_one_or_none()
+
+            if not platform:
+                return False
+
+            history = platform.selector_history or []
+            history.append(
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "field": field,
+                    "old_selector": old_selector[:100],
+                    "new_selector": new_selector[:100],
+                    "reason": reason,
+                    "method": "ai_healing",
+                }
+            )
+
+            platform.selector_history = history[-50:]
+
+            await active_session.commit()
+            logger.info(f"📝 Appended to selector history: {self.platform_name}.{field}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ History append failed: {e}")
+            try:
+                await active_session.rollback()
+            except Exception:
+                pass
+            return False
     
     async def _promote_to_primary(self, field: str, selector: str) -> None:
         """Promote healed selector to primary"""

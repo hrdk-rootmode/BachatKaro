@@ -20,6 +20,7 @@ import asyncio
 import time
 import random
 import hashlib
+from html import unescape
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
@@ -129,6 +130,7 @@ class AmazonScraper(BasePlatformHandler):
     
     def set_db_session(self, session):
         """Set database session for persisting healed selectors"""
+        super().set_db_session(session)
         self._db_session = session
     
     async def _get_browser(self) -> BrowserManager:
@@ -351,8 +353,8 @@ class AmazonScraper(BasePlatformHandler):
                 # TIER 1: ASIN Extraction
                 # ========================================
                 products = await self._extract_search_by_asin(page_obj)
-                
-                if products and len(products) >= 5:
+
+                if products and len(products) >= 2:
                     extraction_method = ExtractionMethod.DOM_SELECTOR
                     logger.info(f"✅ TIER 1 (ASIN): {len(products)} products")
                 else:
@@ -360,11 +362,23 @@ class AmazonScraper(BasePlatformHandler):
                     # TIER 2: JavaScript Extraction
                     # ========================================
                     js_products = await self._extract_search_javascript(page_obj)
-                    
-                    if js_products and len(js_products) >= 5:
+
+                    if products and js_products:
+                        # Merge by external_id to avoid escalating when both tiers are partially good.
+                        merged = {p.external_id: p for p in products if getattr(p, "external_id", None)}
+                        for p in js_products:
+                            ext_id = getattr(p, "external_id", None)
+                            if ext_id and ext_id not in merged:
+                                merged[ext_id] = p
+                        products = list(merged.values())
+
+                    if js_products and len(js_products) >= 2:
                         products = js_products
                         extraction_method = ExtractionMethod.DOM_JAVASCRIPT
                         logger.info(f"✅ TIER 2 (JS): {len(products)} products")
+                    elif products and len(products) >= 2:
+                        extraction_method = ExtractionMethod.DOM_SELECTOR
+                        logger.info(f"✅ TIER 1+2 (MERGED): {len(products)} products")
                     else:
                         # ========================================
                         # TIER 3: 🚀 AI HEALING (The Magic)
@@ -384,6 +398,17 @@ class AmazonScraper(BasePlatformHandler):
                                 products = healed_products
                                 extraction_method = ExtractionMethod.AI_HEALED
                                 logger.info(f"✅ TIER 3 (AI HEALED): {len(products)} products")
+
+                        # ========================================
+                        # TIER 4: RESILIENT FALLBACK (No-stop mode)
+                        # ========================================
+                        if not products:
+                            logger.warning("⚠️ AI healing failed, trying resilient fallback extraction...")
+                            fallback_products = await self._extract_search_resilient_fallback(page_obj, html_content)
+                            if fallback_products:
+                                products = fallback_products
+                                extraction_method = ExtractionMethod.REGEX_FALLBACK
+                                logger.info(f"✅ TIER 4 (RESILIENT): {len(products)} products")
             
             await self.rate_limiter.record_success("amazon")
             self.record_success()
@@ -526,10 +551,11 @@ class AmazonScraper(BasePlatformHandler):
         return products
     
     async def _extract_search_item(self, element, asin: str) -> Optional[ProductData]:
-        """Extract single search result item"""
+        """Extract single search result item with confidence tracking"""
         try:
             # Title - try multiple selectors
             title = None
+            title_source = "dom"
             for sel in ["h2 a span", "h2 span", ".a-text-normal", "h2.a-spacing-none span"]:
                 title_el = await element.query_selector(sel)
                 if title_el:
@@ -556,6 +582,19 @@ class AmazonScraper(BasePlatformHandler):
             # Image
             image_el = await element.query_selector(".s-image, img")
             image_url = await image_el.get_attribute("src") if image_el else None
+
+            # Brand with confidence
+            brand = None
+            brand_confidence = 0.0
+            brand_source = None
+
+            brand_el = await element.query_selector("#bylineInfo, a#brand, .a-row a[href*='brand']")
+            if brand_el:
+                brand_text = await brand_el.text_content()
+                if brand_text:
+                    brand = brand_text.replace("Visit the", "").replace("Store", "").strip()
+                    brand_confidence = 0.75
+                    brand_source = "dom"
             
             # Rating
             rating_el = await element.query_selector(".a-icon-star-small .a-icon-alt, .a-icon-star .a-icon-alt")
@@ -573,8 +612,8 @@ class AmazonScraper(BasePlatformHandler):
             
             discount = self._calculate_discount(current_price, original_price)
             product_url = f"{self.BASE_URL}/dp/{asin}"
-            
-            return ProductData(
+
+            product = ProductData(
                 external_id=asin,
                 title=title.strip()[:200],
                 current_price=current_price,
@@ -589,8 +628,13 @@ class AmazonScraper(BasePlatformHandler):
                 stock_status=StockStatus.IN_STOCK,
                 extraction_method=ExtractionMethod.DOM_SELECTOR,
                 data_source=HandlerType.SCRAPER,
-                raw_data={"asin": asin, "is_prime": is_prime}
+                raw_data={"asin": asin, "is_prime": is_prime, "title_source": title_source}
             )
+
+            if brand:
+                product.set_attribute_with_confidence("brand", brand, brand_source, brand_confidence)
+
+            return product
         
         except Exception as e:
             logger.debug(f"Extract search item error: {e}")
@@ -666,6 +710,145 @@ class AmazonScraper(BasePlatformHandler):
         except Exception as e:
             logger.error(f"JS extraction error: {e}")
             return []
+
+    async def _extract_search_resilient_fallback(self, page_obj, html_content: str) -> List[ProductData]:
+        """
+        Last-resort extraction when standard + AI healing fail.
+        Tries broad DOM harvesting first, then regex from raw HTML.
+        """
+        products: List[ProductData] = []
+        seen_asins = set()
+
+        # 1) Broad DOM harvesting with flexible selectors.
+        try:
+            dom_items = await page_obj.evaluate('''() => {
+                const out = [];
+                const cards = document.querySelectorAll('[data-asin]:not([data-asin=""])');
+
+                cards.forEach(card => {
+                    const asin = card.getAttribute('data-asin') || '';
+                    if (!asin || asin.length !== 10) return;
+
+                    const titleEl = card.querySelector('h2 a span, h2 span, [data-cy="title-recipe"], img[alt]');
+                    const title = titleEl
+                        ? (titleEl.textContent || titleEl.getAttribute('alt') || '').trim()
+                        : '';
+
+                    const offscreen = card.querySelector('.a-price .a-offscreen, .a-price-range .a-offscreen');
+                    const whole = card.querySelector('.a-price-whole');
+                    const frac = card.querySelector('.a-price-fraction');
+
+                    let price = '';
+                    if (offscreen && offscreen.textContent) {
+                        price = offscreen.textContent.trim();
+                    } else if (whole && whole.textContent) {
+                        const w = whole.textContent.trim();
+                        const f = frac && frac.textContent ? frac.textContent.trim() : '00';
+                        price = `₹${w}.${f}`;
+                    }
+
+                    const linkEl = card.querySelector('a.a-link-normal[href*="/dp/"], a[href*="/gp/product/"]');
+                    const href = linkEl ? (linkEl.getAttribute('href') || '') : '';
+
+                    const imgEl = card.querySelector('img.s-image, img');
+                    const image = imgEl ? (imgEl.getAttribute('src') || '') : '';
+
+                    if (title && price) {
+                        out.push({ asin, title, price, href, image });
+                    }
+                });
+
+                return out.slice(0, 30);
+            }''')
+
+            for item in dom_items or []:
+                asin = item.get("asin")
+                if not asin or asin in seen_asins:
+                    continue
+
+                cleaned_price = self._clean_price(item.get("price"))
+                title = (item.get("title") or "").strip()
+                if not cleaned_price or len(title) < 5:
+                    continue
+
+                href = item.get("href") or ""
+                if href and href.startswith("/"):
+                    href = f"{self.BASE_URL}{href}"
+                product_url = href or f"{self.BASE_URL}/dp/{asin}"
+
+                products.append(ProductData(
+                    external_id=asin,
+                    title=title[:200],
+                    current_price=cleaned_price,
+                    product_url=self.build_affiliate_url(product_url),
+                    platform_name="amazon",
+                    image_url=item.get("image"),
+                    in_stock=True,
+                    stock_status=StockStatus.IN_STOCK,
+                    extraction_method=ExtractionMethod.REGEX_FALLBACK,
+                    data_source=HandlerType.SCRAPER,
+                    raw_data={"asin": asin, "resilient": True, "source": "dom_harvest"}
+                ))
+                seen_asins.add(asin)
+
+            if len(products) >= 3:
+                return products[:20]
+
+        except Exception as e:
+            logger.debug(f"Resilient DOM harvesting failed: {e}")
+
+        # 2) Regex harvesting from raw HTML blocks.
+        try:
+            blocks = re.findall(
+                r'(<div[^>]+data-asin="([A-Z0-9]{10})"[^>]*>.*?</div>)',
+                html_content or "",
+                re.IGNORECASE | re.DOTALL,
+            )
+
+            for block_html, asin in blocks[:60]:
+                if asin in seen_asins:
+                    continue
+
+                title = None
+                title_match = re.search(r'<span[^>]*class="[^"]*a-size-[^"]*"[^>]*>(.*?)</span>', block_html, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    title = re.sub(r'<[^>]+>', ' ', title_match.group(1))
+                    title = unescape(re.sub(r'\s+', ' ', title)).strip()
+
+                price = None
+                offscreen_match = re.search(r'₹\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?', block_html)
+                if offscreen_match:
+                    price = self._clean_price(offscreen_match.group(0))
+
+                href = None
+                href_match = re.search(r'href="([^"]*(?:/dp/|/gp/product/)[^"]*)"', block_html, re.IGNORECASE)
+                if href_match:
+                    href = href_match.group(1)
+                    if href.startswith('/'):
+                        href = f"{self.BASE_URL}{href}"
+
+                if title and price:
+                    products.append(ProductData(
+                        external_id=asin,
+                        title=title[:200],
+                        current_price=price,
+                        product_url=self.build_affiliate_url(href or f"{self.BASE_URL}/dp/{asin}"),
+                        platform_name="amazon",
+                        in_stock=True,
+                        stock_status=StockStatus.IN_STOCK,
+                        extraction_method=ExtractionMethod.REGEX_FALLBACK,
+                        data_source=HandlerType.SCRAPER,
+                        raw_data={"asin": asin, "resilient": True, "source": "html_regex"}
+                    ))
+                    seen_asins.add(asin)
+
+                if len(products) >= 20:
+                    break
+
+        except Exception as e:
+            logger.debug(f"Resilient regex harvesting failed: {e}")
+
+        return products[:20]
     
     # =========================================================================
     # PRODUCT DETAILS

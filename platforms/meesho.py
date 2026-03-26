@@ -336,7 +336,7 @@ class MeeshoScraper(BasePlatformHandler):
         return None
     
     def _parse_product_item(self, item: Dict[str, Any]) -> Optional[ProductData]:
-        """Parse single product from JSON"""
+        """Parse single product from JSON with confidence"""
         try:
             # Product ID
             product_id = str(
@@ -396,6 +396,29 @@ class MeeshoScraper(BasePlatformHandler):
             # Fix image URL
             if image_url and not image_url.startswith('http'):
                 image_url = f"https://images.meesho.com{image_url}"
+
+            # Brand with confidence (often noisy on Meesho)
+            brand = item.get('brand') or item.get('supplier_name')
+            brand_confidence = 0.70 if brand else 0.0
+            brand_source = "api" if brand else None
+
+            # Color with confidence
+            color = None
+            color_confidence = 0.0
+            color_source = None
+
+            attributes = item.get('attributes') or {}
+            if isinstance(attributes, dict):
+                color = attributes.get('color') or attributes.get('colour')
+                if color:
+                    color_confidence = 0.82
+                    color_source = "api"
+
+            if not color:
+                color = item.get('color') or item.get('colour')
+                if color:
+                    color_confidence = 0.75
+                    color_source = "api"
             
             # Rating
             rating = item.get('rating') or item.get('average_rating')
@@ -403,11 +426,15 @@ class MeeshoScraper(BasePlatformHandler):
                 rating = rating.get('average') or rating.get('value')
             
             review_count = item.get('review_count') or item.get('rating_count')
+            try:
+                parsed_review_count = int(str(review_count).replace(',', '').strip()) if review_count is not None else None
+            except (TypeError, ValueError):
+                parsed_review_count = None
             
             # Build URL
             product_url = f"{self.BASE_URL}/p/{product_id}"
             
-            return ProductData(
+            product = ProductData(
                 external_id=product_id,
                 title=title.strip()[:200],
                 current_price=Decimal(str(price)),
@@ -417,13 +444,21 @@ class MeeshoScraper(BasePlatformHandler):
                 platform_name="meesho",
                 image_url=image_url,
                 rating=float(rating) if rating else None,
-                review_count=int(review_count) if review_count else None,
+                review_count=parsed_review_count,
                 category="Fashion",
                 in_stock=True,
                 stock_status=StockStatus.IN_STOCK,
                 extraction_method=ExtractionMethod.API_INTERCEPTED,
                 data_source=HandlerType.SCRAPER
             )
+
+            if brand:
+                product.set_attribute_with_confidence("brand", brand, brand_source, brand_confidence)
+
+            if color:
+                product.set_attribute_with_confidence("color", color, color_source, color_confidence)
+
+            return product
         
         except Exception as e:
             logger.debug(f"Parse product error: {e}")
@@ -534,6 +569,11 @@ class MeeshoScraper(BasePlatformHandler):
                     ))
                 except:
                     continue
+
+            if not products:
+                healed_product = await self._extract_search_with_ai_healing(page_obj)
+                if healed_product:
+                    products.append(healed_product)
             
             logger.info(f"✅ DOM extracted {len(products)} products")
         
@@ -541,6 +581,61 @@ class MeeshoScraper(BasePlatformHandler):
             logger.error(f"DOM extraction error: {e}")
         
         return products
+
+    async def _extract_search_with_ai_healing(self, page_obj) -> Optional[ProductData]:
+        """Last-resort search extraction using universal self-healing selectors."""
+        try:
+            healed = await self.auto_healing_extraction(
+                page_obj,
+                await page_obj.content(),
+                fields=["product_title", "product_price", "product_url", "product_image", "brand", "product_rating", "review_count"],
+                test_timeout=4.0,
+            )
+
+            title = healed.get("product_title")
+            price = healed.get("product_price")
+            if not title or price is None:
+                return None
+
+            price_value = Decimal(str(price))
+            if price_value <= 0:
+                return None
+
+            url = healed.get("product_url") or ""
+            if url and not str(url).startswith("http"):
+                url = f"{self.BASE_URL}{url}" if str(url).startswith("/") else f"{self.BASE_URL}/{url}"
+
+            product_id = self.extract_product_id(url) if url else None
+            if not product_id:
+                product_id = hashlib.md5(f"{title}-{price_value}".encode()).hexdigest()[:16]
+
+            rating = healed.get("product_rating")
+            review_count = healed.get("review_count")
+            try:
+                review_count = int(str(review_count).replace(",", "").strip()) if review_count is not None else None
+            except (TypeError, ValueError):
+                review_count = None
+
+            logger.info("🤖 Meesho AI healing recovered a search result")
+            return ProductData(
+                external_id=product_id,
+                title=str(title)[:200],
+                current_price=price_value,
+                product_url=self.build_affiliate_url(url) if url else "",
+                platform_name="meesho",
+                image_url=healed.get("product_image"),
+                brand=healed.get("brand"),
+                rating=float(rating) if rating is not None else None,
+                review_count=review_count,
+                category="Fashion",
+                in_stock=True,
+                extraction_method=ExtractionMethod.AI_HEALED,
+                data_source=HandlerType.SCRAPER,
+                raw_data={"source": "ai_healed_search", "stats": healed.get("_extraction_stats", {})},
+            )
+        except Exception as e:
+            logger.debug(f"AI-healed Meesho search extraction failed: {e}")
+            return None
     
     # =========================================================================
     # PRODUCT DETAILS
@@ -683,6 +778,7 @@ class MeeshoScraper(BasePlatformHandler):
     ) -> Optional[ProductData]:
         """Fallback: DOM extraction for product"""
         try:
+            used_ai_healing = False
             product_data = await page_obj.evaluate('''() => {
                 const result = {
                     title: null,
@@ -729,7 +825,22 @@ class MeeshoScraper(BasePlatformHandler):
             }''')
             
             if not product_data.get('title') or not product_data.get('price'):
-                return None
+                healed = await self.auto_healing_extraction(
+                    page_obj,
+                    await page_obj.content(),
+                    fields=["product_title", "product_price", "product_image", "brand", "product_rating", "review_count"],
+                    test_timeout=4.0,
+                )
+                if healed.get("product_title") and healed.get("product_price"):
+                    used_ai_healing = True
+                    product_data["title"] = healed.get("product_title")
+                    product_data["price"] = str(healed.get("product_price"))
+                    product_data["image"] = healed.get("product_image") or product_data.get("image")
+                    product_data["rating"] = healed.get("product_rating") or product_data.get("rating")
+                    product_data["brand"] = healed.get("brand")
+                    product_data["reviewCount"] = healed.get("review_count")
+                else:
+                    return None
             
             if not product_id:
                 product_id = hashlib.md5(product_url.encode()).hexdigest()[:16]
@@ -741,9 +852,11 @@ class MeeshoScraper(BasePlatformHandler):
                 product_url=self.build_affiliate_url(product_url),
                 platform_name="meesho",
                 image_url=product_data.get('image'),
+                brand=product_data.get('brand'),
                 rating=float(product_data['rating']) if product_data.get('rating') else None,
+                review_count=int(str(product_data['reviewCount']).replace(',', '')) if product_data.get('reviewCount') else None,
                 in_stock=True,
-                extraction_method=ExtractionMethod.DOM_JAVASCRIPT,
+                extraction_method=ExtractionMethod.AI_HEALED if used_ai_healing else ExtractionMethod.DOM_JAVASCRIPT,
                 data_source=HandlerType.SCRAPER
             )
         
