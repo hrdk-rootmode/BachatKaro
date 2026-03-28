@@ -36,7 +36,7 @@ if sys.platform == 'win32':
     _ProactorBasePipeTransport.__del__ = silence_proactor_del
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, and_, or_
+from sqlalchemy import select, and_, or_, case, func, literal
 
 from app.core.config import settings
 from app.core.database import async_session_maker
@@ -52,18 +52,62 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # =============================================================================
 
-MAX_PRODUCTS_PER_RUN = 500  # Limit to avoid overload
+MAX_PRODUCTS_PER_RUN = max(1, int(getattr(settings, "DAILY_SCRAPE_MAX_PRODUCTS_PER_RUN", 500)))
 SCRAPE_INTERVAL_HOURS = 6  # Scrape products not updated in 24h
-DELAY_BETWEEN_PRODUCTS = 2  # Seconds between scrapes (rate limiting)
-MAX_ERRORS_BEFORE_SKIP = 3  # Skip platform after consecutive errors
+DELAY_BETWEEN_PRODUCTS = max(0, int(getattr(settings, "DAILY_SCRAPE_DELAY_SECONDS", 2)))
+MAX_ERRORS_BEFORE_SKIP = max(3, int(getattr(settings, "DAILY_SCRAPE_MAX_ERRORS_BEFORE_SKIP", 8)))
 BATCH_SIZE = 60  # Commit after each batch
+RATE_LIMIT_COOLDOWN_SECONDS = max(30, int(getattr(settings, "DAILY_SCRAPE_RATE_LIMIT_COOLDOWN_SECONDS", 120)))
+
+DEFAULT_INTERVAL_MINUTES = max(5, int(getattr(settings, "DAILY_SCRAPE_DEFAULT_INTERVAL_MINUTES", 720)))
+WATCHLIST_INTERVAL_MINUTES = max(5, int(getattr(settings, "DAILY_SCRAPE_WATCHLIST_INTERVAL_MINUTES", 30)))
+FAST_RECHECK_INTERVAL_MINUTES = max(5, int(getattr(settings, "DAILY_SCRAPE_FAST_RECHECK_INTERVAL_MINUTES", 20)))
+PLATFORM_INTERVAL_MINUTES = {
+    "amazon": max(5, int(getattr(settings, "DAILY_SCRAPE_AMAZON_INTERVAL_MINUTES", 120))),
+    "flipkart": max(5, int(getattr(settings, "DAILY_SCRAPE_FLIPKART_INTERVAL_MINUTES", 360))),
+    "myntra": max(5, int(getattr(settings, "DAILY_SCRAPE_MYNTRA_INTERVAL_MINUTES", 720))),
+    "meesho": max(5, int(getattr(settings, "DAILY_SCRAPE_MEESHO_INTERVAL_MINUTES", 1440))),
+    "nykaa": max(5, int(getattr(settings, "DAILY_SCRAPE_NYKAA_INTERVAL_MINUTES", 1440))),
+    "croma": max(5, int(getattr(settings, "DAILY_SCRAPE_CROMA_INTERVAL_MINUTES", 1440))),
+}
+
+_RUN_LOCK = asyncio.Lock()
 
 
 # =============================================================================
 # MAIN JOB FUNCTION
 # =============================================================================
 
-async def run_daily_scrape() -> Dict[str, Any]:
+def _platform_interval_minutes(platform_name: str) -> int:
+    """Get base interval in minutes for a platform."""
+    return PLATFORM_INTERVAL_MINUTES.get(platform_name.lower(), DEFAULT_INTERVAL_MINUTES)
+
+
+def _compute_next_scrape_at(
+    platform_name: str,
+    *,
+    is_watchlisted: bool,
+    price_changed: bool,
+    scrape_failed: bool,
+    error_streak: int,
+) -> datetime:
+    """Compute next scrape schedule using platform policy + adaptive backoff."""
+    now_utc = datetime.now(pytz.UTC)
+
+    if scrape_failed:
+        backoff_minutes = min(_platform_interval_minutes(platform_name), max(5, 5 * (2 ** max(error_streak - 1, 0))))
+        return now_utc + timedelta(minutes=backoff_minutes)
+
+    if price_changed:
+        return now_utc + timedelta(minutes=FAST_RECHECK_INTERVAL_MINUTES)
+
+    if is_watchlisted:
+        return now_utc + timedelta(minutes=WATCHLIST_INTERVAL_MINUTES)
+
+    return now_utc + timedelta(minutes=_platform_interval_minutes(platform_name))
+
+
+async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] = None) -> Dict[str, Any]:
     """
     Main daily scrape job
     
@@ -92,61 +136,75 @@ async def run_daily_scrape() -> Dict[str, Any]:
         "duration_seconds": 0
     }
     
+    if _RUN_LOCK.locked():
+        logger.warning("⚠️ Daily scrape skipped: previous run is still active")
+        stats["message"] = "Skipped because previous run is still active"
+        return stats
+
     try:
-        async with async_session_maker() as db:
-            # Step 1: Get products to scrape
-            listings = await _get_products_to_scrape(db)
-            stats["products_found"] = len(listings)
-            
-            if not listings:
-                logger.info("✅ No products need scraping")
-                stats["message"] = "No products to scrape"
-                await _log_scrape_results(db, stats, start_time)
-                return stats
-            
-            logger.info(f"📦 Found {len(listings)} products to scrape")
-            
-            # Step 2: Get active platforms
-            platforms = await _get_active_platforms(db)
-            
-            # Step 3: Group by platform
-            products_by_platform = _group_by_platform(listings, platforms)
-            
-            # Step 4: Scrape each platform
-            for platform_name, platform_listings in products_by_platform.items():
-                platform_stats = await _scrape_platform(
-                    db=db,
-                    platform_name=platform_name,
-                    listings=platform_listings
+        async with _RUN_LOCK:
+            async with async_session_maker() as db:
+                watchlisted_product_ids = await _get_watchlisted_product_ids(db)
+
+                # Step 1: Get products to scrape
+                listings = await _get_products_to_scrape(
+                    db,
+                    watchlisted_product_ids=watchlisted_product_ids,
+                    force_all=force_all,
+                    max_products=max_products,
                 )
-                
-                stats["platforms"][platform_name] = platform_stats
-                stats["products_scraped"] += platform_stats["scraped"]
-                stats["products_updated"] += platform_stats["updated"]
-                stats["products_failed"] += platform_stats["failed"]
-                stats["price_changes"] += platform_stats["price_changes"]
-                
-                if platform_stats.get("errors"):
-                    stats["errors"].extend(platform_stats["errors"][:5])
-            
-            # Step 5: Calculate duration
-            stats["duration_seconds"] = round(
-                (datetime.now(pytz.UTC) - start_time).total_seconds(), 2
-            )
-            
-            # Step 6: Log results
-            await _log_scrape_results(db, stats, start_time)
-            
-            logger.info(
-                f"✅ Daily scrape completed | "
-                f"Scraped: {stats['products_scraped']} | "
-                f"Updated: {stats['products_updated']} | "
-                f"Failed: {stats['products_failed']} | "
-                f"Price Changes: {stats['price_changes']} | "
-                f"Duration: {stats['duration_seconds']}s"
-            )
-            
-            return stats
+                stats["products_found"] = len(listings)
+
+                if not listings:
+                    logger.info("✅ No products need scraping")
+                    stats["message"] = "No products to scrape"
+                    await _log_scrape_results(db, stats, start_time)
+                    return stats
+
+                logger.info(f"📦 Found {len(listings)} products to scrape")
+
+                # Step 2: Get active platforms
+                platforms = await _get_active_platforms(db)
+
+                # Step 3: Group by platform
+                products_by_platform = _group_by_platform(listings, platforms)
+
+                # Step 4: Scrape each platform
+                for platform_name, platform_listings in products_by_platform.items():
+                    platform_stats = await _scrape_platform(
+                        db=db,
+                        platform_name=platform_name,
+                        listings=platform_listings,
+                        watchlisted_product_ids=watchlisted_product_ids,
+                    )
+
+                    stats["platforms"][platform_name] = platform_stats
+                    stats["products_scraped"] += platform_stats["scraped"]
+                    stats["products_updated"] += platform_stats["updated"]
+                    stats["products_failed"] += platform_stats["failed"]
+                    stats["price_changes"] += platform_stats["price_changes"]
+
+                    if platform_stats.get("errors"):
+                        stats["errors"].extend(platform_stats["errors"][:5])
+
+                # Step 5: Calculate duration
+                stats["duration_seconds"] = round(
+                    (datetime.now(pytz.UTC) - start_time).total_seconds(), 2
+                )
+
+                # Step 6: Log results
+                await _log_scrape_results(db, stats, start_time)
+
+                logger.info(
+                    f"✅ Daily scrape completed | "
+                    f"Scraped: {stats['products_scraped']} | "
+                    f"Updated: {stats['products_updated']} | "
+                    f"Failed: {stats['products_failed']} | "
+                    f"Price Changes: {stats['price_changes']} | "
+                    f"Duration: {stats['duration_seconds']}s"
+                )
+
+                return stats
             
     except Exception as e:
         logger.error(f"❌ Daily scrape failed: {e}")
@@ -161,34 +219,58 @@ async def run_daily_scrape() -> Dict[str, Any]:
 # HELPER FUNCTIONS
 # =============================================================================
 
-async def _get_products_to_scrape(db: AsyncSession) -> List[ProductListing]:
+async def _get_watchlisted_product_ids(db: AsyncSession) -> set:
+    """Get watchlisted product IDs as a set."""
+    watchlist_result = await db.execute(select(UserWatchlist.product_id).distinct())
+    return {r[0] for r in watchlist_result.fetchall() if r[0] is not None}
+
+
+async def _get_products_to_scrape(
+    db: AsyncSession,
+    watchlisted_product_ids: set,
+    force_all: bool = False,
+    max_products: Optional[int] = None,
+) -> List[ProductListing]:
     """Get products that need scraping (prioritized)"""
     cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=SCRAPE_INTERVAL_HOURS)
+    now_utc = datetime.now(pytz.UTC)
+    max_items = max(1, int(max_products or MAX_PRODUCTS_PER_RUN))
     
     try:
-        # Get watchlisted product IDs (highest priority)
-        watchlist_result = await db.execute(
-            select(UserWatchlist.product_id).distinct()
-        )
-        watchlisted_ids = [r[0] for r in watchlist_result.fetchall()]
-        
-        # Query for listings that need updating
+        watchlist_condition = ProductListing.product_id.in_(watchlisted_product_ids) if watchlisted_product_ids else False
+        watchlist_sort = case((watchlist_condition, 0), else_=1) if watchlisted_product_ids else literal(1)
+
+        if force_all:
+            due_condition = or_(
+                ProductListing.last_scraped < cutoff_time,
+                ProductListing.last_scraped.is_(None),
+                ProductListing.next_scrape_at <= now_utc,
+                ProductListing.next_scrape_at.is_(None),
+            )
+        else:
+            due_condition = or_(
+                ProductListing.next_scrape_at <= now_utc,
+                ProductListing.next_scrape_at.is_(None),
+            )
+
+        if watchlisted_product_ids:
+            due_condition = or_(watchlist_condition, due_condition)
+
         query = (
             select(ProductListing)
+            .join(Platform, ProductListing.platform_id == Platform.id)
             .where(
-                or_(
-                    # Watchlisted products always get priority
-                    ProductListing.product_id.in_(watchlisted_ids) if watchlisted_ids else False,
-                    # Products not scraped recently
-                    ProductListing.last_scraped < cutoff_time,
-                    ProductListing.last_scraped.is_(None)
+                and_(
+                    Platform.is_active == True,
+                    due_condition,
                 )
             )
             .order_by(
-                # Prioritize: watchlisted first, then oldest scraped
-                ProductListing.last_scraped.asc().nullsfirst()
+                watchlist_sort,
+                ProductListing.scrape_priority.asc(),
+                func.coalesce(ProductListing.next_scrape_at, ProductListing.last_scraped).asc().nullsfirst(),
             )
-            .limit(MAX_PRODUCTS_PER_RUN)
+            .limit(max_items)
         )
         
         result = await db.execute(query)
@@ -233,7 +315,8 @@ def _group_by_platform(
 async def _scrape_platform(
     db: AsyncSession,
     platform_name: str,
-    listings: List[ProductListing]
+    listings: List[ProductListing],
+    watchlisted_product_ids: set,
 ) -> Dict[str, Any]:
     """Scrape all listings for a single platform with rate limiting"""
     logger.info(f"📱 Scraping {platform_name}: {len(listings)} products")
@@ -251,9 +334,18 @@ async def _scrape_platform(
     consecutive_errors = 0
     
     for i, listing in enumerate(listings, 1):
+        now_utc = datetime.now(pytz.UTC)
+        is_watchlisted = listing.product_id in watchlisted_product_ids
         min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
         if listing.extraction_confidence is not None and listing.extraction_confidence < min_confidence:
             stats["skipped_low_confidence"] += 1
+            listing.next_scrape_at = _compute_next_scrape_at(
+                platform_name,
+                is_watchlisted=is_watchlisted,
+                price_changed=False,
+                scrape_failed=False,
+                error_streak=0,
+            )
             continue
 
         # Skip platform if too many errors
@@ -264,6 +356,7 @@ async def _scrape_platform(
         
         try:
             # Scrape product price
+            previous_in_stock = listing.in_stock
             new_price, scraped_in_stock = await _scrape_product_price(platform_name, listing)
 
             if scraped_in_stock is not None:
@@ -271,9 +364,19 @@ async def _scrape_platform(
 
             # Explicit out-of-stock is a valid scrape result; keep it out of failed bucket.
             if scraped_in_stock is False:
-                listing.last_scraped = datetime.now(pytz.UTC)
+                listing.last_scraped = now_utc
                 listing.scrape_error_count = 0
                 listing.last_error = None
+                stock_changed = previous_in_stock is not False
+                if stock_changed:
+                    listing.last_price_change_at = now_utc
+                listing.next_scrape_at = _compute_next_scrape_at(
+                    platform_name,
+                    is_watchlisted=is_watchlisted,
+                    price_changed=stock_changed,
+                    scrape_failed=False,
+                    error_streak=0,
+                )
                 stats["scraped"] += 1
                 stats["updated"] += 1
                 stats["marked_out_of_stock"] += 1
@@ -282,17 +385,19 @@ async def _scrape_platform(
             
             if new_price is not None:
                 old_price = listing.current_price
+                price_changed = bool(old_price and abs(float(new_price) - float(old_price)) > 0.01)
                 
                 # Update listing
-                listing.last_scraped = datetime.now(pytz.UTC)
+                listing.last_scraped = now_utc
                 listing.scrape_error_count = 0
                 listing.last_error = None
                 
                 # Check for price change
-                if old_price and abs(float(new_price) - float(old_price)) > 0.01:
+                if price_changed:
                     listing.current_price = new_price
                     stats["price_changes"] += 1
                     stats["updated"] += 1
+                    listing.last_price_change_at = now_utc
                     
                     # Record price history
                     await _record_price_history(db, listing, new_price)
@@ -307,17 +412,53 @@ async def _scrape_platform(
                 
                 stats["scraped"] += 1
                 consecutive_errors = 0
+                listing.next_scrape_at = _compute_next_scrape_at(
+                    platform_name,
+                    is_watchlisted=is_watchlisted,
+                    price_changed=price_changed,
+                    scrape_failed=False,
+                    error_streak=0,
+                )
                 
             else:
                 stats["failed"] += 1
                 consecutive_errors += 1
                 listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
+                listing.last_error = "No price extracted"
+                listing.next_scrape_at = _compute_next_scrape_at(
+                    platform_name,
+                    is_watchlisted=is_watchlisted,
+                    price_changed=False,
+                    scrape_failed=True,
+                    error_streak=listing.scrape_error_count,
+                )
                 
         except Exception as e:
             stats["failed"] += 1
-            consecutive_errors += 1
+            error_text = str(e).lower()
+            is_rate_limited = any(
+                token in error_text
+                for token in ["rate limit", "429", "burst limit", "too many requests", "cooling down"]
+            )
+
             listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
             listing.last_error = str(e)[:500]
+            listing.next_scrape_at = _compute_next_scrape_at(
+                platform_name,
+                is_watchlisted=is_watchlisted,
+                price_changed=False,
+                scrape_failed=True,
+                error_streak=listing.scrape_error_count,
+            )
+
+            if is_rate_limited:
+                # Avoid tripping platform skip too early on burst windows.
+                consecutive_errors = max(0, consecutive_errors - 1)
+                cooldown = RATE_LIMIT_COOLDOWN_SECONDS + random.uniform(10, 30)
+                logger.warning(f"⏳ {platform_name}: rate-limited, backing off for {cooldown:.0f}s")
+                await asyncio.sleep(cooldown)
+            else:
+                consecutive_errors += 1
             
             if len(stats["errors"]) < 10:
                 stats["errors"].append(f"{listing.external_id}: {str(e)[:100]}")
@@ -366,8 +507,8 @@ async def _scrape_product_price(
         - price can be None when unavailable or scraping fails
         - in_stock is None when availability cannot be determined
     """
-    # Development/Mock mode
-    if settings.DEBUG or settings.ENVIRONMENT == "development":
+    # Optional mock mode (disabled by default)
+    if bool(getattr(settings, "DAILY_SCRAPE_USE_MOCK_MODE", False)):
         if listing.current_price:
             # Simulate small price variations for testing
             variation = random.uniform(-0.05, 0.05)
@@ -479,6 +620,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Daily Price Scraping Job")
     parser.add_argument("--force-all", action="store_true", 
                        help="Force scrape all products regardless of timing")
+    parser.add_argument("--continuous", action="store_true",
+                       help="Run continuously with periodic refresh cycles")
+    parser.add_argument("--interval-minutes", type=int,
+                       default=int(getattr(settings, "DAILY_SCRAPE_LOOP_INTERVAL_MINUTES", 10)),
+                       help="Minutes between continuous cycles (default from settings)")
+    parser.add_argument("--max-cycles", type=int, default=0,
+                       help="Stop after N cycles in continuous mode (0 = run forever)")
+    parser.add_argument("--max-products", type=int, default=0,
+                       help="Override max products per run (0 = use configured default)")
     args = parser.parse_args()
     
     print("🚀 Starting Daily Scrape Job...")
@@ -486,13 +636,40 @@ if __name__ == "__main__":
     
     async def main():
         try:
+            max_products = args.max_products if args.max_products and args.max_products > 0 else None
+
+            if args.continuous:
+                cycle = 0
+                print(f"🔁 Continuous mode enabled | Interval: {args.interval_minutes} minutes")
+                while True:
+                    cycle += 1
+                    print(f"\n🕒 Cycle {cycle} started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    result = await run_daily_scrape(force_all=args.force_all, max_products=max_products)
+
+                    print("\n📊 Cycle Results:")
+                    print(f"   Products Found: {result.get('products_found', 0)}")
+                    print(f"   Products Scraped: {result.get('products_scraped', 0)}")
+                    print(f"   Products Updated: {result.get('products_updated', 0)}")
+                    print(f"   Price Changes: {result.get('price_changes', 0)}")
+                    print(f"   Failed: {result.get('products_failed', 0)}")
+                    print(f"   Duration: {result.get('duration_seconds', 0)}s")
+
+                    if args.max_cycles > 0 and cycle >= args.max_cycles:
+                        print(f"\n🛑 Reached max cycles: {args.max_cycles}")
+                        break
+
+                    print(f"⏳ Sleeping for {args.interval_minutes} minutes...")
+                    await asyncio.sleep(max(1, args.interval_minutes) * 60)
+
+                return
+
             if args.force_all:
-                # Override the cutoff time to scrape everything
+                # Override the cutoff time to scrape everything for one run
                 global SCRAPE_INTERVAL_HOURS
-                SCRAPE_INTERVAL_HOURS = 0  # Scrape everything
+                SCRAPE_INTERVAL_HOURS = 0
                 print("🔧 Force mode: Scrape all products")
-            
-            result = await run_daily_scrape()
+
+            result = await run_daily_scrape(force_all=args.force_all, max_products=max_products)
             
             print("\n📊 Results:")
             print(f"   Products Found: {result.get('products_found', 0)}")
@@ -512,5 +689,9 @@ if __name__ == "__main__":
             import traceback
             traceback.print_exc()
     
-    asyncio.run(main())
-    print("\n🏁 Daily scrape job finished.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Daily scrape interrupted by user.")
+    finally:
+        print("\n🏁 Daily scrape job finished.")

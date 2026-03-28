@@ -1,104 +1,43 @@
 """
-Load Trending Products to Redis
-Runs at 5 AM IST to pre-cache trending products
+Load Trending Products Job
 
-Features:
-- Pre-caches top 50 trending products
-- Reduces database load during peak hours
-- Updates search rankings
-- Calculates deal scores
+DEPRECATED: Redis caching removed for direct database-to-frontend communication
 
-FIXED: Redis connection handling for Windows
+This job is no longer needed as:
+- No Redis caching layer
+- Frontend queries database directly
+- Real-time data always available
+- Simplified architecture
+
+Keeping file for reference, but job is disabled.
 """
 
 import logging
-import sys
-import os
-import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List
-import json
-
-# Add parent directory to Python path for imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-# 🔧 WINDOWS FIX: Silence Proactor Event Loop Warning
-if sys.platform == 'win32':
-    from asyncio.proactor_events import _ProactorBasePipeTransport
-    def silence_proactor_del(self): pass
-    _ProactorBasePipeTransport.__del__ = silence_proactor_del
-
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc, Integer, text
-
-from app.core.config import settings
-from app.core.database import async_session_maker
 from app.models import Product, ProductListing, Platform
 
 logger = logging.getLogger(__name__)
 
-# Configuration
-TRENDING_CACHE_KEY = "trending:products"
-TRENDING_CACHE_TTL = 86400  # 24 hours
-TOP_PRODUCTS_COUNT = 50
-
 
 async def run_load_trending() -> Dict[str, Any]:
     """
-    Load trending products into Redis cache
+    Load trending products - DISABLED (Redis removed)
     
-    Process:
-    1. Calculate trending scores based on engagement
-    2. Get top 50 products with full details
-    3. Cache in Redis for fast access
+    This job no longer runs as the application uses direct database access.
+    Frontend queries product data directly from PostgreSQL without caching.
     """
-    logger.info("🔄 Starting trending cache refresh...")
-    start_time = datetime.utcnow()
+    logger.info("⏭️  Trending cache job skipped (Redis deprecated)")
     
-    stats = {
-        "products_cached": 0,
-        "cache_key": TRENDING_CACHE_KEY,
-        "ttl_seconds": TRENDING_CACHE_TTL,
-        "duration_seconds": 0
+    return {
+        "Status": "skipped",
+        "Reason": "Redis caching removed - using direct database access",
+        "Products_cached": 0,
+        "Duration_seconds": 0,
+        "Message": "No caching needed - all data is fresh from database"
     }
-    
-    try:
-        async with async_session_maker() as db:
-            # Get trending products
-            trending = await get_trending_products(db)
-            
-            if not trending:
-                logger.warning("No trending products found")
-                stats["message"] = "No trending products"
-                stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
-                return stats
-            
-            # Format for caching
-            cache_data = format_trending_data(trending)
-            
-            # Store in Redis
-            await store_in_redis(cache_data)
-            
-            # Cache by category
-            await cache_by_category(trending)
-            
-            stats["products_cached"] = len(cache_data)
-            stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
-            stats["success"] = True
-            
-            logger.info(
-                f"✅ Trending cache updated | "
-                f"Products: {stats['products_cached']} | "
-                f"Duration: {stats['duration_seconds']:.2f}s"
-            )
-            
-            return stats
-            
-    except Exception as e:
-        logger.error(f"❌ Trending cache refresh failed: {e}")
-        stats["error"] = str(e)
-        stats["duration_seconds"] = (datetime.utcnow() - start_time).total_seconds()
-        raise
 
 
 async def get_trending_products(db: AsyncSession) -> List[tuple]:

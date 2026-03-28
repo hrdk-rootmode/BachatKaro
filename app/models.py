@@ -190,6 +190,9 @@ class ProductListing(Base):
     
     # Scraping metadata
     last_scraped = Column(DateTime(timezone=True), index=True)
+    next_scrape_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    last_price_change_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    scrape_priority = Column(Integer, nullable=False, default=100, server_default="100", index=True)
     extraction_confidence = Column(Float, nullable=True, index=True)
     extraction_method = Column(String(32), nullable=True)
     data_source = Column(String(32), nullable=True)
@@ -212,6 +215,10 @@ class ProductListing(Base):
         Index('idx_listings_variant_fp', 'variant_fingerprint'),
         Index('idx_listings_price', 'current_price'),
         Index('idx_listings_scraped', 'last_scraped'),
+        Index('idx_listings_next_scrape', 'next_scrape_at'),
+        Index('idx_listings_last_price_change', 'last_price_change_at'),
+        Index('idx_listings_scrape_priority', 'scrape_priority'),
+        Index('idx_listings_platform_due', 'platform_id', 'next_scrape_at', 'scrape_priority'),
         Index('idx_listings_platform_confidence', 'platform_id', 'extraction_confidence'),
         Index('idx_listings_stock', 'in_stock', postgresql_where=Column('in_stock') == True),
     )

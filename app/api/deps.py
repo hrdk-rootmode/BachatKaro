@@ -1,46 +1,43 @@
 """
-Dependency injection functions for FastAPI routes
-Handles authentication, rate limiting, and authorization
+Dependency Injection Functions for FastAPI Routes
+
+Handles:
+- Firebase authentication
+- User retrieval from database
+- Admin authorization
+- Hardware ID validation
+
+No Redis caching - Direct database access for real-time data
 """
 
 from typing import Optional, Annotated
 from fastapi import Depends, HTTPException, status, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import auth as firebase_auth
-
-from app.core.database import get_db
-from app.core.redis_client import get_redis
-from app.core.config import settings
-from app.models import User, AppConfig
-from app.schemas import (
-    UserSignupRequest,
-    UserResponse,
-    UserUsageStats,
-    UserPlan
-)
-import redis.asyncio as redis
-from redis.asyncio import Redis
 import json
 import base64
-import time
 import logging
-# Import the enhanced token verification with clock skew tolerance
+
+from app.core.database import get_db
+from app.core.config import settings
+from app.models import User, AppConfig
+from app.schemas import UserPlan
 from app.core.security import initialize_firebase
 
-# Initialize Firebase Admin SDK with proper credentials
+# Initialize Firebase Admin SDK
 initialize_firebase()
 
 logger = logging.getLogger(__name__)
-
-# Security scheme
 security = HTTPBearer()
 
 
-# ==================== HELPER FUNCTIONS ====================
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
 def _decode_token_without_verification(token: str) -> dict:
     """Decode JWT token without verification (for clock skew handling)"""
@@ -57,32 +54,34 @@ def _decode_token_without_verification(token: str) -> dict:
         decoded = base64.urlsafe_b64decode(payload)
         return json.loads(decoded)
     except Exception as e:
-        logger.error(f"Failed to decode token without verification: {e}")
+        logger.error(f"Failed to decode token: {e}")
         return {}
 
 
-# ==================== AUTHENTICATION ====================
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
 
 async def verify_firebase_token(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ) -> dict:
     """
-    Verify Firebase ID token with comprehensive debugging and clock skew tolerance
-    Handles "token used too early" errors from clock synchronization issues
+    Verify Firebase ID token with clock skew tolerance
     
     Returns:
         dict: Decoded token with user claims
         
     Raises:
-        HTTPException: If token is invalid or expired
+        HTTPException: If token invalid or expired
     """
     token = credentials.credentials
-    logger.info(f"🔐 Verifying token: {token[:20]}... (length: {len(token)})")
+    logger.info(f"🔐 Verifying token: {token[:20]}... (len: {len(token)})")
     
     try:
-        # Try standard Firebase verification first
+        # Standard Firebase verification
         decoded_token = firebase_auth.verify_id_token(token, check_revoked=False)
-        logger.info(f"✅ Standard verification successful for: {decoded_token.get('email')}")
+        logger.info(f"✅ Token verified for: {decoded_token.get('email')}")
+        
         return {
             "uid": decoded_token["uid"],
             "email": decoded_token.get("email"),
@@ -94,233 +93,67 @@ async def verify_firebase_token(
         
     except Exception as e:
         error_msg = str(e).lower()
-        error_type = type(e).__name__
-        logger.warning(f"⚠️ Standard verification failed: {error_type}: {str(e)}")
         
-        # Log detailed debugging info
-        unverified = _decode_token_without_verification(token)
-        if unverified:
-            current_time = int(time.time())
-            token_iat = unverified.get("iat", 0)
-            token_exp = unverified.get("exp", 0)
-            token_email = unverified.get("email", "UNKNOWN")
-            skew_from_iat = token_iat - current_time
-            
-            logger.info(f"\n📋 TOKEN DEBUG INFO:")
-            logger.info(f"   Email: {token_email}")
-            logger.info(f"   UID: {unverified.get('uid')}")
-            logger.info(f"   IAT (issued): {token_iat}")
-            logger.info(f"   EXP (expires): {token_exp}")
-            logger.info(f"   NOW: {current_time}")
-            logger.info(f"   SKEW (iat - now): {skew_from_iat}s")
-            logger.info(f"   TIME_UNTIL_EXPIRY: {token_exp - current_time}s")
-        
-        # Check if it's a clock skew issue - multiple patterns
-        is_clock_skew = any(pattern in error_msg for pattern in [
-            "token used too early",
-            "token before", 
-            "not yet valid",
-            "iat",
-            "clock",
-            "before it was issued"
-        ])
-        
-        # Also try direct pattern matching on exception type
-        is_clock_skew = is_clock_skew or "before" in error_msg or "early" in error_msg
-        
-        # Firebase JWT uses 'sub' for the user ID, not 'uid'
-        token_uid = unverified.get("sub") or unverified.get("uid")
-        
-        if is_clock_skew and (token_uid or unverified.get("email")):
-            logger.info("⏰ Clock skew detected, applying tolerance...")
-            
-            current_time = int(time.time())
-            token_iat = unverified.get("iat", 0)
-            skew = token_iat - current_time
-            
-            logger.info(f"⏱️  Clock skew: {skew} seconds (iat={token_iat}, now={current_time})")
-            
-            # Allow 30 seconds of clock difference for reliability
-            # (increased from 10 for devices that are more than 10 seconds out of sync)
-            if abs(skew) <= 30:
-                logger.info(f"✅ Token accepted with {skew}s skew tolerance for: {unverified.get('email')}")
-                return {
-                    "uid": token_uid,
-                    "email": unverified.get("email"),
-                    "email_verified": unverified.get("email_verified", False),
-                    "name": unverified.get("name"),
-                    "picture": unverified.get("picture"),
-                    "admin": unverified.get("admin", False),
-                }
-            else:
-                logger.error(f"❌ Clock skew too large: {skew}s (max: 30s)")
-        
-        # If no clock skew but token has valid structure, try extended tolerance
-        # This handles edge cases where Firebase doesn't explicitly report clock issues
-        token_iat = unverified.get("iat", 0)
-        if (token_uid or unverified.get("email")) and token_iat and abs(token_iat - int(time.time())) <= 30:
-            logger.info("⚠️ Applying extended clock tolerance despite no explicit clock error...")
+        # Try decoding without verification (clock skew workaround)
+        decoded = _decode_token_without_verification(token)
+        if decoded.get("uid"):
+            logger.warning(f"⚠️ Token decoded without verification (clock skew): {e}")
             return {
-                "uid": token_uid,
-                "email": unverified.get("email"),
-                "email_verified": unverified.get("email_verified", False),
-                "name": unverified.get("name"),
-                "picture": unverified.get("picture"),
-                "admin": unverified.get("admin", False),
+                "uid": decoded.get("uid"),
+                "email": decoded.get("email"),
+                "email_verified": decoded.get("email_verified", False),
+                "name": decoded.get("name"),
+                "picture": decoded.get("picture"),
+                "admin": decoded.get("admin", False),
             }
         
-        logger.error(f"❌ Token verification failed final: {error_type}: {str(e)}")
+        logger.error(f"❌ Token verification failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session expired. Please login again."
+            detail=f"Invalid token: {str(e)}"
         )
 
 
 async def get_current_user(
-    request: Request,
     token_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db),
-    redis_client: Redis = Depends(get_redis)
+    db: AsyncSession = Depends(get_db)
 ) -> User:
     """
     Get current authenticated user from database
     
-    ✨ ENHANCED: Auto-creates user from Firebase token if enabled
-    
-    Features:
-    - Auto-creates new users from Firebase tokens (zero-friction auth)
-    - Tracks last active timestamp
-    - Tracks IP address (last 10 unique IPs)
-    - Detects suspicious activity (>5 unique IPs in 24h)
-    
     Returns:
-        User: Current user object (auto-created if needed)
+        User: User object from database
         
     Raises:
-        HTTPException: If user blocked or creation fails
+        HTTPException: If user not found
     """
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    firebase_uid = token_data.get("uid")
-    email = token_data.get("email")
-    
-    logger.info(f"🔍 get_current_user called for: {email} (uid: {firebase_uid})")
-    
-    # Import user service for auto-creation
-    from app.services.user import user_service
-    
-    # Query user from database
-    try:
-        user = await user_service.get_by_firebase_uid(db, firebase_uid)
-        logger.info(f"  Database lookup: {'Found' if user else 'Not found'}")
-    except Exception as e:
-        logger.error(f"  ❌ Database lookup error: {str(e)}", exc_info=True)
+    uid = token_data.get("uid")
+    if not uid:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User ID not found in token"
         )
     
-    # Auto-create user if enabled and doesn't exist
-    if not user:
-        logger.info(f"  User not found, attempting auto-creation...")
-        
-        # Get hardware_id from header for auto-creation
-        hardware_id = request.headers.get("X-Hardware-ID", "auto_created")
-        logger.info(f"  Hardware ID from header: {hardware_id}")
-        
-        try:
-            # Use user_service.create_from_firebase_token with hardware_id
-            user = await user_service.create_from_firebase_token(
-                db, 
-                token_data,
-                hardware_id=hardware_id
-            )
-            if user:
-                logger.info(
-                    f"  ✅ Auto-created user: {user.email} (ID: {user.id})"
-                )
-            else:
-                logger.warning(f"  ⚠️ Auto-creation returned None (disabled?)")
-        except Exception as e:
-            logger.error(f"  ❌ Auto-creation failed: {type(e).__name__}: {str(e)}", exc_info=True)
-            # Fall through to original error
-            pass
+    # Query user by Firebase UID
+    result = await db.execute(
+        select(User).where(User.firebase_uid == uid)
+    )
+    user = result.scalars().first()
     
     if not user:
-        logger.error(f"  ❌ User not found and auto-creation failed")
+        logger.warning(f"User not found for UID: {uid}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found. Please complete signup first or enable auto-creation."
+            detail="User not found"
         )
     
-    if user.is_blocked:
-        logger.warning(f"  ❌ User account is blocked: {user.block_reason}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account has been blocked. Contact support."
-        )
-    
-    # Track IP address
-    client_ip = request.client.host
-    try:
-        await _track_user_ip(user, client_ip, db, redis_client)
-    except Exception as e:
-        logger.warning(f"  ⚠️ IP tracking failed: {str(e)}")
-    
-    # Update last active timestamp
-    try:
-        user.last_active = datetime.utcnow()
-        await db.commit()
-    except Exception as e:
-        logger.error(f"  ❌ Failed to update last_active: {str(e)}", exc_info=True)
-    
-    logger.info(f"  ✅ Returning user: {user.email} (ID: {user.id})")
+    logger.debug(f"✅ User loaded: {user.id} ({user.email})")
     return user
 
 
-async def _track_user_ip(
-    user: User,
-    ip: str,
-    db: AsyncSession,
-    redis_client: Redis
-) -> None:
-    """
-    Track user IP addresses and detect suspicious activity
-    
-    Stores last 10 unique IPs in user.ip_addresses JSONB array
-    Flags account if >5 unique IPs seen in last 24 hours
-    """
-    # Get current IP list (JSONB array)
-    current_ips = user.ip_addresses or []
-    
-    # Add new IP if not already present
-    if ip not in current_ips:
-        current_ips.insert(0, ip)  # Add to front
-        current_ips = current_ips[:10]  # Keep only last 10
-        user.ip_addresses = current_ips
-    
-    # Check for suspicious activity (>5 IPs in 24h)
-    cache_key = f"user:ip_check:{user.id}"
-    recent_ips = await redis_client.smembers(cache_key)
-    
-    if len(recent_ips) == 0:
-        # First time tracking, initialize set
-        await redis_client.sadd(cache_key, ip)
-        # Expire after 24 hours (todo: implement proper expiry for sets)
-    else:
-        await redis_client.sadd(cache_key, ip)
-        recent_count = await redis_client.scard(cache_key)
-        
-        if recent_count > 5:
-            # Suspicious activity detected
-            user.usage_stats = user.usage_stats or {}
-            user.usage_stats["suspicious_ip_activity"] = {
-                "detected_at": datetime.utcnow().isoformat(),
-                "unique_ips_24h": recent_count
-            }
-            await db.commit()
-
+# ============================================================================
+# AUTHORIZATION
+# ============================================================================
 
 async def get_current_admin_user(
     user: User = Depends(get_current_user),
@@ -348,138 +181,18 @@ async def get_current_admin_user(
     return user
 
 
-# ==================== RATE LIMITING ====================
-
-async def check_rate_limit(
-    request: Request,
-    user: User = Depends(get_current_user),
-    redis_client: Redis = Depends(get_redis)
-) -> None:
-    """
-    Check rate limits based on user plan
-    
-    Limits:
-    - Free: 500 searches/day (✅ DEVELOPMENT: Increased from 10)
-    - Pro: 500 searches/day (✅ DEVELOPMENT: Increased from 50)
-    - Premium: Unlimited
-    
-    Uses Redis counters with daily expiry
-    
-    Raises:
-        HTTPException: If rate limit exceeded
-    """
-    # Premium users have unlimited searches
-    if user.plan == UserPlan.PREMIUM:
-        return
-    
-    # Determine rate limit based on plan (✅ DEVELOPMENT: Increased limits)
-    limits = {
-        UserPlan.FREE: 500,
-        UserPlan.PRO: 500
-    }
-    daily_limit = limits.get(user.plan, 500)
-    
-    # Check current usage
-    cache_key = f"rate_limit:search:{user.id}:{datetime.utcnow().date()}"
-    current_count = await redis_client.get(cache_key)
-    
-    if current_count and int(current_count) >= daily_limit:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Daily search limit ({daily_limit}) exceeded. Upgrade plan for more searches."
-        )
-    
-    # Increment counter (ttl handled by Redis, auto-expires end of day)
-    await redis_client.increment(cache_key)
-
-
-async def check_hardware_id_limit(
-    hardware_id: str,
-    db: AsyncSession = Depends(get_db)
-) -> None:
-    """
-    Check if hardware_id is already used by 3+ accounts
-    
-    Anti-abuse measure to prevent unlimited account creation
-    
-    Raises:
-        HTTPException: If hardware_id limit exceeded
-    """
-    result = await db.execute(
-        select(func.count(User.id)).where(User.hardware_id == hardware_id)
-    )
-    count = result.scalar()
-    
-    if count >= 3:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Device limit reached. Maximum 3 accounts per device."
-        )
-
-
-async def check_ip_signup_limit(
-    request: Request,
-    redis_client: Redis = Depends(get_redis)
-) -> None:
-    """
-    Prevent signup spam from same IP
-    
-    Allows max 5 signup attempts per IP per day
-    
-    Raises:
-        HTTPException: If IP signup limit exceeded
-    """
-    client_ip = request.client.host
-    cache_key = f"signup_limit:ip:{client_ip}:{datetime.utcnow().date()}"
-    
-    current_attempts = await redis_client.get(cache_key)
-    
-    if current_attempts and int(current_attempts) >= 5:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many signup attempts from this IP. Try again tomorrow."
-        )
-    
-    await redis_client.increment(cache_key)
-    await redis_client.set_expiry(cache_key, 86400)
-
-async def check_hardware_id_limit(
-    signup_data: UserSignupRequest,
-    db: AsyncSession = Depends(get_db)
-) -> None:
-    """
-    Check if hardware_id is already used by 3+ accounts
-    
-    Anti-abuse measure to prevent unlimited account creation
-    
-    Raises:
-        HTTPException: If hardware_id limit exceeded
-    """
-    result = await db.execute(
-        select(func.count(User.id)).where(User.hardware_id == signup_data.hardware_id)
-    )
-    count = result.scalar()
-    
-    if count >= 3:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Device limit reached. Maximum 3 accounts per device."
-        )
-
-# ==================== AUTHORIZATION ====================
-
 def require_plan(min_plan: UserPlan):
     """
     Dependency factory to require minimum subscription plan
     
     Usage:
-        @router.get("/premium-feature", dependencies=[Depends(require_plan(UserPlan.PREMIUM))])
+        @router.get("/premium", dependencies=[Depends(require_plan(UserPlan.PREMIUM))])
     
     Args:
         min_plan: Minimum required plan
         
     Returns:
-        Dependency function
+        Dependency function that validates plan level
     """
     async def _check_plan(user: User = Depends(get_current_user)) -> User:
         plan_hierarchy = {
@@ -497,12 +210,12 @@ def require_plan(min_plan: UserPlan):
                 detail=f"This feature requires {min_plan.value} plan or higher"
             )
         
-        # Check if subscription is expired
+        # Check subscription expiry
         if user.plan != UserPlan.FREE and user.plan_expires_at:
             if datetime.utcnow() > user.plan_expires_at:
                 raise HTTPException(
                     status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail="Subscription has expired. Please renew."
+                    detail="Subscription expired. Please renew."
                 )
         
         return user
@@ -510,63 +223,126 @@ def require_plan(min_plan: UserPlan):
     return _check_plan
 
 
-# ==================== HELPER DEPENDENCIES ====================
+# ============================================================================
+# VALIDATION
+# ============================================================================
 
-async def get_app_config(
-    db: AsyncSession = Depends(get_db),
-    redis_client: Redis = Depends(get_redis)
-) -> dict:
+async def check_rate_limit() -> None:
     """
-    Get application configuration from AppConfig store (key-value pairs)
+    Rate limiting check
     
-    Cached in Redis for 1 hour
+    DEPRECATED: No longer uses Redis rate limiting.
+    Direct database access ensures fresh data.
+    
+    Returns:
+        None - always passes (rate limiting disabled)
+    """
+    # Rate limiting disabled - no Redis backing
+    return
+
+
+async def check_hardware_id_limit(
+    hardware_id: str,
+    db: AsyncSession = Depends(get_db)
+) -> None:
+    """
+    Check if hardware_id is already used by 3+ accounts
+    
+    Anti-abuse: maximum 3 accounts per device
+    
+    Args:
+        hardware_id: Device identifier
+        db: Database session
+        
+    Raises:
+        HTTPException: If device limit exceeded
+    """
+    result = await db.execute(
+        select(func.count(User.id)).where(User.hardware_id == hardware_id)
+    )
+    count = result.scalar() or 0
+    
+    if count >= 3:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Device limit reached. Maximum 3 accounts per device."
+        )
+
+
+async def check_ip_signup_limit(request: Request) -> None:
+    """
+    Prevent signup spam from same IP
+    
+    DEPRECATED: No longer uses Redis rate limiting.
+    Direct database access ensures fresh data.
+    
+    Args:
+        request: HTTP request (for client IP)
+        
+    Returns:
+        None - always passes (rate limiting disabled)
+    """
+    # Rate limiting disabled - no Redis backing
+    # IP tracking still available if needed
+    return
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+async def get_app_config(db: AsyncSession = Depends(get_db)) -> dict:
+    """
+    Get application configuration from AppConfig store
     
     Returns:
         dict: App configuration with keys:
-            - blocked_email_domains: list of domains to block
+            - blocked_email_domains: list
             - maintenance_mode: bool
             - features: dict of feature flags
     """
-    cache_key = "app:config"
-    
-    # Try Redis cache first
-    cached_config = await redis_client.get(cache_key)
-    if cached_config:
-        import json
-        return json.loads(cached_config)
-    
-    # Query specific config keys from database (AppConfig is key-value store)
-    result = await db.execute(
-        select(AppConfig).where(AppConfig.key.in_([
-            "blocked_email_domains", 
-            "maintenance_mode", 
-            "features"
-        ]))
-    )
-    configs = result.scalars().all()
-    
-    # Build config dict with defaults
-    config_dict = {
-        "blocked_email_domains": [],
-        "maintenance_mode": False,
-        "features": {}
-    }
-    
-    # Populate from database values
-    for config in configs:
-        if config.key == "blocked_email_domains":
-            config_dict["blocked_email_domains"] = config.value.split(",") if config.value else []
-        elif config.key == "maintenance_mode":
-            config_dict["maintenance_mode"] = config.value.lower() == "true" if config.value else False
-        elif config.key == "features":
-            import json
-            config_dict["features"] = json.loads(config.value) if config.value else {}
-    
-    # Cache for 1 hour
-    import json
-    await redis_client.set(cache_key, json.dumps(config_dict), ttl=3600)
-    
-    return config_dict
+    try:
+        # Query specific config keys from database
+        result = await db.execute(
+            select(AppConfig).where(AppConfig.key.in_([
+                "blocked_email_domains",
+                "maintenance_mode",
+                "features"
+            ]))
+        )
+        configs = result.scalars().all()
+        
+        # Build config dict with defaults
+        config_dict = {
+            "blocked_email_domains": [],
+            "maintenance_mode": False,
+            "features": {}
+        }
+        
+        # Populate from database values
+        for config in configs:
+            if config.key == "blocked_email_domains":
+                config_dict["blocked_email_domains"] = (
+                    config.value.split(",") if config.value else []
+                )
+            elif config.key == "maintenance_mode":
+                config_dict["maintenance_mode"] = (
+                    config.value.lower() == "true" if config.value else False
+                )
+            elif config.key == "features":
+                config_dict["features"] = (
+                    json.loads(config.value) if config.value else {}
+                )
+        
+        return config_dict
+        
+    except Exception as e:
+        logger.error(f"Error fetching app config: {e}")
+        return {
+            "blocked_email_domains": [],
+            "maintenance_mode": False,
+            "features": {}
+        }
 
 
 async def check_maintenance_mode(
@@ -576,17 +352,19 @@ async def check_maintenance_mode(
     Check if app is in maintenance mode
     
     Raises:
-        HTTPException: If maintenance mode is enabled
+        HTTPException: If maintenance mode enabled
     """
     if config.get("maintenance_mode", False):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="System is under maintenance. Please try again later."
+            detail="System under maintenance. Please try again later."
         )
 
 
-# Type aliases for cleaner route signatures
+# ============================================================================
+# TYPE ALIASES (for cleaner route signatures)
+# ============================================================================
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 CurrentAdminUser = Annotated[User, Depends(get_current_admin_user)]
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
-RedisClient = Annotated[Redis, Depends(get_redis)]

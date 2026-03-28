@@ -16,7 +16,6 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.core.config import settings
-from app.core.redis_client import redis_client
 from app.api.v1 import api_router  # Single import
 
 # Configure logging
@@ -33,25 +32,16 @@ async def lifespan(app: FastAPI):
     Application lifespan events
     
     Startup:
-    - Connect to Redis
     - Start background scheduler
     
     Shutdown:
     - Stop scheduler gracefully
     - Close scraper handlers
-    - Disconnect Redis
     """
     # =========================================================================
     # STARTUP
     # =========================================================================
     logger.info("🚀 Starting DealHunt Backend...")
-    
-    # Connect Redis
-    try:
-        await redis_client.connect()
-        logger.info("✅ Redis connected")
-    except Exception as e:
-        logger.error(f"❌ Redis startup failed: {e}")
         
     # Start background scheduler
     if settings.ENABLE_SCHEDULER:
@@ -103,10 +93,6 @@ async def lifespan(app: FastAPI):
         pass
     except Exception as e:
         logger.error(f"Error closing scrapers: {e}")
-    
-    # Disconnect Redis
-    await redis_client.disconnect()
-    logger.info("✅ Redis disconnected")
     
     logger.info("👋 DealHunt Backend stopped")
 
@@ -177,13 +163,9 @@ async def health_check():
     Health check endpoint
     
     Checks:
-    - Redis connection
     - Scheduler status
     - Payment services status
     """
-    # Check Redis
-    redis_status = await redis_client.ping()
-    
     # Check scheduler
     scheduler_status = "disabled"
     jobs_count = 0
@@ -213,17 +195,14 @@ async def health_check():
     except Exception:
         pass
     
-    # Determine overall status
+    # Overall status
     overall_status = "healthy"
-    if not redis_status:
-        overall_status = "degraded"
     
     return {
         "status": overall_status,
         "version": settings.APP_VERSION,
         "environment": settings.ENVIRONMENT,
         "services": {
-            "redis": "connected" if redis_status else "disconnected",
             "scheduler": scheduler_status,
             "jobs_registered": jobs_count
         },

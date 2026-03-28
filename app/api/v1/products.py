@@ -1,186 +1,93 @@
 """
 Product Detail & Price History Routes
+
+CENTRALIZED DATA ACCESS:
+- Uses QueryService for all database operations
+- Uses BusinessLogic for all data formatting and calculations
+- Direct database-to-frontend communication (no Redis caching)
+- Real-time data always fresh
+
+✅ FIXED: Refresh endpoint now gracefully handles scraper failures
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
-from sqlalchemy.orm import selectinload
-from typing import List
+from typing import List, Optional
 from datetime import datetime, timedelta
 from decimal import Decimal
 import logging
 
 from app.core.database import get_db
-from app.core.redis_client import RedisClient, get_redis
-from app.core.config import settings
-from app.models import Product, ProductListing, PriceHistory, User
+from app.models import Product, ProductListing, PriceHistory, User, Platform as PlatformModel
 from app.schemas import (
     ProductResponse,
-    ProductListingResponse,
     PriceHistoryResponse,
-    PriceHistoryPoint,
     Platform
 )
 from app.api.deps import get_current_user
+from app.services.queries import QueryService
+from app.services.logic import BusinessLogic
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-def _is_listing_allowed(listing: ProductListing) -> bool:
-    if hasattr(listing, "platform") and listing.platform:
-        if listing.platform.name.lower() == "croma" and not getattr(settings, "CROMA_ENABLED", False):
-            return False
-
-    min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
-    if listing.extraction_confidence is not None and listing.extraction_confidence < min_confidence:
-        return False
-
-    return True
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def format_listing_response(listing: ProductListing, product: Product) -> ProductListingResponse:
-    """Format ProductListing ORM model to ProductListingResponse"""
-    # Get platform name from relationship (should be eager-loaded)
-    platform_name = "amazon"  # Default
-    if hasattr(listing, 'platform') and listing.platform:
-        platform_name = listing.platform.name.lower()
-    
-    try:
-        platform_enum = Platform[platform_name.upper()]
-    except (KeyError, AttributeError):
-        platform_enum = Platform.AMAZON
-    
-    return ProductListingResponse(
-        id=str(listing.id),  # ✅ Convert UUID to string
-        platform=platform_enum,
-        platform_product_id=listing.external_id or "",
-        url=listing.product_url or "",
-        title=product.title,  # ✅ Get from product parameter (already loaded)
-        current_price=listing.current_price,
-        original_price=listing.original_price,
-        discount_percentage=int(listing.discount_percent) if listing.discount_percent else None,
-        rating=listing.rating,
-        review_count=listing.review_count,
-        image_url=product.image_url,  # ✅ Get from product parameter (already loaded)
-        in_stock=listing.in_stock,
-        last_scraped_at=listing.last_scraped or datetime.now(),
-        extraction_confidence=listing.extraction_confidence,
-        extraction_method=listing.extraction_method,
-        data_source=listing.data_source,
-        seller_name=listing.seller_name,
-        seller_rating=Decimal(str(listing.seller_rating)) if listing.seller_rating is not None else None,
-        variant_fingerprint=listing.variant_fingerprint
-    )
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
 async def get_product(
     product_id: str,
     user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    redis: RedisClient = Depends(get_redis)
+    db: AsyncSession = Depends(get_db)
 ):
-    """Get complete product details with all platform listings"""
-    cache_key = f"product:{product_id}"
-    cached = await redis.get_json(cache_key)
+    """
+    Get complete product details with all platform listings
     
-    if cached:
-        logger.info(f"Product cache HIT: {product_id} | User: {user.id}")
-        return ProductResponse(**cached)
-    
-    product = await db.get(Product, product_id)
-    
-    if not product:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found"
+    ✅ Direct DB access (no cache)
+    ✅ Real-time prices
+    ✅ All platforms in one response
+    ✅ Cross-platform comparison data included
+    """
+    try:
+        # Get product from DB
+        query_service = QueryService(db)
+        product = await query_service.get_product_by_id(product_id)
+        
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Product not found"
+            )
+        
+        # Get all listings for this product
+        listings = await query_service.get_product_listings(product_id, order_by="price_asc")
+        
+        # Filter to valid listings only
+        valid_listings = BusinessLogic.filter_valid_listings(listings, product)
+        
+        if not valid_listings:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No high-confidence listings available for this product"
+            )
+        
+        logger.debug(
+            f"Product {product_id}: "
+            f"Fetched {len(valid_listings)} valid listings (total: {len(listings)})"
         )
+        
+        # Format and return response
+        response = BusinessLogic.format_product_response(product, valid_listings)
+        logger.info(f"Product fetched: {product_id} | User: {user.id} | Listings: {len(valid_listings)}")
+        
+        return response
     
-    result = await db.execute(
-        select(ProductListing)
-        .where(ProductListing.product_id == product_id)
-        .order_by(ProductListing.current_price.asc())
-        .options(selectinload(ProductListing.platform))  # ✅ Eager-load platform relationship
-    )
-    all_listings = result.scalars().all()
-    listings = [l for l in all_listings if l is not None and _is_listing_allowed(l)]
-
-    if not listings:
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching product {product_id}: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No high-confidence listings available for this product"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch product details: {str(e)[:100]}"
         )
-    
-    logger.debug(f"Product {product_id}: Fetched {len(listings)} listings (total: {len(all_listings)})")
-    
-    # Get AI metadata
-    ai_metadata = product.ai_metadata or {}
-    
-    # Calculate best price from listings
-    best_price = 0
-    best_platform = "amazon"
-    avg_price = None
-    if listings:
-        # Filter listings with valid prices
-        listings_with_price = [l for l in listings if l.current_price is not None]
-        if listings_with_price:
-            best_listing = min(listings_with_price, key=lambda x: x.current_price or 0)
-            best_price = float(best_listing.current_price or 0)
-            if hasattr(best_listing, "platform") and best_listing.platform:
-                best_platform = best_listing.platform.name.lower()
-            prices = [float(l.current_price) for l in listings_with_price if l.current_price]
-            if prices:
-                avg_price = sum(prices) / len(prices)
-    
-    price_trend = "stable"
-    if avg_price and best_price:
-        if best_price < avg_price * 0.9:
-            price_trend = "down"
-        elif best_price > avg_price * 1.1:
-            price_trend = "up"
-    
-    response = ProductResponse(
-        id=str(product.id),  # ✅ FIX: Convert UUID to string
-        fingerprint=product.fingerprint,
-        # ✅ NEW: Variant fingerprinting fields
-        variant_fingerprint=product.variant_fingerprint,
-        base_fingerprint=product.base_fingerprint,
-        variant_type=product.variant_type,
-        storage_gb=product.storage_gb,
-        color=product.color,
-        condition=product.condition,
-        # Pricing
-        best_price=best_price,
-        best_platform=best_platform,
-        avg_price=avg_price,
-        price_trend=price_trend,
-        # AI metadata
-        ai_generated_essence=ai_metadata.get("essence", product.title),
-        ai_extracted_specs=product.specifications or {},
-        ai_tags=ai_metadata.get("tags", []),
-        created_at=product.created_at,
-        listings=[
-            format_listing_response(listing, product)  # ✅ Use helper function with product data
-            for listing in listings
-            if listing is not None  # ✅ CRITICAL: Filter None values
-        ]
-    )
-    
-    await redis.set_json(
-        cache_key,
-        response.model_dump(mode='json'),
-        ttl=3600
-    )
-    
-    logger.info(f"Product fetched: {product_id} | Listings: {len(listings)}")
-    
-    return response
 
 
 @router.get("/{product_id}/price-history", response_model=PriceHistoryResponse)
@@ -189,114 +96,368 @@ async def get_price_history(
     platform: Platform,
     days: int = 120,
     user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    redis: RedisClient = Depends(get_redis)
+    db: AsyncSession = Depends(get_db)
 ):
-    """Get price history for product on specific platform"""
-    if days > 365:
-        days = 365
+    """
+    Get price history for product on specific platform
     
-    cache_key = f"price_history:{product_id}:{platform}:{days}"
-    cached = await redis.get_json(cache_key)
-    
-    if cached:
-        logger.info(f"Price history cache HIT: {product_id}/{platform}")
-        return PriceHistoryResponse(**cached)
-    
-    # Get product listing - using JSONB price_history from ProductListing
-    result = await db.execute(
-        select(ProductListing)
-        .where(
-            ProductListing.product_id == product_id,
-            ProductListing.in_stock == True
+    ✅ Direct DB access (no cache)
+    ✅ Full history returned
+    ✅ Real-time data
+    """
+    try:
+        if days > 365:
+            days = 365
+        
+        query_service = QueryService(db)
+        
+        # Verify product exists
+        product = await query_service.get_product_by_id(product_id)
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Product not found"
+            )
+        
+        # Get listing for this platform
+        listing = await query_service.get_listing_by_platform(product_id, platform.value)
+        if not listing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Product not available on {platform.value}"
+            )
+        
+        # Verify listing is valid
+        if not BusinessLogic.is_listing_allowed(listing) or \
+           not BusinessLogic.is_variant_consistent(listing, product):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Product listing not available on {platform.value}"
+            )
+        
+        # Get price history
+        history = await query_service.get_price_history(
+            product_id,
+            platform.value,
+            days=days
         )
-        .options(selectinload(ProductListing.platform))
-        .order_by(ProductListing.last_scraped.desc().nullslast())
-    )
-    all_listings = result.scalars().all()
-    listing = next(
-        (
-            l for l in all_listings
-            if l.platform and l.platform.name.lower() == platform.value and _is_listing_allowed(l)
-        ),
-        None,
-    )
+        
+        # Format and return response
+        response = BusinessLogic.format_price_history_response(product, listing, history)
+        logger.info(
+            f"Price history: Product {product_id} | Platform: {platform.value} | "
+            f"Records: {len(history)} | User: {user.id}"
+        )
+        
+        return response
     
-    if not listing:
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching price history for {product_id}: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Product not available on {platform}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch price history: {str(e)[:100]}"
+        )
+
+
+@router.post("/{product_id}/refresh-price", response_model=ProductResponse)
+async def refresh_product_price(
+    product_id: str,
+    platform: Optional[Platform] = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Force refresh prices for a specific product by scraping its listing URLs live
+    
+    ✅ FIXED: Graceful fallback to DB data when scraper fails
+    ✅ No 503 errors - always returns latest DB snapshot
+    ✅ Proper error handling with rollback
+    """
+    query_service = QueryService(db)
+    
+    # =========================================================================
+    # STEP 1: Verify product exists and get current DB data
+    # =========================================================================
+    try:
+        product = await query_service.get_product_by_id(product_id)
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Product not found"
+            )
+        
+        # Get all listings for this product
+        all_listings = await query_service.get_product_listings(product_id)
+        
+        # Filter to valid listings
+        filtered_listings = BusinessLogic.filter_valid_listings(all_listings, product)
+        
+        # Further filter by platform if specified
+        if platform:
+            filtered_listings = [
+                l for l in filtered_listings
+                if hasattr(l, "platform") and l.platform and 
+                l.platform.name.lower() == platform.value
+            ]
+        
+        if not filtered_listings:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No eligible listings found to refresh"
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error loading product {product_id} for refresh: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load product: {str(e)[:100]}"
         )
     
-    # Get price history from JSONB column
-    price_history_data = listing.price_history_json or []
-    cutoff_date = datetime.utcnow() - timedelta(days=days)
+    # =========================================================================
+    # STEP 2: Attempt live scraping (with graceful failure handling)
+    # =========================================================================
+    now_utc = datetime.utcnow()
+    refreshed_count = 0
+    changed_count = 0
+    failed_platforms = []
+    scraper_available = False
     
-    history_points = []
-    for entry in price_history_data:
-        try:
-            price = entry.get("p")
-            date_str = entry.get("d")
+    # ✅ FIX 1: Wrap scraper import in try/except
+    try:
+        from app.services.scraper.factory import get_platform_handler
+        scraper_available = True
+    except ImportError as e:
+        logger.error(f"❌ Scraper module not available: {e}")
+        scraper_available = False
+    except Exception as e:
+        logger.error(f"❌ Unexpected error importing scraper: {e}")
+        scraper_available = False
+    
+    # Only attempt scraping if module is available
+    if scraper_available:
+        for listing in filtered_listings:
+            platform_name = (
+                listing.platform.name.lower()
+                if hasattr(listing, "platform") and listing.platform
+                else None
+            )
+            if not platform_name or not listing.product_url:
+                continue
             
-            if price and date_str:
-                entry_date = datetime.fromisoformat(date_str)
-                if entry_date >= cutoff_date:
-                    history_points.append(
-                        PriceHistoryPoint(
-                            date=entry_date,
-                            price=Decimal(str(price)),
-                            platform=platform
+            try:
+                # ✅ FIX 2: Pass db session to handler for healing persistence
+                handler = await get_platform_handler(platform_name, db=db)
+                if not handler:
+                    failed_platforms.append(platform_name)
+                    continue
+                
+                # Scrape live product data
+                product_data = await handler.get_product(listing.product_url)
+                if not product_data:
+                    listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
+                    listing.last_error = "No data from live refresh"
+                    failed_platforms.append(platform_name)
+                    continue
+                
+                refreshed_count += 1
+                old_price = listing.current_price
+                new_price = float(product_data.current_price) \
+                    if getattr(product_data, "current_price", None) else None
+                
+                # Update stock status
+                if getattr(product_data, "in_stock", None) is not None:
+                    listing.in_stock = bool(product_data.in_stock)
+                
+                # Update scrape metadata
+                listing.last_scraped = now_utc
+                listing.scrape_error_count = 0
+                listing.last_error = None
+                
+                # Update price if new value available
+                if new_price is not None:
+                    listing.current_price = new_price
+                    
+                    # Record in price history
+                    db.add(
+                        PriceHistory(
+                            product_listing_id=listing.id,
+                            price=Decimal(str(new_price)),
+                            in_stock=listing.in_stock if listing.in_stock is not None else True,
+                            recorded_at=now_utc
                         )
                     )
-        except (ValueError, TypeError):
-            continue
+                    
+                    # Track price changes
+                    if old_price is None or abs(float(new_price) - float(old_price)) > 0.01:
+                        changed_count += 1
+                        listing.last_price_change_at = now_utc
+            
+            except Exception as e:
+                listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
+                listing.last_error = str(e)[:500]
+                logger.error(f"Scrape error for listing {listing.id}: {e}")
+                failed_platforms.append(platform_name)
     
-    history_points.sort(key=lambda x: x.date)
+    # =========================================================================
+    # STEP 3: Commit changes (with proper error handling)
+    # =========================================================================
+    # ✅ FIX 3: Wrap commit in try/except with rollback
+    try:
+        await db.commit()
+        logger.info(
+            f"✅ Refresh commit successful: Product {product_id} | "
+            f"Refreshed: {refreshed_count} | Changed: {changed_count}"
+        )
+    except Exception as e:
+        logger.error(f"❌ Error committing refresh changes: {e}", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        # Continue to return DB data even if commit failed
     
-    # If no historical data exists, use fallback
-    has_historical_data = len([p for p in price_history_data if len(price_history_data) > 1]) > 0
+    # =========================================================================
+    # STEP 4: Return response (ALWAYS return DB data, never 503)
+    # =========================================================================
+    # ✅ FIX 4: Don't raise 503, log warning and return current DB state
+    if refreshed_count == 0:
+        unique_failed = sorted(set(failed_platforms))
+        failed_text = ", ".join(unique_failed) if unique_failed else "all configured platforms"
+        
+        logger.warning(
+            f"⚠️ Live refresh failed for {failed_text} on product {product_id}. "
+            f"Returning current DB snapshot. Scraper available: {scraper_available}"
+        )
+        
+        # Don't raise error - just return DB data
+        # User will see current prices even if scrape failed
+    else:
+        logger.info(
+            f"✅ Live refresh: Product {product_id} | "
+            f"Refreshed: {refreshed_count} | Changed: {changed_count} | User: {user.id}"
+        )
     
-    if not history_points:
-        history_points = [
-            PriceHistoryPoint(
-                date=datetime.utcnow(),
-                price=Decimal(str(listing.current_price)),
-                platform=platform
+    # Always return fresh data from DB (whether scrape succeeded or not)
+    return await get_product(product_id=product_id, user=user, db=db)
+
+
+@router.get("/{product_id}/cross-platform-variants")
+async def get_cross_platform_variants(
+    product_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get all variants of the same product across different platforms
+    
+    Used for: "See this product on other platforms with different variants"
+    
+    Returns:
+        {
+            "base_product": { product info },
+            "variants": [
+                {
+                    "variant_fingerprint": "iPhone 15 Pro 256GB Gold",
+                    "platforms": [ { platform, price, url }, ... ]
+                },
+                ...
+            ]
+        }
+    
+    ✅ Groups by variant (e.g., color, storage)
+    ✅ Shows all platform availability for each variant
+    ✅ Used in cross-platform comparison UI
+    """
+    try:
+        query_service = QueryService(db)
+        
+        # Get base product
+        product = await query_service.get_product_by_id(product_id)
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Product not found"
             )
-        ]
+        
+        # Get all listings for this product
+        all_listings = await query_service.get_product_listings(product_id, order_by="price_asc")
+        
+        # Filter to valid listings
+        valid_listings = BusinessLogic.filter_valid_listings(all_listings, product)
+        
+        if not valid_listings:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No available listings for this product"
+            )
+        
+        # Group by variant fingerprint
+        variants_map = {}
+        for listing in valid_listings:
+            variant_fp = getattr(listing, "variant_fingerprint", None) or "standard"
+            if variant_fp not in variants_map:
+                variants_map[variant_fp] = []
+            variants_map[variant_fp].append(listing)
+        
+        # Format response
+        variants_data = []
+        for variant_fp, listings_for_variant in variants_map.items():
+            platform_data = []
+            for listing in sorted(listings_for_variant, key=lambda x: x.current_price or 0):
+                platform_name = "amazon"
+                if hasattr(listing, "platform") and listing.platform:
+                    platform_name = listing.platform.name.lower()
+                
+                platform_data.append({
+                    "platform": platform_name,
+                    "price": float(listing.current_price or 0),
+                    "original_price": float(listing.original_price or 0) if listing.original_price else None,
+                    "discount_percent": int(listing.discount_percent) if listing.discount_percent else None,
+                    "url": listing.product_url or "",
+                    "in_stock": listing.in_stock if listing.in_stock is not None else False,
+                    "rating": listing.rating,
+                    "review_count": listing.review_count,
+                    "last_scraped": listing.last_scraped.isoformat() if listing.last_scraped else None
+                })
+            
+            variants_data.append({
+                "variant_fingerprint": variant_fp,
+                "platform_count": len(platform_data),
+                "platforms": platform_data,
+                "cheapest_price": min(p["price"] for p in platform_data) if platform_data else 0
+            })
+        
+        # Sort by cheapest price
+        variants_data.sort(key=lambda x: x["cheapest_price"])
+        
+        response_data = {
+            "product_id": str(product.id),
+            "title": product.title,
+            "brand": product.brand,
+            "category": product.category,
+            "image_url": product.image_url,
+            "total_platforms": len(set(l.platform_id for l in valid_listings)),
+            "total_listings": len(valid_listings),
+            "variants": variants_data
+        }
+        
+        logger.info(
+            f"Cross-platform variants: Product {product_id} | "
+            f"Variants: {len(variants_data)} | Platforms: {response_data['total_platforms']} | "
+            f"User: {user.id}"
+        )
+        
+        return response_data
     
-    prices = [point.price for point in history_points]
-    lowest_price = min(prices)
-    highest_price = max(prices)
-    average_price = sum(prices) / len(prices)
-    
-    # ✅ If only 1 data point, all three will be same - that's normal
-    logger.debug(
-        f"Price history for {product_id} on {platform}: "
-        f"Points: {len(history_points)}, Low: ₹{lowest_price}, High: ₹{highest_price}, Avg: ₹{average_price}"
-    )
-    
-    price_drop_percentage = None
-    if highest_price > 0:
-        current_price = Decimal(str(listing.current_price))
-        price_drop_percentage = ((highest_price - current_price) / highest_price) * 100
-    
-    response = PriceHistoryResponse(
-        product_id=product_id,
-        platform=platform,
-        history=history_points,
-        lowest_price=lowest_price,
-        highest_price=highest_price,
-        average_price=Decimal(str(average_price)),
-        price_drop_percentage=Decimal(str(price_drop_percentage)) if price_drop_percentage else None
-    )
-    
-    await redis.set_json(
-        cache_key,
-        response.model_dump(mode='json'),
-        ttl=21600
-    )
-    
-    logger.info(f"Price history: Product {product_id} | Platform: {platform} | Records: {len(history_points)}")
-    
-    return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching cross-platform variants for {product_id}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch cross-platform comparison: {str(e)[:100]}"
+        )

@@ -1,0 +1,641 @@
+"""
+Centralized Business Logic Module
+
+All data transformation, filtering, and business rule logic is here:
+- Response formatting
+- Data validation
+- Filtering (confidence, variants, platform)
+- Price calculations
+- Feature logic
+
+Usage:
+    from app.services.logic import BusinessLogic
+    
+    logic = BusinessLogic()
+    formatted = logic.format_product_detail(product, listings)
+    filtered = logic.filter_valid_listings(listings, product)
+"""
+
+from typing import List, Optional, Dict, Tuple
+from datetime import datetime, timedelta
+from decimal import Decimal
+import logging
+
+from app.models import Product, ProductListing, PriceHistory, Platform
+from app.schemas import (
+    ProductResponse,
+    ProductListingResponse,
+    PriceHistoryResponse,
+    PriceHistoryPoint,
+    TrendingProductResponse,
+    Platform as PlatformEnum
+)
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class BusinessLogic:
+    """
+    SINGLE SOURCE OF TRUTH for all business logic
+    
+    Responsibilities:
+    ✅ Filter invalid listings (confidence, platform settings)
+    ✅ Check variant consistency
+    ✅ Format responses
+    ✅ Calculate price trends
+    ✅ Process AI metadata
+    ✅ Apply business rules
+    """
+    
+    # ========================================================================
+    # FILTERING & VALIDATION LOGIC
+    # ========================================================================
+    
+    @staticmethod
+    def is_listing_allowed(listing: ProductListing) -> bool:
+        """
+        Check if listing meets quality thresholds
+        
+        Rejects:
+        - Disabled platforms (e.g., Croma)
+        - Low confidence extractions
+        
+        Returns:
+            True if listing should be displayed
+        """
+        # Platform check
+        if hasattr(listing, "platform") and listing.platform:
+            if listing.platform.name.lower() == "croma" and not getattr(settings, "CROMA_ENABLED", False):
+                logger.debug(f"Listing {listing.id} rejected: Croma disabled")
+                return False
+        
+        # Confidence check
+        min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
+        if listing.extraction_confidence is not None and listing.extraction_confidence < min_confidence:
+            logger.debug(f"Listing {listing.id} rejected: Low confidence ({listing.extraction_confidence})")
+            return False
+        
+        return True
+    
+    @staticmethod
+    def is_variant_consistent(
+        listing: ProductListing,
+        product: Product
+    ) -> bool:
+        """
+        Check if listing variant matches product variant
+        
+        Prevents cross-variant leakage:
+        - E.g., showing iPhone 14 storage and iPhone 14 Pro color together
+        
+        Returns:
+            True if variant fingerprint matches
+        """
+        product_fp = getattr(product, "variant_fingerprint", None)
+        listing_fp = getattr(listing, "variant_fingerprint", None)
+        
+        # If both have fingerprints, they must match
+        if product_fp and listing_fp and str(product_fp) != str(listing_fp):
+            logger.debug(
+                f"Listing {listing.id} variant mismatch: "
+                f"product_fp={product_fp} vs listing_fp={listing_fp}"
+            )
+            return False
+        
+        return True
+    
+    @staticmethod
+    def filter_valid_listings(
+        listings: List[ProductListing],
+        product: Product
+    ) -> List[ProductListing]:
+        """
+        Filter listings to only valid ones
+        
+        Applies both is_listing_allowed and is_variant_consistent
+        
+        Args:
+            listings: Raw listings from database
+            product: Parent product
+            
+        Returns:
+            Filtered list of valid listings
+        """
+        valid = []
+        for listing in listings:
+            if listing and BusinessLogic.is_listing_allowed(listing) and \
+               BusinessLogic.is_variant_consistent(listing, product):
+                valid.append(listing)
+        
+        logger.debug(
+            f"Filtered {len(listings)} listings → {len(valid)} valid "
+            f"(removed {len(listings) - len(valid)} invalid)"
+        )
+        return valid
+    
+    # ========================================================================
+    # HELPER: Get platform name safely
+    # ========================================================================
+    
+    @staticmethod
+    def _get_platform_name(listing: ProductListing) -> str:
+        """Safely get platform name from listing"""
+        if hasattr(listing, 'platform') and listing.platform:
+            return listing.platform.name.lower()
+        return "amazon"
+    
+    @staticmethod
+    def _get_platform_enum(platform_name: str) -> PlatformEnum:
+        """Convert platform name string to enum"""
+        try:
+            return PlatformEnum[platform_name.upper()]
+        except (KeyError, AttributeError):
+            return PlatformEnum.AMAZON
+    
+    # ========================================================================
+    # RESPONSE FORMATTING
+    # ========================================================================
+    
+    @staticmethod
+    def format_listing_response(
+        listing: ProductListing,
+        product: Product
+    ) -> ProductListingResponse:
+        """
+        Format ProductListing ORM to API response schema
+        
+        Args:
+            listing: ProductListing ORM object
+            product: Parent Product ORM object
+            
+        Returns:
+            ProductListingResponse ready for API
+        """
+        platform_name = BusinessLogic._get_platform_name(listing)
+        platform_enum = BusinessLogic._get_platform_enum(platform_name)
+        
+        return ProductListingResponse(
+            id=str(listing.id),
+            product_id=str(listing.product_id) if listing.product_id else None,
+            platform_id=listing.platform_id,
+            platform_name=platform_name,
+            platform=platform_enum,
+            platform_product_id=listing.external_id or "",
+            url=listing.product_url or "",
+            title=product.title or "",
+            current_price=Decimal(str(listing.current_price)) if listing.current_price else Decimal("0"),
+            original_price=Decimal(str(listing.original_price)) if listing.original_price else None,
+            discount_percentage=int(listing.discount_percent) if listing.discount_percent else None,
+            discount_percent=Decimal(str(listing.discount_percent)) if listing.discount_percent else None,
+            rating=Decimal(str(listing.rating)) if listing.rating else None,
+            review_count=listing.review_count,
+            image_url=product.image_url,
+            in_stock=listing.in_stock if listing.in_stock is not None else True,
+            last_scraped_at=listing.last_scraped or datetime.utcnow(),
+            extraction_confidence=listing.extraction_confidence,
+            extraction_method=listing.extraction_method,
+            data_source=listing.data_source,
+            seller_name=listing.seller_name,
+            seller_rating=Decimal(str(listing.seller_rating)) if listing.seller_rating is not None else None,
+            variant_fingerprint=listing.variant_fingerprint
+        )
+    
+    @staticmethod
+    def format_product_response(
+        product: Product,
+        listings: List[ProductListing]
+    ) -> ProductResponse:
+        """
+        Format complete product detail response
+        
+        Calculates:
+        - Best price across platforms
+        - Average price
+        - Price trend
+        - Formats all listings
+        
+        Args:
+            product: Product ORM object
+            listings: Filtered valid listings
+            
+        Returns:
+            ProductResponse ready for API
+        """
+        # Calculate best price
+        best_price = Decimal("0")
+        best_platform = PlatformEnum.AMAZON
+        avg_price = None
+        
+        listings_with_price = [l for l in listings if l.current_price is not None]
+        
+        if listings_with_price:
+            # Get cheapest listing
+            best_listing = min(listings_with_price, key=lambda x: x.current_price or 0)
+            best_price = Decimal(str(best_listing.current_price or 0))
+            
+            platform_name = BusinessLogic._get_platform_name(best_listing)
+            best_platform = BusinessLogic._get_platform_enum(platform_name)
+            
+            # Calculate average
+            prices = [float(l.current_price) for l in listings_with_price if l.current_price]
+            if prices:
+                avg_price = Decimal(str(sum(prices) / len(prices)))
+        
+        # Calculate price trend
+        price_trend = "stable"
+        if avg_price and best_price:
+            if best_price < avg_price * Decimal("0.9"):
+                price_trend = "down"
+            elif best_price > avg_price * Decimal("1.1"):
+                price_trend = "up"
+        
+        # Get AI metadata
+        ai_metadata = product.ai_metadata or {}
+        
+        # Format response - ✅ FIXED: Include all required fields
+        return ProductResponse(
+            id=str(product.id),
+            fingerprint=product.fingerprint or "",
+            # ✅ FIXED: Added missing required fields
+            title=product.title,
+            brand=product.brand,
+            category=product.category,
+            subcategory=product.subcategory,
+            image_url=product.image_url,
+            specifications=product.specifications or {},
+            # Variant fields
+            variant_fingerprint=product.variant_fingerprint,
+            base_fingerprint=product.base_fingerprint,
+            variant_type=product.variant_type,
+            storage_gb=product.storage_gb,
+            color=product.color,
+            condition=product.condition,
+            # Confidence fields
+            brand_confidence=product.brand_confidence,
+            brand_source=product.brand_source,
+            color_confidence=product.color_confidence,
+            color_source=product.color_source,
+            specs_confidence=product.specs_confidence,
+            specs_source=product.specs_source,
+            last_enriched_at=product.last_enriched_at,
+            enrichment_version=product.enrichment_version,
+            # Pricing
+            best_price=best_price,
+            best_platform=best_platform,
+            avg_price=avg_price,
+            price_trend=price_trend,
+            # AI metadata
+            ai_generated_essence=ai_metadata.get("essence", product.title or ""),
+            ai_extracted_specs=product.specifications or {},
+            ai_tags=ai_metadata.get("tags", []),
+            ai_metadata=ai_metadata,
+            stats=product.stats or {},
+            created_at=product.created_at or datetime.utcnow(),
+            updated_at=product.updated_at,
+            # Formatted listings
+            listings=[
+                BusinessLogic.format_listing_response(listing, product)
+                for listing in listings
+                if listing is not None
+            ]
+        )
+    
+    @staticmethod
+    def format_price_history_response(
+        product: Product,
+        listing: ProductListing,
+        history: List[PriceHistory]
+    ) -> PriceHistoryResponse:
+        """
+        Format price history response
+        
+        Converts PriceHistory records to chart-ready points
+        
+        Args:
+            product: Product ORM object
+            listing: ProductListing ORM object
+            history: List of PriceHistory records
+            
+        Returns:
+            PriceHistoryResponse ready for API
+        """
+        # Get platform enum
+        platform_name = BusinessLogic._get_platform_name(listing)
+        platform_enum = BusinessLogic._get_platform_enum(platform_name)
+        
+        # ✅ FIXED: Convert history to PriceHistoryPoint with correct fields
+        points = []
+        prices = []
+        
+        for price_record in history:
+            price_value = float(price_record.price) if price_record.price else 0
+            prices.append(price_value)
+            
+            points.append(
+                PriceHistoryPoint(
+                    date=price_record.recorded_at,
+                    price=Decimal(str(price_value)),
+                    platform=platform_enum  # ✅ FIXED: Added required platform field
+                )
+            )
+        
+        # ✅ FIXED: Calculate required statistics
+        lowest_price = Decimal(str(min(prices))) if prices else Decimal("0")
+        highest_price = Decimal(str(max(prices))) if prices else Decimal("0")
+        average_price = Decimal(str(sum(prices) / len(prices))) if prices else Decimal("0")
+        
+        # Calculate price drop percentage (current vs highest)
+        current_price = float(listing.current_price) if listing.current_price else 0
+        price_drop_percentage = None
+        if highest_price > 0 and current_price > 0:
+            drop = ((float(highest_price) - current_price) / float(highest_price)) * 100
+            if drop > 0:
+                price_drop_percentage = Decimal(str(round(drop, 2)))
+        
+        # ✅ FIXED: Return with correct field names
+        return PriceHistoryResponse(
+            product_id=str(product.id),
+            platform=platform_enum,
+            history=points,  # ✅ FIXED: Changed from 'points' to 'history'
+            lowest_price=lowest_price,
+            highest_price=highest_price,
+            average_price=average_price,
+            price_drop_percentage=price_drop_percentage
+        )
+    
+    @staticmethod
+    def format_trending_response(
+        product: Product,
+        listing: ProductListing,
+        platform_count: int = 1
+    ) -> TrendingProductResponse:
+        """
+        Format product for trending/featured display
+        
+        Args:
+            product: Product ORM object
+            listing: ProductListing ORM object (preferred platform)
+            platform_count: How many platforms have this product (for badge)
+            
+        Returns:
+            TrendingProductResponse for carousel/list display
+        """
+        ai_metadata = product.ai_metadata or {}
+        
+        # Get best platform
+        platform_name = BusinessLogic._get_platform_name(listing)
+        best_platform_enum = BusinessLogic._get_platform_enum(platform_name)
+        
+        # ✅ FIXED: Ensure all required fields are present with correct types
+        return TrendingProductResponse(
+            product_id=str(product.id),
+            title=ai_metadata.get("essence") or product.title or "Product",
+            image_url=product.image_url,
+            best_price=Decimal(str(listing.current_price or 0)),
+            best_platform=best_platform_enum,
+            discount_percentage=int(listing.discount_percent) if listing.discount_percent else None,
+            search_count=0,  # ✅ FIXED: Added required field (set by caller if needed)
+            rank=0,  # Set by caller
+            # Variant info
+            variant_fingerprint=getattr(listing, "variant_fingerprint", None),
+            base_fingerprint=getattr(product, "base_fingerprint", None),
+            variant_type=getattr(product, "variant_type", None),
+            platform_count=platform_count
+        )
+    
+    # ========================================================================
+    # CALCULATION & AGGREGATION LOGIC
+    # ========================================================================
+    
+    @staticmethod
+    def calculate_best_price_info(listings: List[ProductListing]) -> Tuple[float, str]:
+        """
+        Calculate best price and best platform across listings
+        
+        Returns:
+            Tuple of (best_price, best_platform_name)
+        """
+        best_price = 0
+        best_platform = "amazon"
+        
+        listings_with_price = [l for l in listings if l.current_price is not None]
+        if listings_with_price:
+            best_listing = min(listings_with_price, key=lambda x: x.current_price or 0)
+            best_price = float(best_listing.current_price or 0)
+            best_platform = BusinessLogic._get_platform_name(best_listing)
+        
+        return best_price, best_platform
+    
+    @staticmethod
+    def calculate_average_price(listings: List[ProductListing]) -> Optional[float]:
+        """
+        Calculate average price across all listings
+        
+        Returns:
+            Average price or None if no listings
+        """
+        listings_with_price = [l for l in listings if l.current_price is not None]
+        if not listings_with_price:
+            return None
+        
+        prices = [float(l.current_price) for l in listings_with_price]
+        return sum(prices) / len(prices)
+    
+    @staticmethod
+    def calculate_price_trend(best_price: float, avg_price: Optional[float]) -> str:
+        """
+        Determine price trend (up/down/stable)
+        
+        Rules:
+        - down: best < avg * 0.9 (10%+ below average)
+        - up: best > avg * 1.1 (10%+ above average)
+        - stable: otherwise
+        
+        Returns:
+            'up', 'down', or 'stable'
+        """
+        if not avg_price or best_price == 0:
+            return "stable"
+        
+        if best_price < avg_price * 0.9:
+            return "down"
+        elif best_price > avg_price * 1.1:
+            return "up"
+        else:
+            return "stable"
+    
+    @staticmethod
+    def get_price_points_for_chart(history: List[PriceHistory]) -> List[Dict]:
+        """
+        Convert PriceHistory records to chart-ready points
+        
+        Args:
+            history: List of PriceHistory records
+            
+        Returns:
+            List of dicts with 'date' and 'price' keys (sorted ascending)
+        """
+        points = []
+        for record in sorted(history, key=lambda x: x.recorded_at):
+            points.append({
+                "date": record.recorded_at,
+                "price": float(record.price),
+            })
+        
+        return points
+    
+    # ========================================================================
+    # FEATURE LOGIC
+    # ========================================================================
+    
+    @staticmethod
+    def select_diverse_listings(
+        products: List[Product],
+        all_listings_map: Dict[str, List[ProductListing]]
+    ) -> List[Tuple[Product, ProductListing]]:
+        """
+        Select diverse platform listings for featured section
+        
+        Rotates platform preferences to show variety (Amazon, Flipkart, Meesho, etc)
+        
+        Args:
+            products: List of products
+            all_listings_map: Dict mapping product_id → list of listings
+            
+        Returns:
+            List of (product, selected_listing) tuples
+        """
+        platform_rotation = ['amazon', 'flipkart', 'meesho', 'nykaa', 'myntra', 'croma']
+        platform_index = 0
+        
+        results = []
+        for product in products:
+            product_id = str(product.id)
+            listings = all_listings_map.get(product_id, [])
+            
+            if not listings:
+                continue
+            
+            # Try to get from preferred platform
+            preferred_platform = platform_rotation[platform_index % len(platform_rotation)]
+            platform_index += 1
+            
+            selected_listing = None
+            for listing in listings:
+                platform_name = BusinessLogic._get_platform_name(listing)
+                if platform_name == preferred_platform.lower():
+                    selected_listing = listing
+                    break
+            
+            # Fall back to cheapest if preferred not available
+            if not selected_listing:
+                listings_with_price = [l for l in listings if l.current_price is not None]
+                if listings_with_price:
+                    selected_listing = min(listings_with_price, key=lambda x: x.current_price or 0)
+                else:
+                    selected_listing = listings[0] if listings else None
+            
+            if selected_listing:
+                results.append((product, selected_listing))
+        
+        return results
+    
+    @staticmethod
+    def should_show_discount_badge(listing: ProductListing, min_discount: int = 10) -> bool:
+        """
+        Determine if listing should show discount badge
+        
+        Args:
+            listing: ProductListing to check
+            min_discount: Minimum discount % to show badge
+            
+        Returns:
+            True if discount >= min_discount
+        """
+        if listing.discount_percent is None:
+            return False
+        return listing.discount_percent >= min_discount
+    
+    @staticmethod
+    def categorize_price_level(
+        current_price: float,
+        average_price: float
+    ) -> str:
+        """
+        Categorize price level relative to average
+        
+        Returns:
+            'bargain', 'good', 'fair', 'expensive', or 'unknown'
+        """
+        if current_price == 0:
+            return "unknown"
+        
+        ratio = current_price / average_price if average_price > 0 else 0
+        
+        if ratio < 0.85:
+            return "bargain"
+        elif ratio < 0.95:
+            return "good"
+        elif ratio < 1.1:
+            return "fair"
+        else:
+            return "expensive"
+    
+    # ========================================================================
+    # DATA AGGREGATION
+    # ========================================================================
+    
+    @staticmethod
+    def aggregate_category_stats(
+        categories: Dict[str, int],
+        limit: int = 10
+    ) -> List[Dict]:
+        """
+        Format category stats for display
+        
+        Args:
+            categories: Dict of {category: product_count}
+            limit: Max categories to return
+            
+        Returns:
+            List of {'name': category, 'count': count} dicts
+        """
+        return [
+            {"name": category, "count": count}
+            for category, count in sorted(
+                categories.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:limit]
+        ]
+    
+    @staticmethod
+    def build_search_result_metadata(products: List[Product]) -> Dict:
+        """
+        Build metadata for search results
+        
+        Returns:
+            Dict with stats: total_count, categories, price_range, etc
+        """
+        if not products:
+            return {
+                "total_count": 0,
+                "categories": [],
+                "price_range": {"min": 0, "max": 0}
+            }
+        
+        # Collect categories
+        categories = {}
+        for product in products:
+            if product.category:
+                categories[product.category] = categories.get(product.category, 0) + 1
+        
+        return {
+            "total_count": len(products),
+            "categories": BusinessLogic.aggregate_category_stats(categories),
+            "price_range": {
+                "min": 0,
+                "max": 0
+            }
+        }

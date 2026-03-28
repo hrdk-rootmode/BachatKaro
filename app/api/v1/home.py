@@ -1,21 +1,24 @@
 """
 Home Page API Endpoints
-Provides curated content for home page display
+
+CENTRALIZED DATA ACCESS:
+- Uses QueryService for all database operations
+- Uses BusinessLogic for formatting and calculations
+- Direct database-to-frontend communication (no Redis caching)
+- Real-time product data
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, Integer
-from sqlalchemy.orm import selectinload
-from typing import List, Optional
+from typing import List
 import logging
 
 from app.core.database import get_db
-from app.core.redis_client import get_redis
 from app.api.deps import get_current_user
-from app.models import Product, ProductListing, Platform
+from app.models import User
 from app.schemas import TrendingProductResponse
-from app.core.redis_client import RedisClient
+from app.services.queries import QueryService
+from app.services.logic import BusinessLogic
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -24,106 +27,54 @@ logger = logging.getLogger(__name__)
 @router.get("/featured", response_model=List[TrendingProductResponse])
 async def get_featured_products(
     limit: int = 10,
-    user = Depends(get_current_user),
-    redis: RedisClient = Depends(get_redis),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Get featured products for home page banner
-    Returns hand-picked products with high engagement
+    
+    ✅ Direct DB access (no cache)
+    ✅ Platform diversity rotating
+    ✅ Real-time featured products
     """
-    cache_key = "home:featured:products"
-    
-    # Check Redis cache
-    cached = await redis.get_json(cache_key)
-    if cached:
-        logger.info(f"Featured products cache HIT | User: {user.id}")
-        return cached
-    
     try:
-        # ✅ FIX: Get products from DIFFERENT platforms for variety, not just cheapest
-        # This ensures banner shows Amazon, Flipkart, Meesho, etc.
-        result = await db.execute(
-            select(Product)
-            .where(
-                Product.image_url.isnot(None),
-                Product.title.isnot(None)
-            )
-            .order_by(Product.created_at.desc())
-            .limit(limit)
-        )
+        query_service = QueryService(db)
         
-        products = result.scalars().all()
-        logger.info(f"Fetched {len(products)} featured products")
+        # Get featured products from DB
+        products = await query_service.get_featured_products(limit=limit)
         
-        # Build response - get ONE listing per product (try to vary platforms)
-        featured = []
-        platform_rotation = ['amazon', 'flipkart', 'meesho', 'nykaa', 'myntra']
-        platform_index = 0
+        if not products:
+            logger.info(f"No featured products available | User: {user.id}")
+            return []
         
+        # Get listings for each product, with platform diversity
+        all_listings_map = {}
         for product in products:
+            listings = await query_service.get_product_listings(str(product.id))
+            # Filter valid listings
+            valid_listings = BusinessLogic.filter_valid_listings(listings, product)
+            if valid_listings:
+                all_listings_map[str(product.id)] = valid_listings
+        
+        # Select diverse listings
+        product_listing_pairs = BusinessLogic.select_diverse_listings(products, all_listings_map)
+        
+        # Format responses
+        featured = []
+        for product, listing in product_listing_pairs:
             try:
-                # ✅ Try to get a listing from different platforms in rotation
-                preferred_platform = platform_rotation[platform_index % len(platform_rotation)]
-                platform_index += 1
-                
-                # Get ALL listings for this product with platform eager-loaded
-                result = await db.execute(
-                    select(ProductListing)
-                    .where(ProductListing.product_id == product.id)
-                    .options(selectinload(ProductListing.platform))
-                    .order_by(ProductListing.current_price.asc())
-                )
-                all_listings = list(result.scalars().all())
-                
-                if not all_listings:
-                    continue
-                
-                # Find listing with preferred platform
-                listing = None
-                for l in all_listings:
-                    if l.platform and l.platform.name.lower() == preferred_platform.lower():
-                        listing = l
-                        break
-                
-                # If preferred platform not available, use cheapest from any platform
-                if not listing:
-                    listing = all_listings[0]  # Already sorted by price asc
-                
-                if not listing or not listing.platform:
-                    continue
-                
-                ai_metadata = product.ai_metadata or {}
-                
-                featured_item = TrendingProductResponse(
-                    product_id=str(product.id),
-                    title=ai_metadata.get("essence", product.title),
-                    image_url=product.image_url,
-                    platform=listing.platform.name,
-                    current_price=float(listing.current_price),
-                    original_price=float(listing.original_price) if listing.original_price else None,
-                    discount_percent=listing.discount_percent or 0,
-                    rank=len(featured) + 1,
-                    category=product.category,
-                    brand=product.brand
-                )
-                
-                featured.append(featured_item)
-                
+                # Get platform count for this product
+                product_id_str = str(product.id)
+                listings_for_product = all_listings_map.get(product_id_str, [])
+                platform_count = len(listings_for_product)
+                response = BusinessLogic.format_trending_response(product, listing, platform_count=platform_count)
+                response.rank = len(featured) + 1
+                featured.append(response)
             except Exception as e:
-                logger.error(f"Error building featured product {product.id}: {e}", exc_info=True)
+                logger.error(f"Error formatting featured product {product.id}: {e}")
                 continue
         
-        # Cache for 30 minutes
-        if featured:
-            await redis.set_json(
-                cache_key,
-                [item.model_dump(mode='json') for item in featured],
-                ttl=1800
-            )
-            logger.info(f"Cached {len(featured)} featured products with platform variety")
-        
-        logger.info(f"Featured products ready | Count: {len(featured)}")
+        logger.info(f"Featured products: {len(featured)} | User: {user.id}")
         return featured
         
     except Exception as e:
@@ -133,34 +84,22 @@ async def get_featured_products(
 
 @router.get("/categories", response_model=dict)
 async def get_home_categories(
-    user = Depends(get_current_user),
-    redis: RedisClient = Depends(get_redis),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Get categories with product counts for home page
+    
+    ✅ Direct DB access (no cache)
+    ✅ Real-time category data
     """
-    cache_key = "home:categories:counts"
-    
-    # Check Redis cache
-    cached = await redis.get_json(cache_key)
-    if cached:
-        return cached
-    
     try:
-        # Get product counts by category
-        result = await db.execute(
-            select(Product.category, func.count(Product.id))
-            .where(Product.category.isnot(None))
-            .group_by(Product.category)
-            .order_by(func.count(Product.id).desc())
-        )
+        query_service = QueryService(db)
         
-        categories = {}
-        for category, count in result.all():
-            categories[category] = count
+        # Get category counts
+        categories = await query_service.get_categories_with_counts()
         
-        # Add trending categories
+        # Format as dict
         trending_categories = {
             "Electronics": categories.get("Electronics", 0),
             "Fashion": categories.get("Fashion", 0),
@@ -170,9 +109,7 @@ async def get_home_categories(
             "Books": categories.get("Books", 0)
         }
         
-        # Cache for 1 hour
-        await redis.set_json(cache_key, trending_categories, ttl=3600)
-        
+        logger.info(f"Categories fetched: {len(trending_categories)} | User: {user.id}")
         return trending_categories
         
     except Exception as e:
@@ -183,69 +120,54 @@ async def get_home_categories(
 @router.get("/deals", response_model=List[TrendingProductResponse])
 async def get_home_deals(
     limit: int = 20,
-    user = Depends(get_current_user),
-    redis: RedisClient = Depends(get_redis),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Get best deals for home page
-    Products with highest discounts
+    
+    ✅ Direct DB access (no cache)
+    ✅ Highest discounts first
+    ✅ Real-time deals
     """
-    cache_key = "home:deals:products"
-    
-    # Check Redis cache
-    cached = await redis.get_json(cache_key)
-    if cached:
-        logger.info(f"Home deals cache HIT | User: {user.id}")
-        return cached
-    
     try:
-        # Get products with highest discounts
-        result = await db.execute(
-            select(ProductListing, Product)
-            .join(Product, ProductListing.product_id == Product.id)
-            .where(
-                ProductListing.discount_percent > 0,
-                ProductListing.in_stock == True
-            )
-            .order_by(ProductListing.discount_percent.desc())
-            .limit(limit)
+        query_service = QueryService(db)
+        
+        # Get products with discounts
+        products = await query_service.get_products_with_discount(
+            min_discount=10,
+            limit=limit
         )
         
+        if not products:
+            logger.info(f"No deals available | User: {user.id}")
+            return []
+        
+        # Get and format listings
         deals = []
-        for listing, product in result.all():
+        for product in products:
             try:
-                ai_metadata = product.ai_metadata or {}
+                # Get listings for this product
+                listings = await query_service.get_product_listings(str(product.id))
+                valid_listings = BusinessLogic.filter_valid_listings(listings, product)
                 
-                deal_item = TrendingProductResponse(
-                    product_id=str(product.id),
-                    title=ai_metadata.get("essence", product.title),
-                    image_url=product.image_url,
-                    platform=listing.platform.name,
-                    current_price=float(listing.current_price),
-                    original_price=float(listing.original_price) if listing.original_price else None,
-                    discount_percent=listing.discount_percent,
-                    rank=len(deals) + 1,
-                    category=product.category,
-                    brand=product.brand
-                )
+                if not valid_listings:
+                    continue
                 
-                deals.append(deal_item)
+                # Use listing with highest discount
+                best_deal_listing = max(valid_listings, key=lambda l: l.discount_percent or 0)
+                
+                # Get platform count for this product
+                platform_count = len(valid_listings)
+                response = BusinessLogic.format_trending_response(product, best_deal_listing, platform_count=platform_count)
+                response.rank = len(deals) + 1
+                deals.append(response)
                 
             except Exception as e:
-                logger.error(f"Error building deal {product.id}: {e}")
+                logger.error(f"Error formatting deal {product.id}: {e}")
                 continue
         
-        # Cache for 15 minutes
-        if deals:
-            await redis.set_json(
-                cache_key,
-                [item.model_dump(mode='json') for item in deals],
-                ttl=900
-            )
-            logger.info(f"Cached {len(deals)} home deals")
-        
-        logger.info(f"Home deals ready | Count: {len(deals)}")
+        logger.info(f"Home deals: {len(deals)} | User: {user.id}")
         return deals
         
     except Exception as e:

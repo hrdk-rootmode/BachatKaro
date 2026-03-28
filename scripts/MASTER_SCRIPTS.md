@@ -82,3 +82,54 @@ python scripts/match_existing_products.py --limit 200 --no-ai
 "No eligible cross-platform matches":
 - Not always an error; means no safe same-variant match passed filters.
 - Keep seeding source products and run matching separately later if needed.
+
+
+1. If you run only `python jobs/daily_scrape.py`:
+- It runs one cycle and exits.
+- It uses smart due-based selection now.
+- It respects configured cap (default from settings, currently 500 unless changed).
+- It updates `next_scrape_at` for processed listings.
+
+2. If you want continuous running with no limit:
+- Use:
+`python jobs/daily_scrape.py --continuous --interval-minutes 20 --max-products 80`
+- This loops forever (no max cycle cap).
+- It will sleep 20 minutes between cycles and keep refreshing due products with lower burst risk.
+
+3. If you want continuous plus force-all behavior each cycle (usually heavier):
+- Use:
+`python jobs/daily_scrape.py --continuous --force-all --interval-minutes 10`
+- Recommended only for catch-up periods, not normal steady state.
+
+4. For your goal (stable live-ish updates), best command:
+`python jobs/daily_scrape.py --continuous --interval-minutes 20 --max-products 80`
+
+5. To stop no-limit mode:
+- Press `Ctrl + C` in that terminal.
+
+Mostly yes, with these conditions:
+
+1. Platform coverage:
+- It only covers platforms marked active in DB.
+- If a platform is paused/disabled, it will be skipped.
+
+2. Product coverage:
+- It covers products that are “due” (based on next_scrape_at / policy), not every product every cycle.
+- Over multiple cycles, all due listings get picked progressively.
+
+3. Fairness:
+- Watchlist and higher-priority items are processed first.
+- Normal items still get turns, but may take more cycles depending on max-products and interval.
+
+4. To ensure full sweep regularly:
+- Run continuous mode with enough batch size, for example:
+python jobs/daily_scrape.py --continuous --interval-minutes 10 --max-products 300
+- Optionally run a periodic catch-up:
+python jobs/daily_scrape.py --force-all --max-products 500
+
+5. What can still prevent full coverage:
+- Platform inactive flag
+- Persistent scrape failures/rate limits
+- Very low max-products compared to total listing count
+
+If you want, I can add a “coverage report” log per cycle (total listings, due listings, processed, remaining by platform) so you can verify 100% coverage health continuously.

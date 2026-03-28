@@ -301,7 +301,8 @@ class SearchResponse(BaseModel):
 
 class TrendingProductResponse(BaseModel):
     """Trending product summary
-    ✅ NEW: Added variant fingerprinting for cross-platform deduplication"""
+    ✅ NEW: Added variant fingerprinting for cross-platform deduplication
+    ✅ NEW: Added platform_count for cross-platform availability indicator"""
     model_config = ConfigDict(from_attributes=True)
     
     product_id: str  # ✅ UUID as string
@@ -317,6 +318,8 @@ class TrendingProductResponse(BaseModel):
     image_url: Optional[str]
     search_count: int
     rank: int
+    # ✅ NEW: Cross-platform availability (for home page badge)
+    platform_count: int = Field(1, description="How many platforms have this product")
 
 
 # ==================== PRICE HISTORY SCHEMAS ====================
