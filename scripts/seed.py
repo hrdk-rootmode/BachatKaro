@@ -893,6 +893,10 @@ async def main(args) -> None:
     print(f"   Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
+    if args.no_cross_match:
+        print("   ⚠️ Cross-platform matching is disabled for this run (--no-cross-match).")
+        print("   ⚠️ Run cross_platform_miner.py after seeding to recover platform links.")
+
     if args.quick:
         results = await seed_quick(
             enable_ai=not args.no_ai,

@@ -71,6 +71,78 @@ class FlipkartScraper(BasePlatformHandler):
         self.affiliate_id = config.affiliate_tag or getattr(settings, 'FLIPKART_AFFILIATE_ID', 'dealhunt')
         
         logger.info(f"✅ FlipkartScraper v2.0 initialized (AI Healing: {'Active' if self.healing_engine else 'Inactive'})")
+
+    def _to_decimal_price(self, raw: Any) -> Optional[Decimal]:
+        """Convert extracted price value to Decimal safely."""
+        if raw is None:
+            return None
+
+        if isinstance(raw, Decimal):
+            return raw if raw > 0 else None
+
+        if isinstance(raw, (int, float)):
+            try:
+                value = Decimal(str(raw))
+                return value if value > 0 else None
+            except Exception:
+                return None
+
+        cleaned = re.sub(r"[^\d.]", "", str(raw))
+        if not cleaned:
+            return None
+
+        try:
+            value = Decimal(cleaned)
+            return value if value > 0 else None
+        except Exception:
+            return None
+
+    def _normalize_price_snapshot(
+        self,
+        current_price: Optional[Decimal],
+        original_price: Optional[Decimal],
+        discount_hint: Optional[float] = None,
+    ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[float]]:
+        """
+        Ensure current_price is payable (discounted) and original_price is strike-through MRP.
+        """
+        current = self._to_decimal_price(current_price)
+        original = self._to_decimal_price(original_price)
+
+        if current is None:
+            return None, None, None
+
+        # If extraction swapped values, enforce lower value as payable current price.
+        if original is not None and original < current:
+            current, original = original, current
+
+        if original is not None and original <= current:
+            original = None
+
+        # Guard against parser outliers like 44 captured instead of 4499.
+        if original is not None and current > 0:
+            try:
+                ratio = float(original) / float(current)
+            except Exception:
+                ratio = 0.0
+            if ratio >= 8.0 and float(current) < 100.0 and float(original) >= 1000.0:
+                current = original
+                original = None
+
+        computed_discount = self._calculate_discount(current, original)
+        normalized_discount: Optional[float] = None
+
+        if computed_discount is not None:
+            normalized_discount = computed_discount
+        elif discount_hint is not None and original is not None and original > current:
+            try:
+                hint = float(discount_hint)
+                if 0 < hint < 95:
+                    normalized_discount = round(hint, 1)
+            except Exception:
+                normalized_discount = None
+
+        return current, original, normalized_discount
     
     @property
     def handler_type(self) -> HandlerType:
@@ -187,6 +259,48 @@ class FlipkartScraper(BasePlatformHandler):
         try:
             products_data = await page_obj.evaluate('''() => {
                 const products = [];
+
+                const parseAmount = (value) => {
+                    if (value === null || value === undefined) return null;
+                    const digits = String(value).replace(/[^\d]/g, '');
+                    if (!digits) return null;
+                    const amount = parseInt(digits, 10);
+                    return Number.isFinite(amount) && amount > 0 ? amount : null;
+                };
+
+                const collectPrices = (scope, selectors) => {
+                    const values = [];
+                    selectors.forEach((selector) => {
+                        scope.querySelectorAll(selector).forEach((el) => {
+                            const amount = parseAmount(el.textContent || el.innerText || '');
+                            if (amount) values.push(amount);
+                        });
+                    });
+                    return values;
+                };
+
+                const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = []) => {
+                    const uniquePrimary = Array
+                        .from(new Set((primaryCandidates || []).filter(Boolean)))
+                        .sort((a, b) => a - b);
+
+                    if (uniquePrimary.length > 0) {
+                        if (uniquePrimary.length >= 2 && uniquePrimary[0] <= uniquePrimary[uniquePrimary.length - 1] * 0.2) {
+                            return uniquePrimary[1];
+                        }
+                        return uniquePrimary[0];
+                    }
+
+                    const uniqueFallback = Array
+                        .from(new Set((fallbackCandidates || []).filter(Boolean)))
+                        .sort((a, b) => a - b);
+
+                    if (uniqueFallback.length === 0) return null;
+                    if (uniqueFallback.length >= 2 && uniqueFallback[0] <= uniqueFallback[uniqueFallback.length - 1] * 0.2) {
+                        return uniqueFallback[1];
+                    }
+                    return uniqueFallback[0];
+                };
                 
                 // Find all product links
                 const links = document.querySelectorAll('a[href*="/p/itm"], a[href*="/p/"]');
@@ -202,10 +316,63 @@ class FlipkartScraper(BasePlatformHandler):
                     if (!container) return;
                     
                     const text = container.innerText;
-                    
-                    // Price
-                    const priceMatch = text.match(/₹([0-9,]+)/);
-                    if (!priceMatch) return;
+
+                    const currentSelectors = [
+                        'div.Nx9bqj',
+                        'div._30jeq3',
+                        'div._16Jk6d',
+                        'span.Nx9bqj',
+                        'span._30jeq3',
+                        'div[class*="Nx9bqj"]',
+                        'div[class*="_30jeq3"]'
+                    ];
+
+                    const originalSelectors = [
+                        'div.yRaY8j',
+                        'div._3I9_wc',
+                        'div._2p6lqe',
+                        'span._3I9_wc',
+                        'div[class*="yRaY8j"]',
+                        'div[class*="_3I9_wc"]'
+                    ];
+
+                    const currentCandidates = collectPrices(container, currentSelectors);
+                    const originalCandidates = collectPrices(container, originalSelectors);
+
+                    const allPriceCandidates = Array
+                        .from(text.matchAll(/₹\s*([0-9,]+)(?!\s*\/?\s*month)/gi))
+                        .map((m) => parseAmount(m[1]))
+                        .filter(Boolean);
+
+                    let currentPrice = chooseCurrentCandidate(currentCandidates, allPriceCandidates);
+
+                    let originalPrice = originalCandidates.length > 0
+                        ? Math.max(...originalCandidates)
+                        : null;
+
+                    if (!originalPrice && allPriceCandidates.length >= 2 && currentPrice) {
+                        const aboveCurrent = allPriceCandidates.filter((v) => v > currentPrice);
+                        if (aboveCurrent.length > 0) {
+                            originalPrice = Math.max(...aboveCurrent);
+                        }
+                    }
+
+                    if (!currentPrice) return;
+
+                    if (originalPrice && originalPrice <= currentPrice) {
+                        const low = Math.min(currentPrice, originalPrice);
+                        const high = Math.max(currentPrice, originalPrice);
+                        currentPrice = low;
+                        originalPrice = high > low ? high : null;
+                    }
+
+                    if (currentPrice && originalPrice && originalPrice / currentPrice >= 8 && currentPrice < 100 && originalPrice >= 1000) {
+                        currentPrice = originalPrice;
+                        originalPrice = null;
+                    }
+
+                    const discountMatch = text.match(/(\d{1,2})\s*%\s*off/i);
+                    const discount = discountMatch ? parseInt(discountMatch[1], 10) : null;
                     
                     // Title - Filter out "Add to Compare" and junk
                     const lines = text.split('\\n').filter(l => {
@@ -227,13 +394,11 @@ class FlipkartScraper(BasePlatformHandler):
                     // Rating
                     const ratingMatch = text.match(/([0-5]\\.?\\d?)\\s*[★|\\|]/);
                     
-                    // Original price
-                    const originalMatch = text.match(/₹([0-9,]+).*₹([0-9,]+)/);
-                    
                     products.push({
                         title: title,
-                        price: priceMatch[1].replace(/,/g, ''),
-                        originalPrice: originalMatch ? originalMatch[1].replace(/,/g, '') : null,
+                        price: String(currentPrice),
+                        originalPrice: originalPrice ? String(originalPrice) : null,
+                        discount: discount,
                         url: href,
                         image: imgSrc,
                         rating: ratingMatch ? ratingMatch[1] : null
@@ -246,8 +411,17 @@ class FlipkartScraper(BasePlatformHandler):
             products = []
             for item in products_data:
                 try:
-                    price = Decimal(item.get('price', '0'))
-                    if not price or price <= 0:
+                    extracted_current = self._to_decimal_price(item.get('price'))
+                    extracted_original = self._to_decimal_price(item.get('originalPrice'))
+                    discount_hint = item.get('discount')
+
+                    current_price, original_price, discount = self._normalize_price_snapshot(
+                        current_price=extracted_current,
+                        original_price=extracted_original,
+                        discount_hint=discount_hint,
+                    )
+
+                    if not current_price:
                         continue
                     
                     url = item.get('url', '')
@@ -258,10 +432,6 @@ class FlipkartScraper(BasePlatformHandler):
                     if not product_id:
                         product_id = hashlib.md5(url.encode()).hexdigest()[:16]
                     
-                    original_price = None
-                    if item.get('originalPrice'):
-                        original_price = Decimal(item['originalPrice'])
-                    
                     rating = None
                     if item.get('rating'):
                         try:
@@ -269,12 +439,10 @@ class FlipkartScraper(BasePlatformHandler):
                         except:
                             pass
                     
-                    discount = self._calculate_discount(price, original_price)
-                    
                     products.append(ProductData(
                         external_id=product_id,
                         title=item.get('title', '')[:200],
-                        current_price=price,
+                        current_price=current_price,
                         original_price=original_price,
                         discount_percent=discount,
                         product_url=self.build_affiliate_url(url),
@@ -332,6 +500,10 @@ class FlipkartScraper(BasePlatformHandler):
                     return product
                 
                 return None
+
+        except RateLimitExceeded as e:
+            logger.warning(f"⏳ Flipkart product rate limited: retry_after={e.retry_after}s")
+            raise
         
         except Exception as e:
             logger.error(f"❌ Flipkart product error: {e}")
@@ -350,11 +522,195 @@ class FlipkartScraper(BasePlatformHandler):
                     title: null,
                     price: null,
                     originalPrice: null,
+                    discount: null,
                     image: null,
                     rating: null,
                     reviewCount: null,
                     brand: null,
                     inStock: true
+                };
+
+                const parseAmount = (value) => {
+                    if (value === null || value === undefined) return null;
+                    const digits = String(value).replace(/[^\d]/g, '');
+                    if (!digits) return null;
+                    const amount = parseInt(digits, 10);
+                    return Number.isFinite(amount) && amount > 0 ? amount : null;
+                };
+
+                const collectPrices = (selectors) => {
+                    const values = [];
+                    selectors.forEach((selector) => {
+                        document.querySelectorAll(selector).forEach((el) => {
+                            const amount = parseAmount(el.textContent || el.innerText || '');
+                            if (amount) values.push(amount);
+                        });
+                    });
+                    return values;
+                };
+
+                const collectText = (selectors) => {
+                    const chunks = [];
+                    selectors.forEach((selector) => {
+                        document.querySelectorAll(selector).forEach((el) => {
+                            const txt = (el.textContent || el.innerText || '').trim();
+                            if (txt) chunks.push(txt.toLowerCase());
+                        });
+                    });
+                    return chunks.join(' | ');
+                };
+
+                const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = []) => {
+                    const uniquePrimary = Array
+                        .from(new Set((primaryCandidates || []).filter(Boolean)))
+                        .sort((a, b) => a - b);
+
+                    if (uniquePrimary.length > 0) {
+                        if (uniquePrimary.length >= 2 && uniquePrimary[0] <= uniquePrimary[uniquePrimary.length - 1] * 0.2) {
+                            return uniquePrimary[1];
+                        }
+                        return uniquePrimary[0];
+                    }
+
+                    const uniqueFallback = Array
+                        .from(new Set((fallbackCandidates || []).filter(Boolean)))
+                        .sort((a, b) => a - b);
+
+                    if (uniqueFallback.length === 0) return null;
+                    if (uniqueFallback.length >= 2 && uniqueFallback[0] <= uniqueFallback[uniqueFallback.length - 1] * 0.2) {
+                        return uniqueFallback[1];
+                    }
+                    return uniqueFallback[0];
+                };
+
+                const extractFromJsonLd = () => {
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    let jsonCurrent = null;
+                    let jsonOriginal = null;
+                    let jsonAvailability = null;
+
+                    const parseOfferPrice = (offer) => {
+                        if (!offer || typeof offer !== 'object') return null;
+                        const direct = parseAmount(offer.price);
+                        if (direct) return direct;
+                        if (offer.priceSpecification && typeof offer.priceSpecification === 'object') {
+                            return parseAmount(offer.priceSpecification.price || offer.priceSpecification.minPrice);
+                        }
+                        return null;
+                    };
+
+                    scripts.forEach((script) => {
+                        const raw = script.textContent;
+                        if (!raw) return;
+                        try {
+                            const parsed = JSON.parse(raw);
+                            const nodes = Array.isArray(parsed)
+                                ? parsed
+                                : (Array.isArray(parsed['@graph']) ? parsed['@graph'] : [parsed]);
+
+                            nodes.forEach((node) => {
+                                if (!node || typeof node !== 'object') return;
+                                const typeVal = String(node['@type'] || '').toLowerCase();
+                                if (!typeVal.includes('product')) return;
+
+                                if (!result.title && node.name) {
+                                    result.title = String(node.name).trim();
+                                }
+
+                                const offersRaw = node.offers;
+                                const offers = Array.isArray(offersRaw) ? offersRaw : (offersRaw ? [offersRaw] : []);
+                                offers.forEach((offer) => {
+                                    const offerPrice = parseOfferPrice(offer);
+                                    if (offerPrice) {
+                                        jsonCurrent = jsonCurrent ? Math.min(jsonCurrent, offerPrice) : offerPrice;
+                                    }
+
+                                    const availability = String(offer?.availability || '').toLowerCase();
+                                    if (availability) {
+                                        if (availability.includes('instock')) {
+                                            jsonAvailability = true;
+                                        } else if (
+                                            jsonAvailability !== true && (
+                                                availability.includes('outofstock') ||
+                                                availability.includes('soldout') ||
+                                                availability.includes('discontinued')
+                                            )
+                                        ) {
+                                            jsonAvailability = false;
+                                        }
+                                    }
+
+                                    const originalHints = [
+                                        offer?.highPrice,
+                                        offer?.priceBeforeDiscount,
+                                        offer?.mrp,
+                                        offer?.priceSpecification?.maxPrice,
+                                    ];
+
+                                    originalHints.forEach((hint) => {
+                                        const parsedHint = parseAmount(hint);
+                                        if (parsedHint) {
+                                            jsonOriginal = jsonOriginal ? Math.max(jsonOriginal, parsedHint) : parsedHint;
+                                        }
+                                    });
+                                });
+                            });
+                        } catch {
+                            // Ignore malformed JSON-LD blocks.
+                        }
+                    });
+
+                    return { jsonCurrent, jsonOriginal, jsonAvailability };
+                };
+
+                const detectStockSignals = () => {
+                    const enabledButtonTexts = Array
+                        .from(document.querySelectorAll('button:not([disabled])'))
+                        .map((el) => (el.textContent || el.innerText || '').toLowerCase().trim())
+                        .filter(Boolean);
+
+                    const allButtonTexts = Array
+                        .from(document.querySelectorAll('button'))
+                        .map((el) => (el.textContent || el.innerText || '').toLowerCase().trim())
+                        .filter(Boolean);
+
+                    const ctaTextPool = [...enabledButtonTexts, ...allButtonTexts];
+                    const hasAddToCart = ctaTextPool.some((txt) => txt.includes('add to cart'));
+                    const hasBuyNow = ctaTextPool.some((txt) => txt.includes('buy now'));
+                    const hasCta = hasAddToCart || hasBuyNow;
+
+                    const availabilityText = collectText([
+                        'div._16FRp0',
+                        'div[class*="_16FRp0"]',
+                        'div._1o9grS',
+                        'div._2D5lwg',
+                        'span._2D5lwg',
+                        'div[class*="availability"]',
+                        'span[class*="availability"]',
+                    ]);
+
+                    const outKeywords = [
+                        'out of stock',
+                        'currently unavailable',
+                        'sold out',
+                        'not available',
+                        'unavailable',
+                    ];
+                    const inKeywords = [
+                        'in stock',
+                        'available',
+                    ];
+
+                    const explicitOut = outKeywords.some((kw) => availabilityText.includes(kw));
+                    const explicitIn = inKeywords.some((kw) => availabilityText.includes(kw)) && !explicitOut;
+                    const hasNotifyMe = ctaTextPool.some((txt) => txt.includes('notify me')) || availabilityText.includes('notify me');
+
+                    return {
+                        hasCta,
+                        hasNotifyMe,
+                        explicitOut,
+                        explicitIn,
+                    };
                 };
                 
                 // Title from page title
@@ -370,24 +726,67 @@ class FlipkartScraper(BasePlatformHandler):
                     if (h1) result.title = h1.textContent.trim();
                 }
                 
-                // Prices
+                const { jsonCurrent, jsonOriginal, jsonAvailability } = extractFromJsonLd();
+
+                const currentSelectors = [
+                    'div.Nx9bqj.CxhGGd',
+                    'div.Nx9bqj',
+                    'div._30jeq3._16Jk6d',
+                    'div._30jeq3',
+                    'span.Nx9bqj',
+                    'span._30jeq3',
+                    'div[class*="Nx9bqj"]',
+                    'div[class*="_30jeq3"]'
+                ];
+
+                const originalSelectors = [
+                    'div.yRaY8j',
+                    'div._3I9_wc',
+                    'div._2p6lqe',
+                    'span._3I9_wc',
+                    'div[class*="yRaY8j"]',
+                    'div[class*="_3I9_wc"]'
+                ];
+
+                const currentCandidates = collectPrices(currentSelectors);
+                const originalCandidates = collectPrices(originalSelectors);
+
                 const bodyText = document.body.innerText;
-                const priceMatches = bodyText.match(/₹([0-9,]+)/g);
-                if (priceMatches && priceMatches.length >= 1) {
-                    // First price is usually selling price
-                    result.price = priceMatches[0].replace(/[₹,]/g, '');
-                    
-                    // Second might be MRP
-                    if (priceMatches.length >= 2) {
-                        const secondPrice = priceMatches[1].replace(/[₹,]/g, '');
-                        if (parseInt(secondPrice) > parseInt(result.price)) {
-                            result.originalPrice = secondPrice;
-                        }
+                const allPriceCandidates = Array
+                    .from(bodyText.matchAll(/₹\s*([0-9,]+)(?!\s*\/?\s*month)/gi))
+                    .map((m) => parseAmount(m[1]))
+                    .filter(Boolean);
+
+                let resolvedCurrent = jsonCurrent || null;
+                if (!resolvedCurrent) {
+                    resolvedCurrent = chooseCurrentCandidate(currentCandidates, allPriceCandidates);
+                }
+                if (resolvedCurrent) {
+                    result.price = String(resolvedCurrent);
+                }
+
+                const originalPool = [];
+                if (jsonOriginal) originalPool.push(jsonOriginal);
+                originalPool.push(...originalCandidates);
+                if (allPriceCandidates.length > 0 && result.price) {
+                    const current = parseAmount(result.price);
+                    const highestSeen = Math.max(...allPriceCandidates);
+                    if (current && highestSeen > current) {
+                        originalPool.push(highestSeen);
                     }
+                }
+
+                if (originalPool.length > 0) {
+                    result.originalPrice = String(Math.max(...originalPool));
+                }
+
+                const discountMatch = bodyText.match(/(\d{1,2})\s*%\s*off/i);
+                if (discountMatch) {
+                    result.discount = discountMatch[1];
                 }
                 
                 // Image
-                const img = document.querySelector('img._396cs4, img._2r_T1I, img[loading="eager"]');
+                const img = document.querySelector('img._396cs4, img._2r_T1I, img[loading="eager"], img[src*="rukminim"], img[src*="flap"]');
                 if (img) result.image = img.src;
                 
                 // Rating
@@ -402,10 +801,33 @@ class FlipkartScraper(BasePlatformHandler):
                 const brandEl = document.querySelector('span._2WkVRV');
                 if (brandEl) result.brand = brandEl.textContent.trim();
                 
-                // Stock
-                if (bodyText.toLowerCase().includes('out of stock') || 
-                    bodyText.toLowerCase().includes('currently unavailable')) {
+                // Stock (signal-based to avoid false negatives from unrelated page text)
+                const stockSignals = detectStockSignals();
+                if (stockSignals.hasCta) {
+                    result.inStock = true;
+                } else if (stockSignals.hasNotifyMe || stockSignals.explicitOut) {
                     result.inStock = false;
+                } else if (jsonAvailability !== null) {
+                    result.inStock = Boolean(jsonAvailability);
+                } else if (stockSignals.explicitIn) {
+                    result.inStock = true;
+                } else {
+                    result.inStock = true;
+                }
+
+                if (result.price && result.originalPrice) {
+                    const p = parseAmount(result.price);
+                    const o = parseAmount(result.originalPrice);
+                    if (p && o && o <= p) {
+                        const low = Math.min(p, o);
+                        const high = Math.max(p, o);
+                        result.price = String(low);
+                        result.originalPrice = high > low ? String(high) : null;
+                    }
+                    if (p && o && o / p >= 8 && p < 100 && o >= 1000) {
+                        result.price = String(o);
+                        result.originalPrice = null;
+                    }
                 }
                 
                 return result;
@@ -421,10 +843,25 @@ class FlipkartScraper(BasePlatformHandler):
             
             if not product_data.get('title') or not product_data.get('price'):
                 return None
-            
-            current_price = Decimal(product_data['price'])
-            original_price = Decimal(product_data['originalPrice']) if product_data.get('originalPrice') else None
-            discount = self._calculate_discount(current_price, original_price)
+
+            extracted_current = self._to_decimal_price(product_data.get('price'))
+            extracted_original = self._to_decimal_price(product_data.get('originalPrice'))
+
+            discount_hint = None
+            if product_data.get('discount') is not None:
+                try:
+                    discount_hint = float(product_data.get('discount'))
+                except Exception:
+                    discount_hint = None
+
+            current_price, original_price, discount = self._normalize_price_snapshot(
+                current_price=extracted_current,
+                original_price=extracted_original,
+                discount_hint=discount_hint,
+            )
+
+            if not current_price:
+                return None
             
             rating = None
             if product_data.get('rating'):

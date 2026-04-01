@@ -81,11 +81,126 @@ class MeeshoScraper(BasePlatformHandler):
         '/search/',
         '/catalog/',
     ]
+    @staticmethod
+    def _normalize_image_url(url: Optional[str]) -> Optional[str]:
+        if not url or not isinstance(url, str):
+            return None
+
+        normalized = url.strip()
+        if not normalized:
+            return None
+
+        if normalized.startswith("//"):
+            return f"https:{normalized}"
+
+        if normalized.startswith("/"):
+            return f"https://images.meesho.com{normalized}"
+
+        return normalized
+
+    @classmethod
+    def _is_valid_product_image(url: Optional[str]) -> bool:
+        normalized = cls._normalize_image_url(url)
+        if not normalized:
+            return False
+
+        u = normalized.lower()
+        if not u:
+            return False
+
+        # Meesho frequently returns UI icon placeholders that are not product photos.
+        junk_tokens = [
+            "svgicons",
+            "wishlist.svg",
+            "/icons/",
+            "/icon/",
+            "placeholder",
+            "default-image",
+            "data:image/svg",
+        ]
+        if u.endswith(".svg") or any(token in u for token in junk_tokens):
+            return False
+
+        return u.startswith("http://") or u.startswith("https://")
+
+    def _collect_image_candidates(self, value: Any, candidates: List[str], depth: int = 0) -> None:
+        """Collect potential image URL strings from nested API payloads."""
+        if depth > 5 or value is None:
+            return
+
+        if isinstance(value, str):
+            text = value.strip()
+            if text and any(token in text.lower() for token in ["http", "//", "/images", "meesho"]):
+                candidates.append(text)
+            return
+
+        if isinstance(value, list):
+            for item in value:
+                self._collect_image_candidates(item, candidates, depth + 1)
+            return
+
+        if not isinstance(value, dict):
+            return
+
+        prioritized_keys = [
+            "images", "product_images", "image", "image_url", "imageUrl",
+            "product_image", "productImage", "thumbnail", "thumbnail_url",
+            "thumb", "large", "large_image", "medium", "medium_image",
+            "display_image", "share_image", "hero_image", "media", "gallery",
+        ]
+
+        for key in prioritized_keys:
+            if key in value:
+                self._collect_image_candidates(value.get(key), candidates, depth + 1)
+
+        for nested_value in value.values():
+            if isinstance(nested_value, (dict, list)):
+                self._collect_image_candidates(nested_value, candidates, depth + 1)
+
+    def _extract_best_image_url(self, payload: Any) -> Optional[str]:
+        """Return best valid product image URL found in payload."""
+        candidates: List[str] = []
+        self._collect_image_candidates(payload, candidates)
+
+        for candidate in candidates:
+            normalized = self._normalize_image_url(candidate)
+            if self._is_valid_product_image(normalized):
+                return normalized
+
+        return None
     
     # Keywords to filter out accessories
     ACCESSORY_KEYWORDS = [
         "cover", "case", "screen guard", "protector", "tempered glass",
         "charger", "cable", "holder", "stand", "skin", "pouch"
+    ]
+
+    NOISE_TITLE_KEYWORDS = [
+        "access denied",
+        "captcha",
+        "security check",
+        "blocked",
+        "loading",
+        "retry",
+        "try again",
+        "not available",
+        "sign in",
+        "log in",
+        "view all",
+        "shop now",
+        "add to cart",
+        "wishlist",
+    ]
+
+    GENERIC_BRANDS = {
+        "unknown", "generic", "unbranded", "seller", "supplier",
+        "women", "men", "girls", "boys", "kids", "fashion"
+    }
+
+    TITLE_COLOR_HINTS = [
+        "black", "white", "blue", "green", "red", "pink", "yellow",
+        "purple", "grey", "gray", "silver", "gold", "brown", "orange",
+        "maroon", "navy", "beige"
     ]
     
     def __init__(
@@ -110,6 +225,66 @@ class MeeshoScraper(BasePlatformHandler):
         if not title:
             return False
         return any(kw in title.lower() for kw in self.ACCESSORY_KEYWORDS)
+
+    def _is_low_quality_title(self, title: Optional[str]) -> bool:
+        """Reject navigation/status text masquerading as product titles."""
+        if not title:
+            return True
+
+        cleaned = re.sub(r"\s+", " ", str(title)).strip()
+        if len(cleaned) < 8:
+            return True
+
+        lowered = cleaned.lower()
+        if any(token in lowered for token in self.NOISE_TITLE_KEYWORDS):
+            return True
+
+        # Titles with almost no alphabetic characters are usually junk nodes.
+        alpha_chars = sum(1 for ch in cleaned if ch.isalpha())
+        return alpha_chars < 4
+
+    def _clean_brand(self, brand: Optional[str]) -> Optional[str]:
+        if not brand:
+            return None
+
+        normalized = re.sub(r"\s+", " ", str(brand)).strip()
+        if not normalized:
+            return None
+
+        if normalized.lower() in self.GENERIC_BRANDS:
+            return None
+
+        return normalized[:80]
+
+    def _extract_color_from_title(self, title: Optional[str]) -> Optional[str]:
+        if not title:
+            return None
+
+        lowered = title.lower()
+        for color in self.TITLE_COLOR_HINTS:
+            if re.search(rf"\b{re.escape(color)}\b", lowered):
+                return color
+
+        return None
+
+    def _is_valid_search_product(self, product: ProductData) -> bool:
+        """Validate search product candidate before returning to seed/search pipelines."""
+        if product is None:
+            return False
+
+        if self._is_low_quality_title(getattr(product, "title", None)):
+            return False
+
+        try:
+            if float(product.current_price) <= 0:
+                return False
+        except Exception:
+            return False
+
+        if not getattr(product, "product_url", None):
+            return False
+
+        return True
     
     async def _get_browser(self) -> BrowserManager:
         if self.browser_manager is None:
@@ -128,7 +303,12 @@ class MeeshoScraper(BasePlatformHandler):
                 "reference #",
                 "your request has been blocked",
                 "unusual traffic",
-                "captcha"
+                "captcha",
+                "verify you're human",
+                "security check",
+                "akamai",
+                "bot manager",
+                "pardon our interruption",
             ]
             
             combined = (content + body_text).lower()
@@ -248,8 +428,15 @@ class MeeshoScraper(BasePlatformHandler):
                     products = await self._extract_search_dom(page_obj)
                     extraction_method = ExtractionMethod.DOM_JAVASCRIPT
             
-            # Filter out accessories
-            products = [p for p in products if not self._is_accessory(p.title)]
+            # Filter low-quality results early so seed jobs do not treat junk cards as products.
+            raw_product_count = len(products)
+            products = [
+                p for p in products
+                if self._is_valid_search_product(p) and not self._is_accessory(p.title)
+            ]
+
+            if raw_product_count > 0 and not products:
+                logger.warning("⚠️ Meesho returned only low-quality/invalid candidates for this query")
             
             await self.rate_limiter.record_success("meesho")
             self.record_success()
@@ -355,8 +542,9 @@ class MeeshoScraper(BasePlatformHandler):
                 item.get('product_name') or 
                 item.get('title') or ''
             )
+            title = re.sub(r'\s+', ' ', str(title)).strip()
             
-            if not title or len(title) < 5:
+            if not title or len(title) < 5 or self._is_low_quality_title(title):
                 return None
             
             # Price
@@ -370,7 +558,12 @@ class MeeshoScraper(BasePlatformHandler):
             if isinstance(price, dict):
                 price = price.get('value') or price.get('amount') or 0
             
-            if not price or float(price) <= 0:
+            try:
+                numeric_price = float(price)
+            except (TypeError, ValueError):
+                return None
+
+            if not price or numeric_price <= 0:
                 return None
             
             # Original price
@@ -387,18 +580,10 @@ class MeeshoScraper(BasePlatformHandler):
                 discount = int(match.group(1)) if match else 0
             
             # Image
-            images = item.get('images') or item.get('product_images') or []
-            if isinstance(images, list) and images:
-                image_url = images[0].get('url') if isinstance(images[0], dict) else images[0]
-            else:
-                image_url = item.get('image') or item.get('image_url')
-            
-            # Fix image URL
-            if image_url and not image_url.startswith('http'):
-                image_url = f"https://images.meesho.com{image_url}"
+            image_url = self._extract_best_image_url(item)
 
             # Brand with confidence (often noisy on Meesho)
-            brand = item.get('brand') or item.get('supplier_name')
+            brand = self._clean_brand(item.get('brand') or item.get('supplier_name'))
             brand_confidence = 0.70 if brand else 0.0
             brand_source = "api" if brand else None
 
@@ -419,6 +604,12 @@ class MeeshoScraper(BasePlatformHandler):
                 if color:
                     color_confidence = 0.75
                     color_source = "api"
+
+            if not color:
+                color = self._extract_color_from_title(title)
+                if color:
+                    color_confidence = 0.35
+                    color_source = "title_heuristic"
             
             # Rating
             rating = item.get('rating') or item.get('average_rating')
@@ -530,12 +721,13 @@ class MeeshoScraper(BasePlatformHandler):
                     if (!title) return;
                     
                     const img = container.querySelector('img');
+                    const imgSrc = img ? (img.currentSrc || img.src || '') : '';
                     
                     products.push({
                         title: title,
                         price: priceMatch[1].replace(/,/g, ''),
                         url: href,
-                        image: img ? img.src : null
+                        image: imgSrc || null
                     });
                 });
                 
@@ -544,6 +736,9 @@ class MeeshoScraper(BasePlatformHandler):
             
             for item in products_data:
                 try:
+                    if self._is_low_quality_title(item.get('title')):
+                        continue
+
                     price = Decimal(item.get('price', '0'))
                     if not price or price <= 0:
                         continue
@@ -562,7 +757,7 @@ class MeeshoScraper(BasePlatformHandler):
                         current_price=price,
                         product_url=self.build_affiliate_url(url),
                         platform_name="meesho",
-                        image_url=item.get('image'),
+                        image_url=self._normalize_image_url(item.get('image')) if self._is_valid_product_image(item.get('image')) else None,
                         in_stock=True,
                         extraction_method=ExtractionMethod.DOM_JAVASCRIPT,
                         data_source=HandlerType.SCRAPER
@@ -594,7 +789,7 @@ class MeeshoScraper(BasePlatformHandler):
 
             title = healed.get("product_title")
             price = healed.get("product_price")
-            if not title or price is None:
+            if not title or price is None or self._is_low_quality_title(str(title)):
                 return None
 
             price_value = Decimal(str(price))
@@ -604,6 +799,9 @@ class MeeshoScraper(BasePlatformHandler):
             url = healed.get("product_url") or ""
             if url and not str(url).startswith("http"):
                 url = f"{self.BASE_URL}{url}" if str(url).startswith("/") else f"{self.BASE_URL}/{url}"
+
+            if not url:
+                return None
 
             product_id = self.extract_product_id(url) if url else None
             if not product_id:
@@ -623,8 +821,8 @@ class MeeshoScraper(BasePlatformHandler):
                 current_price=price_value,
                 product_url=self.build_affiliate_url(url) if url else "",
                 platform_name="meesho",
-                image_url=healed.get("product_image"),
-                brand=healed.get("brand"),
+                image_url=healed.get("product_image") if self._is_valid_product_image(healed.get("product_image")) else None,
+                brand=self._clean_brand(healed.get("brand")),
                 rating=float(rating) if rating is not None else None,
                 review_count=review_count,
                 category="Fashion",
@@ -678,7 +876,7 @@ class MeeshoScraper(BasePlatformHandler):
                 if await self._check_blocked(page_obj):
                     logger.warning("🚫 Meesho blocked product request")
                     await self.rate_limiter.record_failure("meesho", ThreatLevel.BLOCKED)
-                    return None
+                    raise RateLimitExceeded("meesho", retry_after=1800)
                 
                 await page_obj.wait_for_timeout(4000)
                 
@@ -719,8 +917,9 @@ class MeeshoScraper(BasePlatformHandler):
                 
                 return None
         
-        except RateLimitExceeded:
-            return None
+        except RateLimitExceeded as e:
+            logger.warning(f"⏳ Meesho product rate limited: retry_after={e.retry_after}s")
+            raise
         
         except Exception as e:
             logger.error(f"❌ Meesho product error: {e}")
@@ -807,12 +1006,26 @@ class MeeshoScraper(BasePlatformHandler):
                 if (priceMatches && priceMatches.length > 0) {
                     result.price = priceMatches[0].replace(/[₹,\\s]/g, '');
                 }
+
+                // Prefer explicit social preview image if available.
+                const ogImage = document.querySelector('meta[property="og:image"], meta[name="og:image"]');
+                if (ogImage && ogImage.content) {
+                    result.image = ogImage.content;
+                }
                 
                 // Image
-                const imgs = document.querySelectorAll('img[src*="meesho"], img[src*="images"]');
-                for (const img of imgs) {
-                    if (img.src && img.naturalWidth > 100) {
-                        result.image = img.src;
+                if (!result.image) {
+                    const imgs = document.querySelectorAll('img[src], img[data-src], img[data-srcset]');
+                    for (const img of imgs) {
+                        const src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
+                        if (!src) continue;
+                        if (src.includes('wishlist') || src.includes('svgicons') || src.includes('/icon/') || src.includes('/icons/')) continue;
+                        if (src.startsWith('data:image/svg')) continue;
+                        const width = img.naturalWidth || 0;
+                        if (width < 160) continue;
+                        if (!src.includes('meesho') && !src.includes('/images')) continue;
+
+                        result.image = img.currentSrc || img.src || img.getAttribute('data-src');
                         break;
                     }
                 }
@@ -825,22 +1038,27 @@ class MeeshoScraper(BasePlatformHandler):
             }''')
             
             if not product_data.get('title') or not product_data.get('price'):
+                missing_fields = []
+                if not product_data.get("title"):
+                    missing_fields.append("product_title")
+                if not product_data.get("price"):
+                    missing_fields.append("product_price")
+
                 healed = await self.auto_healing_extraction(
                     page_obj,
                     await page_obj.content(),
-                    fields=["product_title", "product_price", "product_image", "brand", "product_rating", "review_count"],
-                    test_timeout=4.0,
+                    fields=missing_fields,
+                    test_timeout=3.0,
                 )
                 if healed.get("product_title") and healed.get("product_price"):
                     used_ai_healing = True
                     product_data["title"] = healed.get("product_title")
                     product_data["price"] = str(healed.get("product_price"))
-                    product_data["image"] = healed.get("product_image") or product_data.get("image")
-                    product_data["rating"] = healed.get("product_rating") or product_data.get("rating")
-                    product_data["brand"] = healed.get("brand")
-                    product_data["reviewCount"] = healed.get("review_count")
                 else:
                     return None
+
+            if self._is_low_quality_title(product_data.get("title")):
+                return None
             
             if not product_id:
                 product_id = hashlib.md5(product_url.encode()).hexdigest()[:16]
@@ -851,8 +1069,8 @@ class MeeshoScraper(BasePlatformHandler):
                 current_price=Decimal(product_data['price']),
                 product_url=self.build_affiliate_url(product_url),
                 platform_name="meesho",
-                image_url=product_data.get('image'),
-                brand=product_data.get('brand'),
+                image_url=self._normalize_image_url(product_data.get('image')) if self._is_valid_product_image(product_data.get('image')) else None,
+                brand=self._clean_brand(product_data.get('brand')),
                 rating=float(product_data['rating']) if product_data.get('rating') else None,
                 review_count=int(str(product_data['reviewCount']).replace(',', '')) if product_data.get('reviewCount') else None,
                 in_stock=True,

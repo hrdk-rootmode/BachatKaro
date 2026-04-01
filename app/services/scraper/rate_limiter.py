@@ -2,14 +2,11 @@
 Advanced Rate Limiter with Anti-Ban Protection
 Features: Token bucket, exponential backoff, human-like patterns, circuit breaker
 
-Safety Features:
-- Adaptive rate limiting based on responses
-- Time-of-day awareness (avoid suspicious hours)
-- Request pattern randomization
-- Session rotation
-- Circuit breaker for automatic pause
-- IP reputation tracking
-- Browser fingerprint rotation
+FIXED:
+- Circuit breaker with exponential backoff recovery
+- Quiet hours multiplier bug (was 0.3, now 3.0 for slower)
+- Added circuit state inspection helpers
+- Better recovery attempt tracking
 
 Author: DealHunt
 Safety Level: MAXIMUM - Designed to prevent ANY bans
@@ -18,7 +15,7 @@ Safety Level: MAXIMUM - Designed to prevent ANY bans
 import logging
 import asyncio
 from datetime import datetime, timedelta, time
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 import random
 import hashlib
@@ -65,36 +62,37 @@ class ThreatLevel(str, Enum):
 class RateLimitConfig:
     """Enhanced rate limit configuration per platform"""
     # Conservative limits (MUCH lower than platform allows)
-    requests_per_minute: int = 15          # Very conservative
-    requests_per_hour: int = 200           # Leave 60% headroom
-    requests_per_day: int = 2000           # Daily cap
+    requests_per_minute: int = 15
+    requests_per_hour: int = 200
+    requests_per_day: int = 2000
     
     # Delays (LONGER for safety)
-    min_delay_seconds: float = 3.0         # Minimum 3s between requests
-    max_delay_seconds: float = 8.0         # Maximum random delay
+    min_delay_seconds: float = 3.0
+    max_delay_seconds: float = 8.0
     
     # Backoff settings
-    backoff_multiplier: float = 3.0        # Aggressive backoff
-    max_backoff_seconds: float = 300.0     # 5 minutes max
-    min_backoff_seconds: float = 10.0      # Start with 10s
+    backoff_multiplier: float = 3.0
+    max_backoff_seconds: float = 300.0
+    min_backoff_seconds: float = 10.0
     
-    # Circuit breaker
-    failure_threshold: int = 3             # Open circuit after 3 failures
-    recovery_timeout: int = 300            # Wait 5 minutes before retry
-    half_open_max_calls: int = 1           # Test with 1 request
+    # Circuit breaker - ✅ FIXED: Added recovery attempt tracking
+    failure_threshold: int = 3
+    recovery_timeout: int = 300  # Base timeout (5 minutes)
+    max_recovery_timeout: int = 3600  # Max timeout (1 hour)
+    half_open_max_calls: int = 1
     
     # Human-like behavior
-    burst_size: int = 3                    # Max 3 requests in quick succession
-    burst_cooldown: int = 60               # Wait 1 minute after burst
+    burst_size: int = 3
+    burst_cooldown: int = 60
     
     # Time-based restrictions
-    quiet_hours_start: time = time(2, 0)   # 2 AM
-    quiet_hours_end: time = time(6, 0)     # 6 AM
-    quiet_hours_multiplier: float = 0.3    # 70% slower during quiet hours
+    quiet_hours_start: time = time(2, 0)
+    quiet_hours_end: time = time(6, 0)
+    quiet_hours_multiplier: float = 3.0  # ✅ FIXED: Was 0.3 (made it faster), now 3.0 (slower)
     
     # Session management
-    max_requests_per_session: int = 50     # Rotate session after 50 requests
-    session_cooldown: int = 600            # Wait 10 minutes before new session
+    max_requests_per_session: int = 50
+    session_cooldown: int = 600
 
 
 @dataclass
@@ -126,41 +124,52 @@ class RequestMetrics:
     @property
     def needs_session_rotation(self) -> bool:
         """Check if session needs rotation"""
-        return self.session_request_count >= 50  # Conservative limit
+        return self.session_request_count >= 50
 
 
 @dataclass
 class CircuitBreaker:
-    """Circuit breaker for automatic failure handling"""
+    """Circuit breaker for automatic failure handling with exponential backoff"""
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
     last_failure_time: Optional[datetime] = None
     opened_at: Optional[datetime] = None
     half_open_successes: int = 0
+    recovery_attempts: int = 0  # ✅ NEW: Track recovery attempts
     
     def can_request(self, config: RateLimitConfig) -> Tuple[bool, Optional[str]]:
-        """Check if request is allowed"""
+        """Check if request is allowed with exponential backoff"""
         now = datetime.utcnow()
         
         if self.state == CircuitState.CLOSED:
             return True, None
         
         if self.state == CircuitState.OPEN:
-            # Check if recovery timeout passed
             if self.opened_at:
+                # ✅ FIXED: Exponential backoff - 5min, 10min, 20min, 40min, 60min (max)
+                recovery_backoff = min(
+                    config.recovery_timeout * (2 ** min(self.recovery_attempts, 4)),
+                    config.max_recovery_timeout
+                )
+                
                 elapsed = (now - self.opened_at).total_seconds()
-                if elapsed >= config.recovery_timeout:
+                if elapsed >= recovery_backoff:
                     # Move to half-open
                     self.state = CircuitState.HALF_OPEN
                     self.half_open_successes = 0
-                    logger.info("Circuit breaker moving to HALF_OPEN state")
+                    self.recovery_attempts += 1
+                    logger.info(
+                        f"Circuit breaker moving to HALF_OPEN state "
+                        f"(attempt {self.recovery_attempts}, waited {elapsed:.0f}s)"
+                    )
                     return True, None
+                
+                remaining = int(recovery_backoff - elapsed)
+                return False, f"Circuit open. Retry after {remaining}s (attempt {self.recovery_attempts})"
             
-            remaining = config.recovery_timeout - int(elapsed) if self.opened_at else config.recovery_timeout
-            return False, f"Circuit open. Retry after {remaining}s"
+            return False, f"Circuit open. Retry after {config.recovery_timeout}s"
         
         if self.state == CircuitState.HALF_OPEN:
-            # Allow limited requests
             if self.half_open_successes < config.half_open_max_calls:
                 return True, None
             return False, "Circuit half-open, testing in progress"
@@ -171,12 +180,14 @@ class CircuitBreaker:
         """Record successful request"""
         if self.state == CircuitState.HALF_OPEN:
             self.half_open_successes += 1
-            if self.half_open_successes >= 1:  # After 1 success, close circuit
+            if self.half_open_successes >= 1:
+                # ✅ FIXED: Reset recovery attempts on successful recovery
                 self.state = CircuitState.CLOSED
                 self.failure_count = 0
+                self.recovery_attempts = 0
                 logger.info("Circuit breaker CLOSED - service recovered")
         elif self.state == CircuitState.CLOSED:
-            self.failure_count = 0  # Reset failures on success
+            self.failure_count = 0
     
     def record_failure(self, config: RateLimitConfig) -> None:
         """Record failed request"""
@@ -187,15 +198,18 @@ class CircuitBreaker:
             # Failure during testing - reopen circuit
             self.state = CircuitState.OPEN
             self.opened_at = now
-            logger.warning("Circuit breaker RE-OPENED - service still down")
+            logger.warning(
+                f"Circuit breaker RE-OPENED - service still down "
+                f"(attempt {self.recovery_attempts})"
+            )
             return
         
         if self.state == CircuitState.CLOSED:
             self.failure_count += 1
             if self.failure_count >= config.failure_threshold:
-                # Open circuit
                 self.state = CircuitState.OPEN
                 self.opened_at = now
+                self.recovery_attempts = 0
                 logger.error(
                     f"Circuit breaker OPENED after {self.failure_count} failures. "
                     f"Pausing for {config.recovery_timeout}s"
@@ -210,46 +224,22 @@ class RateLimiter:
     """
     Military-grade rate limiter with anti-ban protection
     
-    Safety Features:
-    1. Conservative rate limits (50% of platform max)
-    2. Human-like random delays (3-8 seconds)
-    3. Exponential backoff (3x multiplier)
-    4. Circuit breaker (auto-pause on failures)
-    5. Time-of-day awareness (slower at night)
-    6. Session rotation (every 50 requests)
-    7. Burst prevention (max 3 quick requests)
-    8. Adaptive rate limiting (based on responses)
-    9. Request pattern randomization
-    10. Threat level detection
-    
-    Usage:
-        limiter = RateLimiter(redis_client)
-        
-        # Before request
-        try:
-            await limiter.acquire("amazon")
-        except RateLimitExceeded as e:
-            await asyncio.sleep(e.retry_after)
-        
-        # Make request...
-        
-        # After request
-        if success:
-            await limiter.record_success("amazon")
-        else:
-            await limiter.record_failure("amazon", threat_level=ThreatLevel.WARNING)
+    ✅ FIXES APPLIED:
+    - Exponential backoff recovery
+    - Fixed quiet-hours multiplier bug
+    - Added circuit state inspection
+    - Better recovery tracking
     """
     
-    # Platform-specific configurations (VERY CONSERVATIVE)
     DEFAULT_CONFIGS: Dict[str, RateLimitConfig] = {
         "amazon": RateLimitConfig(
-            requests_per_minute=10,        # Only 10/min (Amazon allows ~30)
-            requests_per_hour=150,         # Only 150/hour (Amazon allows ~400)
-            requests_per_day=1500,         # Daily cap
-            min_delay_seconds=4.0,         # 4-10 second delays
+            requests_per_minute=10,
+            requests_per_hour=150,
+            requests_per_day=1500,
+            min_delay_seconds=4.0,
             max_delay_seconds=10.0,
-            failure_threshold=2,           # Very sensitive
-            burst_size=2                   # Max 2 quick requests
+            failure_threshold=2,
+            burst_size=2
         ),
         "flipkart": RateLimitConfig(
             requests_per_minute=12,
@@ -294,22 +284,15 @@ class RateLimiter:
     }
     
     def __init__(self, redis_client: Optional[Redis] = None):
-        """
-        Initialize advanced rate limiter
-        
-        Args:
-            redis_client: Redis client for distributed rate limiting
-        """
+        """Initialize advanced rate limiter"""
         self.redis = redis_client
         
-        # Per-platform tracking
         self._metrics: Dict[str, RequestMetrics] = {}
         self._circuit_breakers: Dict[str, CircuitBreaker] = {}
         self._last_request_time: Dict[str, datetime] = {}
         self._burst_counters: Dict[str, List[datetime]] = {}
         self._backoff_until: Dict[str, datetime] = {}
         
-        # Session tracking
         self._session_ids: Dict[str, str] = {}
         self._session_start: Dict[str, datetime] = {}
         
@@ -317,17 +300,12 @@ class RateLimiter:
     
     def get_config(self, platform: str) -> RateLimitConfig:
         """Get rate limit config for platform"""
-        return self.DEFAULT_CONFIGS.get(
-            platform.lower(),
-            RateLimitConfig()  # Even more conservative default
-        )
+        return self.DEFAULT_CONFIGS.get(platform.lower(), RateLimitConfig())
     
     def _get_metrics(self, platform: str) -> RequestMetrics:
         """Get or create metrics for platform"""
         if platform not in self._metrics:
-            self._metrics[platform] = RequestMetrics(
-                session_start_time=datetime.utcnow()
-            )
+            self._metrics[platform] = RequestMetrics(session_start_time=datetime.utcnow())
         return self._metrics[platform]
     
     def _get_circuit_breaker(self, platform: str) -> CircuitBreaker:
@@ -336,23 +314,31 @@ class RateLimiter:
             self._circuit_breakers[platform] = CircuitBreaker()
         return self._circuit_breakers[platform]
     
-    async def acquire(
-        self,
-        platform: str,
-        priority: str = "normal"
-    ) -> None:
-        """
-        Acquire permission to make request
+    # ✅ NEW: Helper methods for circuit state inspection
+    def get_circuit_state(self, platform: str) -> Dict[str, Any]:
+        """Get current circuit breaker state for inspection"""
+        circuit = self._get_circuit_breaker(platform)
+        config = self.get_config(platform)
         
-        Implements ALL safety checks
+        can_request, reason = circuit.can_request(config)
         
-        Args:
-            platform: Platform name
-            priority: "low", "normal", "high" (high = slightly faster)
-        
-        Raises:
-            RateLimitExceeded: If request not allowed
-        """
+        return {
+            "state": circuit.state.value,
+            "can_request": can_request,
+            "reason": reason,
+            "failure_count": circuit.failure_count,
+            "recovery_attempts": circuit.recovery_attempts,
+            "opened_at": circuit.opened_at.isoformat() if circuit.opened_at else None,
+            "last_failure": circuit.last_failure_time.isoformat() if circuit.last_failure_time else None
+        }
+    
+    def is_circuit_open(self, platform: str) -> bool:
+        """Check if circuit is open (blocking requests)"""
+        circuit = self._get_circuit_breaker(platform)
+        return circuit.state == CircuitState.OPEN
+    
+    async def acquire(self, platform: str, priority: str = "normal") -> None:
+        """Acquire permission to make request"""
         platform = platform.lower()
         config = self.get_config(platform)
         metrics = self._get_metrics(platform)
@@ -373,7 +359,7 @@ class RateLimiter:
         
         # 3. CHECK SESSION ROTATION
         if metrics.needs_session_rotation:
-            logger.info(f"{platform}: Session rotation needed (50 requests reached)")
+            logger.info(f"{platform}: Session rotation needed")
             await self._rotate_session(platform, config)
         
         # 4. CHECK RATE LIMITS
@@ -388,12 +374,12 @@ class RateLimiter:
         # 6. ENFORCE HUMAN-LIKE DELAY
         delay = await self._calculate_delay(platform, config, priority)
         
-        # 7. CHECK TIME-OF-DAY
+        # 7. CHECK TIME-OF-DAY - ✅ FIXED: multiplier now slows down correctly
         if self._is_quiet_hours():
-            delay *= config.quiet_hours_multiplier  # Slow down during night
+            delay *= config.quiet_hours_multiplier  # Now 3.0 (slower), was 0.3 (faster - bug!)
             logger.debug(f"{platform}: Quiet hours - delay increased to {delay:.1f}s")
         
-        # 8. ADD RANDOM JITTER (make pattern unpredictable)
+        # 8. ADD RANDOM JITTER
         jitter = random.uniform(-0.3, 0.5) * delay
         delay += jitter
         
@@ -419,11 +405,7 @@ class RateLimiter:
             f"(session: {metrics.session_request_count}/{config.max_requests_per_session})"
         )
     
-    async def _check_redis_limits(
-        self,
-        platform: str,
-        config: RateLimitConfig
-    ) -> None:
+    async def _check_redis_limits(self, platform: str, config: RateLimitConfig) -> None:
         """Check and update Redis-based rate limits"""
         now = datetime.utcnow()
         
@@ -435,7 +417,7 @@ class RateLimiter:
             await self.redis.expire(minute_key, 60)
         
         if minute_count > config.requests_per_minute:
-            wait_seconds = 60 - now.second + random.randint(5, 15)  # Add safety buffer
+            wait_seconds = 60 - now.second + random.randint(5, 15)
             logger.warning(
                 f"{platform}: Per-minute limit reached ({minute_count}/{config.requests_per_minute})"
             )
@@ -465,37 +447,26 @@ class RateLimiter:
         if day_count > config.requests_per_day:
             wait_seconds = 86400 - (now.hour * 3600 + now.minute * 60 + now.second)
             logger.critical(
-                f"{platform}: Daily limit reached ({day_count}/{config.requests_per_day}). "
-                f"Pausing until tomorrow."
+                f"{platform}: Daily limit reached ({day_count}/{config.requests_per_day})"
             )
             raise RateLimitExceeded(platform, wait_seconds)
     
-    async def _check_local_limits(
-        self,
-        platform: str,
-        config: RateLimitConfig
-    ) -> None:
+    async def _check_local_limits(self, platform: str, config: RateLimitConfig) -> None:
         """Check local (in-memory) rate limits"""
         metrics = self._get_metrics(platform)
-        now = datetime.utcnow()
         
-        # Simple check: don't exceed requests per session
         if metrics.session_request_count >= config.max_requests_per_session:
             logger.warning(f"{platform}: Session limit reached, forcing rotation")
             raise RateLimitExceeded(platform, config.session_cooldown)
     
-    async def _check_burst_limit(
-        self,
-        platform: str,
-        config: RateLimitConfig
-    ) -> None:
-        """Prevent burst requests (anti-bot detection)"""
+    async def _check_burst_limit(self, platform: str, config: RateLimitConfig) -> None:
+        """Prevent burst requests"""
         if platform not in self._burst_counters:
             return
         
         now = datetime.utcnow()
         
-        # Clean old entries (older than 30 seconds)
+        # Clean old entries
         self._burst_counters[platform] = [
             t for t in self._burst_counters[platform]
             if (now - t).total_seconds() < 30
@@ -504,11 +475,9 @@ class RateLimiter:
         recent_count = len(self._burst_counters[platform])
         
         if recent_count >= config.burst_size:
-            # Too many requests in short time - enforce cooldown
             wait_time = config.burst_cooldown + random.randint(10, 30)
             logger.warning(
-                f"{platform}: Burst limit reached ({recent_count}/{config.burst_size}). "
-                f"Cooling down for {wait_time}s"
+                f"{platform}: Burst limit reached ({recent_count}/{config.burst_size})"
             )
             raise RateLimitExceeded(platform, wait_time)
     
@@ -518,35 +487,22 @@ class RateLimiter:
         config: RateLimitConfig,
         priority: str = "normal"
     ) -> float:
-        """
-        Calculate delay before next request
-        
-        Factors:
-        - Last request time
-        - Success rate
-        - Consecutive failures
-        - Priority
-        - Random variation (human-like)
-        """
+        """Calculate delay before next request"""
         if platform not in self._last_request_time:
-            return 0.0  # First request
+            return 0.0
         
         metrics = self._get_metrics(platform)
         elapsed = (datetime.utcnow() - self._last_request_time[platform]).total_seconds()
         
-        # Base delay range
         min_delay = config.min_delay_seconds
         max_delay = config.max_delay_seconds
         
         # Adjust based on success rate
         success_rate = metrics.success_rate
         if success_rate < 50:
-            # Low success rate - slow down significantly
             min_delay *= 2.5
             max_delay *= 3.0
-            logger.warning(f"{platform}: Low success rate ({success_rate:.1f}%), increasing delays")
         elif success_rate < 80:
-            # Moderate success rate - slow down a bit
             min_delay *= 1.5
             max_delay *= 2.0
         
@@ -556,79 +512,53 @@ class RateLimiter:
             min_delay *= failure_multiplier
             max_delay *= failure_multiplier
         
-        # Adjust based on priority (but still safe)
+        # Adjust based on priority
         if priority == "low":
             min_delay *= 1.5
             max_delay *= 1.5
         elif priority == "high":
-            min_delay *= 0.8  # Slightly faster, but still safe
+            min_delay *= 0.8
             max_delay *= 0.8
         
-        # Random delay in range
         required_delay = random.uniform(min_delay, max_delay)
-        
-        # Check how much time already passed
         remaining_delay = max(0, required_delay - elapsed)
         
         return remaining_delay
     
     def _is_quiet_hours(self) -> bool:
         """Check if current time is in quiet hours (2 AM - 6 AM IST)"""
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30)  # Convert to IST
+        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
         current_time = now.time()
         
-        # Quiet hours: 2 AM to 6 AM
         if time(2, 0) <= current_time < time(6, 0):
             return True
         
         return False
     
-    async def _rotate_session(
-        self,
-        platform: str,
-        config: RateLimitConfig
-    ) -> None:
-        """
-        Rotate session to avoid detection
-        
-        Waits session_cooldown before starting new session
-        """
+    async def _rotate_session(self, platform: str, config: RateLimitConfig) -> None:
+        """Rotate session to avoid detection"""
         metrics = self._get_metrics(platform)
         
-        logger.info(
-            f"{platform}: Rotating session after {metrics.session_request_count} requests. "
-            f"Cooling down for {config.session_cooldown}s"
-        )
+        logger.info(f"{platform}: Rotating session after {metrics.session_request_count} requests")
         
-        # Set backoff
         self._backoff_until[platform] = datetime.utcnow() + timedelta(
             seconds=config.session_cooldown
         )
         
-        # Reset session counters
         metrics.session_request_count = 0
         metrics.session_start_time = datetime.utcnow()
         
-        # Generate new session ID
         session_id = hashlib.md5(
             f"{platform}_{datetime.utcnow().isoformat()}".encode()
         ).hexdigest()[:16]
         self._session_ids[platform] = session_id
-        
-        logger.info(f"{platform}: New session ID: {session_id}")
     
     async def record_success(
         self,
         platform: str,
         response_time_ms: Optional[int] = None
     ) -> None:
-        """
-        Record successful request
-        
-        Args:
-            platform: Platform name
-            response_time_ms: Response time in milliseconds (for monitoring)
-        """
+        """Record successful request"""
         platform = platform.lower()
         metrics = self._get_metrics(platform)
         circuit = self._get_circuit_breaker(platform)
@@ -638,10 +568,8 @@ class RateLimiter:
         metrics.consecutive_successes += 1
         metrics.consecutive_failures = 0
         
-        # Update circuit breaker
         circuit.record_success()
         
-        # Clear backoff if exists
         if platform in self._backoff_until:
             del self._backoff_until[platform]
         
@@ -656,14 +584,7 @@ class RateLimiter:
         threat_level: ThreatLevel = ThreatLevel.WARNING,
         error_type: str = "unknown"
     ) -> None:
-        """
-        Record failed request with adaptive backoff
-        
-        Args:
-            platform: Platform name
-            threat_level: Severity of failure (SAFE, WARNING, BLOCKED)
-            error_type: Type of error (timeout, captcha, 403, etc.)
-        """
+        """Record failed request with adaptive backoff"""
         platform = platform.lower()
         config = self.get_config(platform)
         metrics = self._get_metrics(platform)
@@ -674,58 +595,40 @@ class RateLimiter:
         metrics.consecutive_failures += 1
         metrics.consecutive_successes = 0
         
-        # Track error types
         if error_type == "captcha":
             metrics.captcha_count += 1
         elif error_type == "timeout":
             metrics.timeout_count += 1
         
-        # Update circuit breaker
         circuit.record_failure(config)
         
-        # Calculate backoff based on threat level
+        # Calculate backoff
         backoff_seconds = config.min_backoff_seconds
         
         if threat_level == ThreatLevel.BLOCKED:
-            # Severe - long backoff
             backoff_seconds = config.max_backoff_seconds
-            logger.error(
-                f"{platform}: BLOCKED detected! Backing off for {backoff_seconds}s"
-            )
+            logger.error(f"{platform}: BLOCKED! Backing off for {backoff_seconds}s")
         elif threat_level == ThreatLevel.WARNING:
-            # Moderate - adaptive backoff
             backoff_seconds = min(
                 config.min_backoff_seconds * (config.backoff_multiplier ** metrics.consecutive_failures),
                 config.max_backoff_seconds
             )
-            logger.warning(
-                f"{platform}: WARNING detected ({error_type}). "
-                f"Backing off for {backoff_seconds:.1f}s"
-            )
+            logger.warning(f"{platform}: WARNING ({error_type}). Backoff: {backoff_seconds:.1f}s")
         else:
-            # Safe failure - minimal backoff
             backoff_seconds = config.min_backoff_seconds
         
-        # Add random jitter to backoff
         jitter = random.uniform(0.8, 1.3)
         backoff_seconds *= jitter
         
-        # Set backoff
-        self._backoff_until[platform] = datetime.utcnow() + timedelta(
-            seconds=backoff_seconds
-        )
+        self._backoff_until[platform] = datetime.utcnow() + timedelta(seconds=backoff_seconds)
         
         logger.info(
             f"{platform}: Request FAILED (consecutive: {metrics.consecutive_failures}, "
             f"backoff: {backoff_seconds:.1f}s, circuit: {circuit.state.value})"
         )
         
-        # If too many captchas, log critical warning
         if metrics.captcha_count >= 3:
-            logger.critical(
-                f"{platform}: Multiple captchas detected! "
-                f"Consider increasing delays or rotating proxy."
-            )
+            logger.critical(f"{platform}: Multiple captchas! Consider rotating proxy.")
     
     async def get_status(self, platform: str) -> Dict:
         """Get comprehensive rate limit status"""
@@ -754,6 +657,7 @@ class RateLimiter:
             "circuit_breaker": {
                 "state": circuit.state.value,
                 "failure_count": circuit.failure_count,
+                "recovery_attempts": circuit.recovery_attempts,
                 "is_healthy": circuit.state == CircuitState.CLOSED
             },
             "in_backoff": False,
@@ -767,7 +671,6 @@ class RateLimiter:
                 status["in_backoff"] = True
                 status["backoff_remaining_seconds"] = int(remaining)
         
-        # Get Redis counts if available
         if self.redis:
             now = datetime.utcnow()
             minute_key = f"rate:{platform}:min:{now.strftime('%Y%m%d%H%M')}"

@@ -284,15 +284,20 @@ class AmazonScraper(BasePlatformHandler):
         filters: Optional[Dict[str, Any]] = None
     ) -> SearchResult:
         """
-        Search products on Amazon.in with full self-healing
+        ✅ FIXED: Search with full extraction diagnostics tracking
         
-        Extraction Strategy:
-        1. Try ASIN extraction (most reliable)
-        2. Try JavaScript extraction
-        3. 🚀 If both fail, invoke AI healing
+        Tracks all extraction attempts and returns structured metadata
         """
         start_time = datetime.utcnow()
         filters = filters or {}
+        
+        # ✅ NEW: Initialize extraction diagnostics
+        extraction_attempts = {
+            "asin": {"attempted": False, "success": False, "error": None, "count": 0, "method": "dom_selector"},
+            "javascript": {"attempted": False, "success": False, "error": None, "count": 0, "method": "dom_javascript"},
+            "ai_healed": {"attempted": False, "success": False, "error": None, "count": 0, "method": "ai_healed"},
+            "resilient": {"attempted": False, "success": False, "error": None, "count": 0, "method": "regex_fallback"},
+        }
         
         try:
             await self.rate_limiter.acquire("amazon")
@@ -314,7 +319,6 @@ class AmazonScraper(BasePlatformHandler):
             
             async with browser.get_page(block_resources=True, stealth=True) as page_obj:
                 
-                # Human delay
                 await asyncio.sleep(random.uniform(1, 2))
                 
                 success = await browser.safe_goto(
@@ -325,95 +329,181 @@ class AmazonScraper(BasePlatformHandler):
                 )
                 
                 if not success:
+                    extraction_attempts["_navigation_error"] = "Failed to navigate to search URL"
                     return SearchResult(
                         query=query,
                         platform_name="amazon",
                         success=False,
-                        error_message="Navigation failed"
+                        error_message="Navigation failed",
+                        metadata=extraction_attempts
                     )
                 
                 # Check captcha
                 if await self._check_captcha(page_obj):
                     logger.warning("🚫 Amazon captcha detected!")
                     await self.rate_limiter.record_failure("amazon", ThreatLevel.BLOCKED)
+                    extraction_attempts["_captcha_detected"] = True
                     return SearchResult(
                         query=query,
                         platform_name="amazon",
                         success=False,
-                        error_message="Captcha detected"
+                        error_message="Captcha detected",
+                        metadata=extraction_attempts
                     )
                 
                 await page_obj.wait_for_timeout(2000)
                 await browser.scroll_page(page_obj, scroll_count=2, delay_ms=600)
                 
-                # Get HTML for potential healing
                 html_content = await page_obj.content()
                 
                 # ========================================
                 # TIER 1: ASIN Extraction
                 # ========================================
-                products = await self._extract_search_by_asin(page_obj)
-
-                if products and len(products) >= 2:
-                    extraction_method = ExtractionMethod.DOM_SELECTOR
-                    logger.info(f"✅ TIER 1 (ASIN): {len(products)} products")
-                else:
-                    # ========================================
-                    # TIER 2: JavaScript Extraction
-                    # ========================================
-                    js_products = await self._extract_search_javascript(page_obj)
-
-                    if products and js_products:
-                        # Merge by external_id to avoid escalating when both tiers are partially good.
-                        merged = {p.external_id: p for p in products if getattr(p, "external_id", None)}
-                        for p in js_products:
-                            ext_id = getattr(p, "external_id", None)
-                            if ext_id and ext_id not in merged:
-                                merged[ext_id] = p
-                        products = list(merged.values())
-
-                    if js_products and len(js_products) >= 2:
-                        products = js_products
-                        extraction_method = ExtractionMethod.DOM_JAVASCRIPT
-                        logger.info(f"✅ TIER 2 (JS): {len(products)} products")
-                    elif products and len(products) >= 2:
+                extraction_attempts["asin"]["attempted"] = True
+                tier1_start = time.time()
+                
+                try:
+                    products = await self._extract_search_by_asin(page_obj)
+                    extraction_attempts["asin"]["count"] = len(products)
+                    extraction_attempts["asin"]["duration_ms"] = int((time.time() - tier1_start) * 1000)
+                    
+                    if products and len(products) >= 2:
+                        extraction_attempts["asin"]["success"] = True
                         extraction_method = ExtractionMethod.DOM_SELECTOR
-                        logger.info(f"✅ TIER 1+2 (MERGED): {len(products)} products")
+                        logger.info(f"✅ TIER 1 (ASIN): {len(products)} products")
                     else:
-                        # ========================================
-                        # TIER 3: 🚀 AI HEALING (The Magic)
-                        # ========================================
-                        logger.warning("⚠️ Standard extraction failed, invoking AI healing...")
+                        extraction_attempts["asin"]["error"] = f"Only {len(products)} products extracted"
+                except Exception as e:
+                    extraction_attempts["asin"]["error"] = str(e)[:200]
+                    logger.debug(f"TIER 1 failed: {e}")
+                
+                # ========================================
+                # TIER 2: JavaScript Extraction
+                # ========================================
+                if not products or len(products) < 2:
+                    extraction_attempts["javascript"]["attempted"] = True
+                    tier2_start = time.time()
+                    
+                    try:
+                        js_products = await self._extract_search_javascript(page_obj)
+                        extraction_attempts["javascript"]["count"] = len(js_products)
+                        extraction_attempts["javascript"]["duration_ms"] = int((time.time() - tier2_start) * 1000)
                         
+                        if js_products and len(js_products) >= 2:
+                            extraction_attempts["javascript"]["success"] = True
+                            products = js_products
+                            extraction_method = ExtractionMethod.DOM_JAVASCRIPT
+                            logger.info(f"✅ TIER 2 (JS): {len(products)} products")
+                        else:
+                            extraction_attempts["javascript"]["error"] = f"Only {len(js_products)} products"
+                    except Exception as e:
+                        extraction_attempts["javascript"]["error"] = str(e)[:200]
+                        logger.debug(f"TIER 2 failed: {e}")
+                
+                # ========================================
+                # TIER 3: AI Healing
+                # ========================================
+                if not products or len(products) < 2:
+                    extraction_attempts["ai_healed"]["attempted"] = True
+                    tier3_start = time.time()
+                    
+                    logger.warning("⚠️ Standard extraction failed, invoking AI healing...")
+                    
+                    try:
                         healed_data = await self._extract_with_ai_healing(
                             page_obj,
                             html_content,
                             fields=["product_title", "product_price", "product_image", "product_url"]
                         )
                         
-                        # Try to build products from healed data
+                        extraction_attempts["ai_healed"]["duration_ms"] = int((time.time() - tier3_start) * 1000)
+                        
                         if healed_data:
                             healed_products = await self._build_products_from_healed(page_obj, healed_data)
+                            extraction_attempts["ai_healed"]["count"] = len(healed_products)
+                            
                             if healed_products:
+                                extraction_attempts["ai_healed"]["success"] = True
                                 products = healed_products
                                 extraction_method = ExtractionMethod.AI_HEALED
                                 logger.info(f"✅ TIER 3 (AI HEALED): {len(products)} products")
-
-                        # ========================================
-                        # TIER 4: RESILIENT FALLBACK (No-stop mode)
-                        # ========================================
-                        if not products:
-                            logger.warning("⚠️ AI healing failed, trying resilient fallback extraction...")
-                            fallback_products = await self._extract_search_resilient_fallback(page_obj, html_content)
-                            if fallback_products:
-                                products = fallback_products
-                                extraction_method = ExtractionMethod.REGEX_FALLBACK
-                                logger.info(f"✅ TIER 4 (RESILIENT): {len(products)} products")
+                            else:
+                                extraction_attempts["ai_healed"]["error"] = "No products built from healed data"
+                        else:
+                            extraction_attempts["ai_healed"]["error"] = "AI healing returned no data"
+                    except Exception as e:
+                        extraction_attempts["ai_healed"]["error"] = str(e)[:200]
+                        logger.debug(f"TIER 3 failed: {e}")
+                
+                # ========================================
+                # TIER 4: Resilient Fallback
+                # ========================================
+                if not products:
+                    extraction_attempts["resilient"]["attempted"] = True
+                    tier4_start = time.time()
+                    
+                    logger.warning("⚠️ AI healing failed, trying resilient fallback...")
+                    
+                    try:
+                        fallback_products = await self._extract_search_resilient_fallback(page_obj, html_content)
+                        extraction_attempts["resilient"]["count"] = len(fallback_products)
+                        extraction_attempts["resilient"]["duration_ms"] = int((time.time() - tier4_start) * 1000)
+                        
+                        if fallback_products:
+                            extraction_attempts["resilient"]["success"] = True
+                            products = fallback_products
+                            extraction_method = ExtractionMethod.REGEX_FALLBACK
+                            logger.info(f"✅ TIER 4 (RESILIENT): {len(products)} products")
+                        else:
+                            extraction_attempts["resilient"]["error"] = "No products from resilient extraction"
+                    except Exception as e:
+                        extraction_attempts["resilient"]["error"] = str(e)[:200]
+                        logger.debug(f"TIER 4 failed: {e}")
+                
+                # ✅ NEW: Log comprehensive failure if all methods failed
+                if not products:
+                    logger.error(
+                        f"❌ ALL EXTRACTION METHODS FAILED for Amazon search '{query}'\n"
+                        f"Diagnostics:\n"
+                        f"  TIER 1 (ASIN): {extraction_attempts['asin']}\n"
+                        f"  TIER 2 (JS): {extraction_attempts['javascript']}\n"
+                        f"  TIER 3 (AI): {extraction_attempts['ai_healed']}\n"
+                        f"  TIER 4 (RESILIENT): {extraction_attempts['resilient']}"
+                    )
+            
+            # ✅ NEW: Validate products before returning
+            validated_products = []
+            validation_failures = 0
+            
+            for product in products:
+                try:
+                    product.validate()
+                    validated_products.append(product)
+                except ValueError as e:
+                    validation_failures += 1
+                    logger.warning(f"Product validation failed: {e}")
+                    continue
+            
+            extraction_attempts["_validation"] = {
+                "total": len(products),
+                "valid": len(validated_products),
+                "failed": validation_failures
+            }
+            
+            products = validated_products
             
             await self.rate_limiter.record_success("amazon")
             self.record_success()
             
             search_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            
+            # ✅ NEW: Calculate extraction summary
+            extraction_attempts["_summary"] = {
+                "total_attempts": sum(1 for v in extraction_attempts.values() if isinstance(v, dict) and v.get("attempted")),
+                "successful_tiers": sum(1 for v in extraction_attempts.values() if isinstance(v, dict) and v.get("success")),
+                "final_method": extraction_method.value,
+                "final_count": len(products)
+            }
             
             return SearchResult(
                 query=query,
@@ -424,6 +514,7 @@ class AmazonScraper(BasePlatformHandler):
                 has_more=len(products) >= 15,
                 search_time_ms=search_time,
                 extraction_method=extraction_method,
+                metadata=extraction_attempts,  # ✅ NEW: Rich diagnostics
                 success=True
             )
         
@@ -432,20 +523,24 @@ class AmazonScraper(BasePlatformHandler):
                 query=query,
                 platform_name="amazon",
                 success=False,
-                error_message=f"Rate limited: {e.retry_after}s"
+                error_message=f"Rate limited: {e.retry_after}s",
+                metadata=extraction_attempts
             )
         
         except Exception as e:
             logger.error(f"❌ Amazon search error: {e}")
             await self.rate_limiter.record_failure("amazon", ThreatLevel.WARNING)
             self.record_failure(str(e))
+            
+            extraction_attempts["_fatal_error"] = str(e)[:500]
+            
             return SearchResult(
                 query=query,
                 platform_name="amazon",
                 success=False,
-                error_message=str(e)
+                error_message=str(e),
+                metadata=extraction_attempts
             )
-    
     async def _build_products_from_healed(
         self,
         page_obj,

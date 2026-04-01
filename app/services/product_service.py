@@ -385,9 +385,14 @@ def _validate_image_url(url: Optional[str]) -> bool:
     # Reject placeholder/broken patterns
     placeholders = [
         'placeholder', 'noimage', 'no-image', 'coming-soon', 
-        'unavailable', 'default', '1x1', 'blank', 'dummy'
+        'unavailable', 'default', '1x1', 'blank', 'dummy',
+        'svgicons', 'wishlist.svg'
     ]
     
+    # Reject generic icon vectors; these are not product photos.
+    if url_str.endswith('.svg'):
+        return False
+
     if any(p in url_str for p in placeholders):
         return False
     
@@ -746,9 +751,18 @@ class ProductService:
             existing.last_enriched_at = datetime.utcnow()
             existing.enrichment_version = 2
 
-        if not existing.image_url and getattr(incoming, "image_url", None):
-            existing.image_url = incoming.image_url
-            changes.append("image_url: added")
+        incoming_image = getattr(incoming, "image_url", None)
+        incoming_image_valid = _validate_image_url(incoming_image)
+        existing_image_valid = _validate_image_url(existing.image_url)
+
+        # Allow replacing stale/invalid image URLs when a valid incoming image is available.
+        if incoming_image_valid and (not existing.image_url or not existing_image_valid):
+            old_image = existing.image_url
+            existing.image_url = incoming_image
+            if old_image:
+                changes.append("image_url: replaced invalid image")
+            else:
+                changes.append("image_url: added")
 
         incoming_subcategory = getattr(incoming, "subcategory", None) or _infer_subcategory(
             title=getattr(incoming, "title", ""),

@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     SCRAPER_MAX_RETRIES: int = 3
     SCRAPER_CONCURRENT_LIMIT: int = 10
     USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    LOCATION_REFRESH_ENABLED: bool = True
+    LOCATION_REFRESH_CACHE_TTL_SECONDS: int = 1200
+    LOCATION_REFRESH_MAX_LISTINGS_PER_REQUEST: int = 8
 
     # Daily scrape smart scheduling
     DAILY_SCRAPE_MAX_PRODUCTS_PER_RUN: int = 500

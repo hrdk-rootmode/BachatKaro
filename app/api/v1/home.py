@@ -98,19 +98,44 @@ async def get_home_categories(
         
         # Get category counts
         categories = await query_service.get_categories_with_counts()
-        
-        # Format as dict
-        trending_categories = {
-            "Electronics": categories.get("Electronics", 0),
-            "Fashion": categories.get("Fashion", 0),
-            "Beauty": categories.get("Beauty", 0),
-            "Home & Kitchen": categories.get("Home & Kitchen", 0),
-            "Sports": categories.get("Sports", 0),
-            "Books": categories.get("Books", 0)
+
+        # Normalize to master-catalog section keys expected by the app.
+        master_counts = {
+            "mobiles": 0,
+            "tablets": 0,
+            "laptops": 0,
+            "mobile_accessories": 0,
+            "laptop_accessories": 0,
+            "fashion": 0,
+            "home_kitchen": 0,
+            "books": 0,
         }
-        
-        logger.info(f"Categories fetched: {len(trending_categories)} | User: {user.id}")
-        return trending_categories
+
+        for category, count in categories.items():
+            category_text = str(category or "").lower()
+            numeric_count = int(count or 0)
+
+            if "book" in category_text:
+                master_counts["books"] += numeric_count
+            elif any(token in category_text for token in ["fashion", "clothing", "apparel"]):
+                master_counts["fashion"] += numeric_count
+            elif any(token in category_text for token in ["home", "kitchen", "furniture"]):
+                master_counts["home_kitchen"] += numeric_count
+            elif any(token in category_text for token in ["tablet", "ipad"]):
+                master_counts["tablets"] += numeric_count
+            elif any(token in category_text for token in ["laptop accessory", "computer accessory"]):
+                master_counts["laptop_accessories"] += numeric_count
+            elif any(token in category_text for token in ["mobile accessory", "phone accessory"]):
+                master_counts["mobile_accessories"] += numeric_count
+            elif any(token in category_text for token in ["laptop", "notebook", "computer"]):
+                master_counts["laptops"] += numeric_count
+            elif "accessor" in category_text:
+                master_counts["mobile_accessories"] += numeric_count
+            elif any(token in category_text for token in ["mobile", "phone", "smartphone", "electronics"]):
+                master_counts["mobiles"] += numeric_count
+
+        logger.info(f"Categories fetched: {len(master_counts)} | User: {user.id}")
+        return master_counts
         
     except Exception as e:
         logger.error(f"Error fetching categories: {e}", exc_info=True)
@@ -172,4 +197,78 @@ async def get_home_deals(
         
     except Exception as e:
         logger.error(f"Error fetching home deals: {e}", exc_info=True)
+        return []
+
+
+@router.get("/cross-platform", response_model=List[TrendingProductResponse])
+async def get_home_cross_platform(
+    limit: int = 24,
+    min_platforms: int = 2,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get products that are available across multiple platforms.
+
+    ✅ Direct DB access
+    ✅ Cross-platform matched products only
+    ✅ Intended for home page quick section
+    """
+    try:
+        query_service = QueryService(db)
+        safe_limit = max(1, min(int(limit or 24), 60))
+        safe_min_platforms = max(2, min(int(min_platforms or 2), 6))
+
+        candidates = await query_service.get_cross_platform_products(
+            limit=max(safe_limit * 3, 30),
+            min_platforms=safe_min_platforms,
+        )
+
+        if not candidates:
+            logger.info(f"No cross-platform home products available | User: {user.id}")
+            return []
+
+        response_items: List[TrendingProductResponse] = []
+
+        for product, raw_platform_count in candidates:
+            listings = await query_service.get_product_listings(str(product.id), order_by="price_asc")
+            valid_listings = BusinessLogic.filter_valid_listings(listings, product)
+            if not valid_listings:
+                continue
+
+            distinct_platforms = {
+                str(getattr(listing.platform, "name", "")).lower()
+                for listing in valid_listings
+                if getattr(listing, "platform", None) is not None
+            }
+            platform_count = len([p for p in distinct_platforms if p])
+            platform_count = max(platform_count, int(raw_platform_count or 0))
+
+            if platform_count < safe_min_platforms:
+                continue
+
+            best_listing = min(
+                valid_listings,
+                key=lambda listing: float(listing.current_price or float("inf")),
+            )
+
+            item = BusinessLogic.format_trending_response(
+                product,
+                best_listing,
+                platform_count=platform_count,
+            )
+            item.rank = len(response_items) + 1
+            response_items.append(item)
+
+            if len(response_items) >= safe_limit:
+                break
+
+        logger.info(
+            f"Home cross-platform products: {len(response_items)} | "
+            f"min_platforms: {safe_min_platforms} | User: {user.id}"
+        )
+        return response_items
+
+    except Exception as e:
+        logger.error(f"Error fetching cross-platform home products: {e}", exc_info=True)
         return []

@@ -317,6 +317,111 @@ class ProductData:
             except (TypeError, ValueError):
                 self.extraction_confidence = EXTRACTION_CONFIDENCE_MAP.get(self.extraction_method, 0.5)
     
+    def validate(self) -> None:
+        """
+        ✅ NEW: Validate product data before storage/use
+        
+        Raises:
+            ValueError: If any required field is invalid
+        
+        Checks:
+        - Title is non-empty
+        - Price is positive
+        - URL is valid HTTP(S)
+        - Image URL format (if provided)
+        """
+        # 1. Validate title
+        if not self.title or not self.title.strip():
+            raise ValueError("Product title is required and cannot be empty")
+        
+        if len(self.title.strip()) < 3:
+            raise ValueError(f"Product title too short: '{self.title}'")
+        
+        # 2. Validate price
+        if self.current_price is None:
+            raise ValueError("Current price is required")
+        
+        if self.current_price <= 0:
+            raise ValueError(f"Current price must be positive, got {self.current_price}")
+        
+        # Sanity check: price shouldn't be astronomically high
+        if self.current_price > Decimal('10000000'):  # 1 crore
+            raise ValueError(f"Current price seems invalid: ₹{self.current_price}")
+        
+        # 3. Validate original price (if provided)
+        if self.original_price is not None:
+            if self.original_price < self.current_price:
+                logger.warning(
+                    f"Original price (₹{self.original_price}) < current price (₹{self.current_price}), "
+                    f"setting original_price to None"
+                )
+                self.original_price = None
+            elif self.original_price > self.current_price * 100:
+                logger.warning(
+                    f"Original price suspiciously high: ₹{self.original_price} vs ₹{self.current_price}"
+                )
+        
+        # 4. Validate product URL
+        if not self.product_url:
+            raise ValueError("Product URL is required")
+        
+        if not self.product_url.startswith(('http://', 'https://')):
+            raise ValueError(f"Product URL must be HTTP(S): {self.product_url}")
+        
+        if len(self.product_url) > 2048:
+            raise ValueError(f"Product URL too long: {len(self.product_url)} chars")
+        
+        # 5. Validate image URL (if provided)
+        if self.image_url:
+            if not isinstance(self.image_url, str):
+                raise ValueError(f"Image URL must be string, got {type(self.image_url)}")
+            
+            if not self.image_url.startswith(('http://', 'https://', '//', 'data:')):
+                logger.warning(f"Image URL has unusual format: {self.image_url[:50]}")
+            
+            if len(self.image_url) > 2048:
+                raise ValueError(f"Image URL too long: {len(self.image_url)} chars")
+        
+        # 6. Validate platform name
+        if not self.platform_name:
+            raise ValueError("Platform name is required")
+        
+        # 7. Validate external ID
+        if not self.external_id:
+            raise ValueError("External ID is required")
+        
+        # 8. Validate rating (if provided)
+        if self.rating is not None:
+            if not (0 <= self.rating <= 5):
+                logger.warning(f"Rating out of range: {self.rating}, setting to None")
+                self.rating = None
+        
+        # 9. Validate review count (if provided)
+        if self.review_count is not None:
+            if self.review_count < 0:
+                logger.warning(f"Negative review count: {self.review_count}, setting to None")
+                self.review_count = None
+        
+        # 10. Validate discount percentage
+        if self.discount_percent is not None:
+            if not (0 <= self.discount_percent <= 100):
+                logger.warning(f"Invalid discount: {self.discount_percent}%, setting to None")
+                self.discount_percent = None
+    
+    def validate_safe(self) -> bool:
+        """
+        Safe validation that returns bool instead of raising
+        
+        Returns:
+            True if valid, False otherwise
+        """
+        try:
+            self.validate()
+            return True
+        except ValueError as e:
+            logger.warning(f"Product validation failed: {e}")
+            return False
+
     # =========================================================================
     # PHASE 1: ENHANCED FINGERPRINTING WITH VARIANT DETECTION
     # =========================================================================
@@ -705,7 +810,7 @@ class ProductData:
 
 @dataclass
 class SearchResult:
-    """Search operation result"""
+    """Search operation result with extraction diagnostics"""
     query: str
     platform_name: str
     products: List[ProductData] = field(default_factory=list)
@@ -720,6 +825,9 @@ class SearchResult:
     data_source: HandlerType = HandlerType.SCRAPER
     extraction_method: ExtractionMethod = ExtractionMethod.DOM_SELECTOR
     
+    # ✅ NEW: Extraction diagnostics metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
     # Errors
     success: bool = True
     error_message: Optional[str] = None
@@ -731,7 +839,6 @@ class SearchResult:
     @property
     def product_count(self) -> int:
         return len(self.products)
-
 
 @dataclass
 class HealthStatus:
@@ -1244,13 +1351,27 @@ class BasePlatformHandler(ABC):
                 if getattr(self.healing_engine, "db_session", None) is None and self._db_session is not None:
                     setattr(self.healing_engine, "db_session", self._db_session)
                 
-                async def test_selector(selector: str) -> bool:
+                async def test_selector(selector: str, _field_name: str = field_name) -> bool:
                     try:
                         element = await asyncio.wait_for(
                             page.query_selector(selector),
                             timeout=test_timeout
                         )
-                        return element is not None
+                        if element is None:
+                            return False
+
+                        field_config = UNIVERSAL_FIELD_CONFIG.get(_field_name)
+                        if field_config:
+                            extract_type, extract_spec = field_config
+                            if extract_type == "attribute":
+                                raw_value = await element.get_attribute(extract_spec)
+                            else:
+                                raw_value = await element.text_content()
+                        else:
+                            raw_value = await element.text_content()
+
+                        cleaned_value = self._clean_field_value(_field_name, raw_value)
+                        return self._is_meaningful_extracted_value(_field_name, cleaned_value)
                     except asyncio.TimeoutError:
                         return False
                     except Exception:
@@ -1266,37 +1387,50 @@ class BasePlatformHandler(ABC):
                 field_duration = time.time() - field_start
                 
                 if selector_result.success:
-                    element = await page.query_selector(selector_result.selector)
-                    
-                    if element:
-                        field_config = UNIVERSAL_FIELD_CONFIG.get(field_name)
-                        
-                        if field_config:
-                            extract_type, clean_method = field_config
-                            
-                            if extract_type == "attribute":
-                                raw_value = await element.get_attribute(clean_method)
+                    cleaned_value = None
+
+                    if selector_result.method.value == "fallback_regex":
+                        cleaned_value = self._extract_regex_fallback_value(
+                            pattern=selector_result.selector,
+                            field_name=field_name,
+                            html_content=html_content,
+                        )
+                    else:
+                        element = await page.query_selector(selector_result.selector)
+
+                        if element:
+                            field_config = UNIVERSAL_FIELD_CONFIG.get(field_name)
+
+                            if field_config:
+                                extract_type, clean_method = field_config
+
+                                if extract_type == "attribute":
+                                    raw_value = await element.get_attribute(clean_method)
+                                else:
+                                    raw_value = await element.text_content()
+
+                                cleaned_value = self._clean_field_value(field_name, raw_value)
                             else:
                                 raw_value = await element.text_content()
-                            
-                            cleaned_value = self._clean_field_value(field_name, raw_value)
-                            extracted[field_name] = cleaned_value
-                        else:
-                            raw_value = await element.text_content()
-                            extracted[field_name] = self._clean_text(raw_value)
-                        
+                                cleaned_value = self._clean_text(raw_value)
+
+                    if self._is_meaningful_extracted_value(field_name, cleaned_value):
+                        extracted[field_name] = cleaned_value
                         extraction_stats["successful"] += 1
-                        
+
                         if selector_result.method.value == "ai_generated":
                             extraction_stats["ai_generated"] += 1
                         elif selector_result.method.value == "healed_cached":
                             extraction_stats["cached"] += 1
-                        
+
                         await self._record_extraction_performance(
                             field_name, selector_result.selector, True, field_duration
                         )
                     else:
                         extraction_stats["failed"] += 1
+                        await self._record_extraction_performance(
+                            field_name, selector_result.selector, False, field_duration
+                        )
                 else:
                     extraction_stats["failed"] += 1
                     
@@ -1318,9 +1452,105 @@ class BasePlatformHandler(ABC):
                 await self.persist_healed_selectors(fields)
             except Exception as e:
                 logger.debug(f"Healed selector persistence skipped: {e}")
+
+        if self.healing_engine is not None and getattr(self.healing_engine, "db_session", None) is not None:
+            try:
+                await self.healing_engine.update_platform_healing_stats(
+                    db_session=getattr(self.healing_engine, "db_session", None)
+                )
+            except Exception as e:
+                logger.debug(f"Healing stats update skipped: {e}")
         
         extracted["_extraction_stats"] = extraction_stats
         return extracted
+
+    def _extract_regex_fallback_value(
+        self,
+        pattern: str,
+        field_name: str,
+        html_content: str,
+    ) -> Any:
+        """Extract fallback value using regex pattern from HTML content."""
+        if not pattern or not html_content:
+            return None
+
+        try:
+            match = re.search(pattern, html_content, re.IGNORECASE)
+        except re.error:
+            return None
+
+        if not match:
+            return None
+
+        raw_value = match.group(1) if match.groups() else match.group(0)
+        return self._clean_field_value(field_name, raw_value)
+
+    def _is_meaningful_extracted_value(self, field_name: str, value: Any) -> bool:
+        """Reject selector matches that return empty or junk values."""
+        if value is None:
+            return False
+
+        field_lower = field_name.lower()
+
+        if "price" in field_lower:
+            try:
+                return Decimal(str(value)) > 0
+            except Exception:
+                return False
+
+        if field_lower in ["product_title", "title"]:
+            title = str(value).strip()
+            if len(title) < 6:
+                return False
+            bad_title_tokens = [
+                "access denied",
+                "captcha",
+                "sign in",
+                "log in",
+                "verify you",
+                "security check",
+                "blocked",
+                "loading",
+                "not found",
+            ]
+            lowered = title.lower()
+            return not any(token in lowered for token in bad_title_tokens)
+
+        if field_lower in ["product_url", "url"]:
+            url = str(value).strip()
+            return url.startswith("http") or url.startswith("/")
+
+        if "image" in field_lower:
+            image_url = str(value).strip().lower()
+            if not image_url:
+                return False
+            if image_url.endswith(".svg") or "placeholder" in image_url:
+                return False
+            return image_url.startswith("http") or image_url.startswith("/")
+
+        if field_lower == "brand":
+            brand = str(value).strip().lower()
+            if not brand:
+                return False
+            generic_brand_tokens = {
+                "unknown", "generic", "unbranded", "men", "women",
+                "boys", "girls", "cotton", "casual", "formal"
+            }
+            return brand not in generic_brand_tokens
+
+        if field_lower == "review_count":
+            try:
+                return int(value) >= 0
+            except Exception:
+                return False
+
+        if field_lower == "in_stock":
+            return isinstance(value, bool)
+
+        if isinstance(value, str):
+            return bool(value.strip())
+
+        return True
     
     async def _record_extraction_performance(
         self,

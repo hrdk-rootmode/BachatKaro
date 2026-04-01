@@ -38,6 +38,7 @@ if sys.platform == 'win32':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.core.database import async_session_maker
+from app.core.config import settings
 from app.services.scraper.factory import get_platform_handler
 from app.services.ai.enrichment_service import enrichment_service
 from app.services.product_service import product_service
@@ -470,10 +471,20 @@ async def main(args):
 
 
 async def run_seed_products() -> Dict[str, Any]:
-    """Scheduler/manual entrypoint for legacy seed job."""
+    """Scheduler/manual entrypoint aligned with hardened scripts seeder."""
     try:
-        results = await seed_smart_rotate(categories=["Electronics", "Fashion", "Home & Kitchen"], products_per_category=4)
-        return {"success": True, "results": results, "mode": "smart_rotate"}
+        from scripts.seed import seed_smart_rotate as hardened_seed_smart_rotate
+
+        results = await hardened_seed_smart_rotate(
+            categories=["Electronics", "Fashion", "Home & Kitchen"],
+            products_per_category=4,
+            enable_ai=not bool(getattr(settings, "SEED_NO_AI", False)),
+            enable_cross_match=not bool(getattr(settings, "SEED_NO_CROSS_MATCH", False)),
+            timeout_seconds=int(getattr(settings, "SEED_PLATFORM_TIMEOUT_SECONDS", 45)),
+            query_interval_seconds=float(getattr(settings, "SEED_QUERY_INTERVAL_SECONDS", 4.0)),
+            cooldown_buffer_seconds=int(getattr(settings, "SEED_COOLDOWN_BUFFER_SECONDS", 8)),
+        )
+        return {"success": True, "results": results, "mode": "smart_rotate_hardened"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

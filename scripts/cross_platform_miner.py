@@ -135,6 +135,10 @@ class MinerConfig:
     # Supported Platforms
     SUPPORTED_PLATFORMS = {'amazon', 'flipkart', 'meesho', 'myntra', 'croma', 'nykaa'}
 
+    # Master catalog alignment
+    MASTER_CATALOG_PATH = Path(__file__).with_name("master_catalog.json")
+    MASTER_GROUP_MIN_SCORE = 2
+
 
 # =============================================================================
 # SECTION 2: ENUMS & DATA CLASSES
@@ -210,6 +214,8 @@ class ProductSpecs:
     raw_title: str = ""
     full_title: str = ""
     category_type: ProductCategoryType = ProductCategoryType.GENERAL
+    master_group: Optional[str] = None
+    category_hint: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() 
@@ -437,6 +443,9 @@ BRAND_PATTERNS_LIST = [
     r'Garnier', r'Pond\'?s', r'Himalaya', r'Biotique', r'Mamaearth',
     r'WOW', r'mCaffeine', r'Plum', r'The\s*Body\s*Shop', r'Forest\s*Essentials',
     r'Nykaa', r'Sugar', r'Colorbar', r'Faces', r'PAC', r'Swiss\s*Beauty',
+
+    # Additional real-world misses from audits
+    r'Primebook', r'CMF', r'American\s*Tourister', r'Frontech', r'Aroma', r'Lorenz',
     
     # Generic catches
     r'Crazyly', r'Generic', r'Local', r'Unbranded',
@@ -458,6 +467,8 @@ BRAND_NORMALIZATIONS = {
     'pixel': 'Google', 'google': 'Google',
     'redmi': 'Xiaomi', 'poco': 'Xiaomi', 'mi': 'Xiaomi',
     'iqoo': 'iQOO',
+    'cmf': 'Nothing',
+    'nothing': 'Nothing',
     'red magic': 'RedMagic', 'redmagic': 'RedMagic',
     'black shark': 'BlackShark', 'blackshark': 'BlackShark',
     
@@ -490,7 +501,268 @@ BRAND_FAMILIES = {
     'hp': {'hp', 'pavilion', 'hewlett-packard'},
     'fire-boltt': {'fire-boltt', 'fireboltt'},
     'boat': {'boat', 'boAt'},
+    'nothing': {'nothing', 'cmf'},
+    'cmf': {'nothing', 'cmf'},
 }
+
+
+# =============================================================================
+# SECTION 3.5: MASTER CATALOG CATEGORY INTELLIGENCE (NEW)
+# =============================================================================
+
+MASTER_GROUP_TO_CATEGORY_TYPE = {
+    "mobiles": ProductCategoryType.ELECTRONICS,
+    "tablets": ProductCategoryType.ELECTRONICS,
+    "laptops": ProductCategoryType.ELECTRONICS,
+    "mobile_accessories": ProductCategoryType.ELECTRONICS,
+    "laptop_accessories": ProductCategoryType.ELECTRONICS,
+    "fashion": ProductCategoryType.FASHION,
+    "home_kitchen": ProductCategoryType.APPLIANCES,
+    "books": ProductCategoryType.GENERAL,
+}
+
+MASTER_GROUP_TO_ROUTING_CATEGORY = {
+    "mobiles": ProductCategory.ELECTRONICS,
+    "tablets": ProductCategory.ELECTRONICS,
+    "laptops": ProductCategory.ELECTRONICS,
+    "mobile_accessories": ProductCategory.ELECTRONICS,
+    "laptop_accessories": ProductCategory.ELECTRONICS,
+    "fashion": ProductCategory.FASHION,
+    "home_kitchen": ProductCategory.HOME,
+    "books": ProductCategory.GENERAL,
+}
+
+MASTER_ACCESSORY_GROUPS = {"mobile_accessories", "laptop_accessories"}
+
+MASTER_GROUP_ALIAS_MAP: Dict[str, Set[str]] = {
+    "mobiles": {"mobile", "mobiles", "phone", "smartphone"},
+    "tablets": {"tablet", "tab", "ipad"},
+    "laptops": {"laptop", "notebook", "macbook"},
+    "mobile_accessories": {
+        "mobile accessories",
+        "phone accessories",
+        "charger",
+        "cable",
+        "cover",
+        "case",
+        "tempered",
+        "power bank",
+        "earbuds",
+        "watch band",
+        "watch strap",
+    },
+    "laptop_accessories": {
+        "laptop accessories",
+        "laptop bag",
+        "laptop sleeve",
+        "sleeve",
+        "sleeves",
+        "bag",
+        "bags",
+        "keyboard",
+        "mouse",
+        "docking",
+        "usb hub",
+        "external ssd",
+    },
+    "fashion": {"fashion", "apparel", "clothing", "shirt", "kurti", "saree", "shoes"},
+    "home_kitchen": {"home", "kitchen", "cookware", "appliance", "organizer"},
+    "books": {"book", "books", "novel", "paperback", "hardcover"},
+}
+
+MASTER_TOKEN_STOP_WORDS = {
+    "latest", "new", "best", "under", "with", "for", "and", "the", "from",
+    "launch", "price", "online", "items", "set", "pack", "size", "inch", "2026",
+}
+
+MASTER_GROUP_TOKEN_INDEX: Dict[str, Set[str]] = {}
+
+BRAND_INFERENCE_HINTS = [
+    (re.compile(r"\b(omen|victus|pavilion|envy|spectre|probook|elitebook)\b", re.IGNORECASE), ("HP", "HP")),
+    (re.compile(r"\b(vivobook|zenbook|tuf|proart|rog)\b", re.IGNORECASE), ("Asus", "Asus")),
+    (re.compile(r"\b(thinkpad|ideapad|legion|loq|thinkbook|yoga)\b", re.IGNORECASE), ("Lenovo", "Lenovo")),
+    (re.compile(r"\b(inspiron|xps|vostro|latitude|alienware)\b", re.IGNORECASE), ("Dell", "Dell")),
+    (re.compile(r"\b(macbook|iphone|ipad)\b", re.IGNORECASE), ("Apple", "Apple")),
+    (re.compile(r"\b(reno|find\s*x)\b", re.IGNORECASE), ("Oppo", "Oppo")),
+    (re.compile(r"\b(narzo)\b", re.IGNORECASE), ("Realme", "Realme")),
+    (re.compile(r"\b(cmf)\b", re.IGNORECASE), ("Nothing", "CMF")),
+    (re.compile(r"\b(primebook)\b", re.IGNORECASE), ("Primebook", "Primebook")),
+    (re.compile(r"\b(american\s*tourister)\b", re.IGNORECASE), ("American Tourister", "American Tourister")),
+    (re.compile(r"\b(frontech)\b", re.IGNORECASE), ("Frontech", "Frontech")),
+    (re.compile(r"\b(aroma)\b", re.IGNORECASE), ("Aroma", "Aroma")),
+    (re.compile(r"\b(lorenz)\b", re.IGNORECASE), ("Lorenz", "Lorenz")),
+]
+
+LOW_CONFIDENCE_BRANDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "the",
+    "with",
+    "w",
+    "of",
+}
+
+
+def _tokenize_for_master_index(text: str) -> Set[str]:
+    if not text:
+        return set()
+    tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    filtered = {
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in MASTER_TOKEN_STOP_WORDS and not token.isdigit()
+    }
+    return filtered
+
+
+def _load_master_catalog_index() -> None:
+    if MASTER_GROUP_TOKEN_INDEX:
+        return
+
+    path = MinerConfig.MASTER_CATALOG_PATH
+    if not path.exists():
+        logger.warning("Master catalog not found at %s", path)
+        return
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        groups = payload.get("groups", {}) if isinstance(payload, dict) else {}
+        for group_name, category_block in groups.items():
+            group = str(group_name or "").strip().lower()
+            if not group:
+                continue
+
+            tokens = set(_tokenize_for_master_index(group.replace("_", " ")))
+            tokens.update(_tokenize_for_master_index(" ".join(MASTER_GROUP_ALIAS_MAP.get(group, set()))))
+
+            if isinstance(category_block, dict):
+                for label, queries in category_block.items():
+                    tokens.update(_tokenize_for_master_index(str(label or "")))
+                    if isinstance(queries, list):
+                        for query in queries:
+                            tokens.update(_tokenize_for_master_index(str(query or "")))
+
+            MASTER_GROUP_TOKEN_INDEX[group] = tokens
+
+    except Exception as e:
+        logger.warning("Failed to load master catalog index: %s", e)
+
+
+def infer_master_catalog_group(title: str, category: Optional[str]) -> Optional[str]:
+    """Infer canonical master-catalog group for source product classification."""
+    _load_master_catalog_index()
+
+    category_text = str(category or "").lower()
+    haystack = f"{category_text} {title or ''}".lower()
+
+    # Watch bands/straps frequently miss brand and should be treated as accessories.
+    if any(x in haystack for x in ["watch", "smartwatch", "smart watch"]) and any(
+        y in haystack for y in ["band", "bands", "strap", "straps", "belt"]
+    ):
+        return "mobile_accessories"
+
+    # Deterministic accessory overrides.
+    if any(x in haystack for x in ["laptop", "notebook", "macbook"]) and any(
+        y in haystack
+        for y in ["bag", "sleeve", "mouse", "keyboard", "docking", "usb hub", "adapter", "charger"]
+    ):
+        return "laptop_accessories"
+
+    if any(x in haystack for x in ["mobile", "phone", "smartphone", "iphone"]) and any(
+        y in haystack
+        for y in ["cover", "case", "tempered", "charger", "cable", "power bank", "holder", "earbuds", "strap"]
+    ):
+        return "mobile_accessories"
+
+    # Deterministic device-line overrides.
+    if any(
+        x in haystack
+        for x in [
+            "omen", "vivobook", "zenbook", "thinkpad", "ideapad", "legion", "primebook",
+            "macbook", "inspiron", "xps", "vostro", "latitude", "victus", "probook", "elitebook",
+            "galaxy book",
+        ]
+    ):
+        return "laptops"
+
+    if any(
+        x in haystack
+        for x in [
+            "iphone", "galaxy", "redmi", "poco", "iqoo", "oneplus", "pixel",
+            "reno", "cmf phone", "vivo", "oppo", "motorola", "moto", "smartphone",
+        ]
+    ) and any(y in haystack for y in ["phone", "mobile", "5g", "ram", "gb"]) and not any(
+        z in haystack for z in ["galaxy book", "laptop", "notebook", "macbook", "intel core", "ryzen"]
+    ):
+        return "mobiles"
+
+    # Generic 5G smartphone patterns (e.g., "Note 14 Pro+ 5G") with laptop guards.
+    if "5g" in haystack and any(
+        x in haystack for x in ["note", "neo", "narzo", "realme", "redmi", "iqoo", "edge", "phone", "mobile"]
+    ) and not any(z in haystack for z in ["laptop", "notebook", "macbook", "galaxy book"]):
+        return "mobiles"
+
+    # Alias scoring pass for common category words.
+    alias_scores: Dict[str, int] = {}
+    for group, aliases in MASTER_GROUP_ALIAS_MAP.items():
+        score = 0
+        for alias in aliases:
+            alias_norm = alias.lower().strip()
+            if not alias_norm:
+                continue
+            if alias_norm in haystack:
+                score += 2 if " " in alias_norm else 1
+        if score > 0:
+            alias_scores[group] = score
+
+    if not MASTER_GROUP_TOKEN_INDEX:
+        if alias_scores:
+            return max(alias_scores.items(), key=lambda item: item[1])[0]
+        return None
+
+    title_tokens = _tokenize_for_master_index(haystack)
+    if not title_tokens:
+        return None
+
+    best_group = None
+    best_score = 0
+
+    for group, tokens in MASTER_GROUP_TOKEN_INDEX.items():
+        score = len(title_tokens.intersection(tokens))
+        score += alias_scores.get(group, 0)
+        if score > best_score:
+            best_group = group
+            best_score = score
+
+    if best_group and best_score >= MinerConfig.MASTER_GROUP_MIN_SCORE:
+        return best_group
+
+    return None
+
+
+def infer_brand_from_context(
+    title: str,
+    product_line: Optional[str],
+    model: Optional[str],
+    master_group: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Infer brand when explicit brand token is missing in title."""
+    search_blob = " ".join([
+        str(title or ""),
+        str(product_line or ""),
+        str(model or ""),
+        str((master_group or "").replace("_", " ")),
+    ])
+
+    for pattern, (normalized_brand, original_brand) in BRAND_INFERENCE_HINTS:
+        if pattern.search(search_blob):
+            return normalized_brand, original_brand
+
+    return None, None
 
 
 # =============================================================================
@@ -1171,8 +1443,17 @@ def is_junk_title(title: str) -> bool:
     return False
 
 
-def determine_category_type(category: Optional[str], title: str) -> ProductCategoryType:
+def determine_category_type(
+    category: Optional[str],
+    title: str,
+    master_group: Optional[str] = None,
+) -> ProductCategoryType:
     """Determine the product category type for category-aware processing."""
+    if master_group:
+        mapped = MASTER_GROUP_TO_CATEGORY_TYPE.get(master_group)
+        if mapped:
+            return mapped
+
     if not category:
         category = ""
     
@@ -1218,7 +1499,8 @@ def extract_specs(
     title: str, 
     price: Optional[float] = None, 
     full_title: Optional[str] = None,
-    category: Optional[str] = None
+    category: Optional[str] = None,
+    master_group: Optional[str] = None,
 ) -> ProductSpecs:
     """
     Extract all specs from a product title.
@@ -1241,16 +1523,42 @@ def extract_specs(
     
     # Use full_title for extraction when available (more details)
     spec_text = full_title if full_title else title
+
+    resolved_master_group = master_group or infer_master_catalog_group(spec_text, category)
+    specs.master_group = resolved_master_group
+    specs.category_hint = category
     
     # Determine category type
-    specs.category_type = determine_category_type(category, spec_text)
+    specs.category_type = determine_category_type(category, spec_text, master_group=resolved_master_group)
     
     # Basic extraction
     specs.brand, specs.original_brand = extract_brand(spec_text)
+
+    # Drop obvious non-brand tokens so context inference can take over.
+    if specs.brand and specs.brand.strip().lower() in LOW_CONFIDENCE_BRANDS:
+        specs.brand = None
+        specs.original_brand = None
+
     specs.product_line = extract_product_line(spec_text, specs.brand)
     specs.model = extract_model(spec_text, specs.brand)
     specs.generation = extract_generation(spec_text)
     specs.color = extract_color(spec_text)
+
+    inferred_brand, inferred_original = infer_brand_from_context(
+        title=spec_text,
+        product_line=specs.product_line,
+        model=specs.model,
+        master_group=resolved_master_group,
+    )
+
+    # If brand is missing (or clearly noisy in device groups), infer from context.
+    if inferred_brand:
+        if not specs.brand:
+            specs.brand = inferred_brand
+            specs.original_brand = inferred_original or inferred_brand
+        elif resolved_master_group in {"laptops", "mobiles", "tablets"} and specs.brand.strip().lower() in {"titan"}:
+            specs.brand = inferred_brand
+            specs.original_brand = inferred_original or inferred_brand
     
     # Electronics-specific
     specs.ram_gb = extract_ram(spec_text)
@@ -1268,6 +1576,8 @@ def extract_specs(
     
     # Flags
     specs.is_accessory = is_accessory(spec_text)
+    if resolved_master_group in MASTER_ACCESSORY_GROUPS:
+        specs.is_accessory = True
     specs.is_refurbished = is_refurbished(spec_text)
     
     return specs
@@ -1280,7 +1590,8 @@ def extract_specs(
 def check_quality_gate(
     title: str,
     specs: ProductSpecs,
-    category_type: ProductCategoryType
+    category_type: ProductCategoryType,
+    master_group: Optional[str] = None,
 ) -> QualityGateResult:
     """
     Check if product has enough identity information to be matchable.
@@ -1300,13 +1611,20 @@ def check_quality_gate(
     
     words = [w.lower() for w in re.findall(r'\b[a-zA-Z]{2,}\b', title)]
     meaningful_words = [w for w in words if w not in filler_words]
+    resolved_group = master_group or specs.master_group
+
+    min_words_required = MinerConfig.MIN_TITLE_WORDS
+    if resolved_group in {"books", "home_kitchen"}:
+        min_words_required = 2
+    if resolved_group in MASTER_ACCESSORY_GROUPS:
+        min_words_required = 2
     
     # Check minimum title length
     if len(title) < MinerConfig.MIN_TITLE_LENGTH:
         return QualityGateResult(False, f"Title too short ({len(title)} chars)", 0)
     
     # Check minimum meaningful words
-    if len(meaningful_words) < MinerConfig.MIN_TITLE_WORDS:
+    if len(meaningful_words) < min_words_required:
         return QualityGateResult(
             False, 
             f"Too few meaningful words ({len(meaningful_words)}): '{title[:50]}...'",
@@ -1329,18 +1647,41 @@ def check_quality_gate(
     
     # Electronics: need brand + (model OR product_line OR storage)
     if category_type == ProductCategoryType.ELECTRONICS:
-        if not specs.brand:
-            return QualityGateResult(False, "Electronics: No brand detected", identity_score)
-        if not any([specs.model, specs.product_line, specs.storage_gb, specs.ram_gb]):
-            return QualityGateResult(
-                False, 
-                "Electronics: No model/storage/RAM info",
-                identity_score
-            )
+        is_accessory_group = resolved_group in MASTER_ACCESSORY_GROUPS
+
+        if is_accessory_group:
+            has_identity = any([
+                specs.brand,
+                specs.product_line,
+                specs.model,
+                specs.storage_gb,
+                specs.ram_gb,
+            ])
+            if not has_identity and len(meaningful_words) < 3:
+                return QualityGateResult(
+                    False,
+                    "Electronics accessory: weak identity",
+                    identity_score,
+                )
+        else:
+            if not specs.brand:
+                strong_identity_without_brand = bool(
+                    (specs.product_line and (specs.model or specs.storage_gb or specs.ram_gb or specs.processor))
+                    or (specs.model and (specs.storage_gb or specs.ram_gb or specs.processor))
+                )
+                if not strong_identity_without_brand:
+                    return QualityGateResult(False, "Electronics: No brand detected", identity_score)
+
+            if not any([specs.model, specs.product_line, specs.storage_gb, specs.ram_gb, specs.processor]):
+                return QualityGateResult(
+                    False,
+                    "Electronics: No model/storage/RAM/processor info",
+                    identity_score,
+                )
     
     # Watches: need brand + (product_line OR model)
     if category_type == ProductCategoryType.WATCHES:
-        if not specs.brand:
+        if not specs.brand and not any([specs.model, specs.product_line]):
             return QualityGateResult(False, "Watch: No brand detected", identity_score)
         if not any([specs.model, specs.product_line]):
             # Check if title has at least a series name
@@ -2132,6 +2473,22 @@ async def save_matched_product(
         # Step 2: FORCE fingerprint to match DB product
         existing_fp = db_product.fingerprint
         enriched._cached_fingerprint = existing_fp
+
+        # Keep variant/base fingerprints aligned so product_service links to the same master product.
+        db_variant_fp = getattr(db_product, "variant_fingerprint", None) or existing_fp
+        db_base_fp = getattr(db_product, "base_fingerprint", None)
+        if db_variant_fp:
+            enriched._cached_variant_fingerprint = db_variant_fp
+        if db_base_fp:
+            enriched._cached_base_fingerprint = db_base_fp
+
+        # Preserve source variant metadata when incoming extraction is sparse/noisy.
+        if getattr(db_product, "variant_type", None):
+            enriched.variant_type = db_product.variant_type
+        if getattr(db_product, "storage_gb", None):
+            enriched.storage_gb = db_product.storage_gb
+        if getattr(db_product, "color", None):
+            enriched.color = db_product.color
         
         # Override AI essence to match source
         if db_product.ai_metadata and db_product.ai_metadata.get("essence"):
@@ -2160,6 +2517,7 @@ async def scrape_platform(
     query: str,
     db,
     source_specs: ProductSpecs,
+    source_master_group: Optional[str],
     source_essence: str,
     db_product: Product,
     use_ai: bool,
@@ -2231,7 +2589,8 @@ async def scrape_platform(
                 s_title, 
                 s_price, 
                 full_title=s_title,
-                category=db_product.category
+                category=db_product.category,
+                master_group=source_master_group,
             )
             target_specs.full_title = s_title
             
@@ -2465,14 +2824,21 @@ async def process_orphan_products(
                 except Exception:
                     existing_platform = None
             
-            # Determine category type
-            category_type = determine_category_type(db_product.category, db_product.title)
+            # Determine canonical master group and effective category type.
+            master_group = infer_master_catalog_group(db_product.title, db_product.category)
+            category_type = determine_category_type(
+                db_product.category,
+                db_product.title,
+                master_group=master_group,
+            )
             
             # Build available platforms
-            try:
-                cat_enum = ProductCategory(db_product.category.lower()) if db_product.category else ProductCategory.GENERAL
-            except (ValueError, AttributeError):
-                cat_enum = ProductCategory.GENERAL
+            cat_enum = MASTER_GROUP_TO_ROUTING_CATEGORY.get(master_group)
+            if cat_enum is None:
+                try:
+                    cat_enum = ProductCategory(db_product.category.lower()) if db_product.category else ProductCategory.GENERAL
+                except (ValueError, AttributeError):
+                    cat_enum = ProductCategory.GENERAL
             
             available = ProductCategory.get_platforms_for_category(cat_enum)
             available = [p for p in available if p in MinerConfig.SUPPORTED_PLATFORMS]
@@ -2498,10 +2864,12 @@ async def process_orphan_products(
                 db_product.title, 
                 source_price, 
                 full_title=db_product.title,
-                category=db_product.category
+                category=db_product.category,
+                master_group=master_group,
             )
             source_specs.full_title = db_product.title
             source_specs.category_type = category_type
+            source_specs.master_group = master_group
             
             # Get source essence
             source_essence = ""
@@ -2515,9 +2883,16 @@ async def process_orphan_products(
                 x in db_product.title.lower() 
                 for x in ['headphone', 'earphone', 'earbuds', 'speaker', 'charger', 'cable']
             )
+            if master_group in MASTER_ACCESSORY_GROUPS:
+                source_is_accessory_category = True
             
             # QUALITY GATE CHECK
-            quality_result = check_quality_gate(db_product.title, source_specs, category_type)
+            quality_result = check_quality_gate(
+                db_product.title,
+                source_specs,
+                category_type,
+                master_group=master_group,
+            )
             
             if not quality_result.passed:
                 stats.quality_gate_skipped += 1
@@ -2530,6 +2905,7 @@ async def process_orphan_products(
             
             if verbose:
                 print(f"  📊 Category: {category_type.value.upper()}")
+                print(f"  📊 Master Group: {(master_group or 'unmapped').upper()}")
                 print(f"  📊 Brand={source_specs.brand or '?'} | Line={source_specs.product_line or '?'} | Model={source_specs.model or '?'}")
                 print(f"  📊 RAM={source_specs.ram_gb or '?'}GB | Storage={source_specs.storage_gb or '?'}GB | Screen={source_specs.screen_size or '?'}\"")
                 print(f"  📊 Variant={source_specs.generation or 'Std'} | Price=₹{source_price or '?'}")
@@ -2553,6 +2929,7 @@ async def process_orphan_products(
                             query=query,
                             db=db,
                             source_specs=source_specs,
+                            source_master_group=master_group,
                             source_essence=source_essence,
                             db_product=db_product,
                             use_ai=use_ai,
@@ -2587,6 +2964,7 @@ async def process_orphan_products(
                         query=query,
                         db=db,
                         source_specs=source_specs,
+                        source_master_group=master_group,
                         source_essence=source_essence,
                         db_product=db_product,
                         use_ai=use_ai,

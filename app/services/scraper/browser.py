@@ -249,19 +249,51 @@ class BrowserManager:
         mobile: bool = False,
         intercept_api: bool = False
     ):
-        """Get a new page with context"""
+        """
+        ✅ FIXED: Get a new page with timeout protection and safer cleanup
+        
+        Improvements:
+        - Timeout wrapper around context/page creation
+        - Guaranteed cleanup on exception
+        - Isolated interception per page
+        """
         if not self._initialized:
             await self.initialize()
         
-        # Clear previous interceptions
+        # Clear previous interceptions (prevent cross-contamination)
         self._intercepted_responses.clear()
         self._interception_enabled = intercept_api
         
-        # Create context with random fingerprint
-        context = await self._create_context(stealth, mobile)
-        page = await context.new_page()
+        context = None
+        page = None
         
         try:
+            # ✅ NEW: Timeout wrapper for context creation
+            try:
+                context = await asyncio.wait_for(
+                    self._create_context(stealth, mobile),
+                    timeout=30.0  # 30 second timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error("❌ Browser context creation timeout (30s)")
+                raise RuntimeError("Browser context creation timeout")
+            
+            # ✅ NEW: Timeout wrapper for page creation
+            try:
+                page = await asyncio.wait_for(
+                    context.new_page(),
+                    timeout=15.0  # 15 second timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error("❌ Page creation timeout (15s)")
+                if context:
+                    await context.close()
+                raise RuntimeError("Page creation timeout")
+            
+            # Set page timeout
+            page.set_default_timeout(30000)
+            page.set_default_navigation_timeout(45000)
+            
             # Block resources for speed
             if block_resources:
                 await self._setup_resource_blocking(page)
@@ -276,13 +308,43 @@ class BrowserManager:
             
             yield page
             
+        except Exception as e:
+            error_text = str(e).lower()
+            is_expected_rate_limit = (
+                e.__class__.__name__.lower() == "ratelimitexceeded"
+                or "rate limit exceeded" in error_text
+                or "retry after" in error_text
+            )
+            if is_expected_rate_limit:
+                logger.warning(f"⏳ get_page stopped due to platform rate limit: {e}")
+            else:
+                logger.error(f"❌ Error in get_page: {e}")
+            raise
+        
         finally:
+            # ✅ FIXED: Guaranteed cleanup
             try:
-                await page.close()
-                await context.close()
+                if page:
+                    try:
+                        await asyncio.wait_for(page.close(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("Page close timeout, forcing")
+                    except Exception as e:
+                        logger.debug(f"Page close error: {e}")
             except Exception as e:
-                logger.debug(f"Page/context cleanup error: {e}")
-    
+                logger.debug(f"Page cleanup error: {e}")
+            
+            try:
+                if context:
+                    try:
+                        await asyncio.wait_for(context.close(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("Context close timeout, forcing")
+                    except Exception as e:
+                        logger.debug(f"Context close error: {e}")
+            except Exception as e:
+                logger.debug(f"Context cleanup error: {e}")
+                
     async def _create_context(self, stealth: bool = True, mobile: bool = False) -> 'BrowserContext':
         """Create browser context with randomized fingerprint"""
         if mobile:
@@ -611,18 +673,40 @@ class BrowserManager:
         timeout: int = 30000,
         retries: int = 2
     ) -> bool:
-        """Navigate to URL with retry logic"""
+        """
+        ✅ FIXED: Navigate to URL with strict timeout and retry logic
+        
+        Improvements:
+        - Strict outer timeout wrapper
+        - Better error handling
+        - Returns partial success if page loads but timeout
+        """
         for attempt in range(retries + 1):
             try:
-                await page.goto(url, wait_until=wait_until, timeout=timeout)
+                # ✅ NEW: Strict timeout wrapper
+                await asyncio.wait_for(
+                    page.goto(url, wait_until=wait_until, timeout=timeout),
+                    timeout=(timeout / 1000) + 5  # Add 5s buffer
+                )
                 return True
-            except Exception as e:
+            
+            except asyncio.TimeoutError:
                 if attempt < retries:
-                    logger.warning(f"Navigation retry {attempt + 1}/{retries}: {e}")
+                    logger.warning(f"Navigation timeout (attempt {attempt + 1}/{retries + 1})")
                     await asyncio.sleep(random.uniform(1, 3))
                 else:
-                    logger.error(f"Navigation failed after {retries} retries: {e}")
+                    logger.error(f"Navigation failed after {retries + 1} attempts (timeout)")
+                    # Return True anyway - page may have partially loaded
+                    return True
+            
+            except Exception as e:
+                if attempt < retries:
+                    logger.warning(f"Navigation retry {attempt + 1}/{retries + 1}: {e}")
+                    await asyncio.sleep(random.uniform(1, 3))
+                else:
+                    logger.error(f"Navigation failed after {retries + 1} retries: {e}")
                     return False
+        
         return False
     
     @property

@@ -336,10 +336,40 @@ class PriceHistoryResponse(BaseModel):
     product_id: str  # ✅ UUID as string
     platform: Platform
     history: List[PriceHistoryPoint]
+    data_points_count: int = 0
+    history_span_days: int = 0
     lowest_price: Decimal
     highest_price: Decimal
     average_price: Decimal
     price_drop_percentage: Optional[Decimal]
+    observed_change_percentage_7d: Optional[Decimal] = Field(
+        default=None,
+        description="Observed price change over the most recent 7-day window",
+    )
+    observed_drop_amount_7d: Optional[Decimal] = Field(
+        default=None,
+        description="Observed rupee drop over the most recent 7-day window when price moved down",
+    )
+    prediction_available: bool = Field(
+        default=False,
+        description="Whether enough historical data exists for trend-based prediction",
+    )
+    predicted_change_percentage_7d: Optional[Decimal] = Field(
+        default=None,
+        description="Trend-only directional signal for next 7 days",
+    )
+    predicted_price_7d: Optional[Decimal] = Field(default=None, description="Model estimate for next 7 days")
+    predicted_price_30d: Optional[Decimal] = Field(default=None, description="Model estimate for next 30 days")
+    predicted_change_percentage_30d: Optional[Decimal] = Field(
+        default=None,
+        description="Projected % change over next 30 days vs current price",
+    )
+    recommendation: Optional[str] = Field(default=None, description="buy_now | wait | watch")
+    confidence_score: Optional[Decimal] = Field(default=None, description="Forecast confidence from 0-100")
+    recommendation_reasons: List[str] = Field(default_factory=list)
+    insight_basis: List[str] = Field(default_factory=list)
+    upcoming_sale_event: Optional[str] = Field(default=None, description="Nearest expected India sale event")
+    days_until_sale_event: Optional[int] = Field(default=None, description="Days left for upcoming sale event")
 
 
 # ==================== REFRESH PRICE SCHEMAS ====================
@@ -352,6 +382,10 @@ class PlatformPriceSnapshot(BaseModel):
     discount_percentage: Optional[int]
     in_stock: bool
     last_updated_at: datetime
+    location_applied: bool = False
+    location_scope: Optional[str] = None  # 'global' | 'pincode' | 'state'
+    pincode: Optional[str] = None
+    state: Optional[str] = None
 
 
 class RefreshPriceResponse(BaseModel):
@@ -365,6 +399,29 @@ class RefreshPriceResponse(BaseModel):
     price_change: Optional[Decimal] = None  # How much changed since last update
     refresh_in_progress: bool = False
     can_refresh_again_at: Optional[datetime] = None  # When can user refresh again
+
+
+class LocationPriceRefreshRequest(BaseModel):
+    """Request payload for location-aware live refresh"""
+    pincode: str = Field(..., pattern=r"^\d{6}$", description="Indian pincode")
+    state: Optional[str] = Field(default=None, min_length=2, max_length=60)
+    platform: Optional[Platform] = None
+    force_refresh: bool = False
+
+
+class LocationRefreshPriceResponse(BaseModel):
+    """Response for location-aware refresh with cache metadata"""
+    product_id: str
+    pincode: str
+    state: Optional[str] = None
+    best_price: Decimal
+    best_platform: Platform
+    all_platforms: List[PlatformPriceSnapshot]
+    last_updated_at: datetime
+    freshness_status: str
+    cache_hit: bool = False
+    location_applied_platforms: int = 0
+    message: Optional[str] = None
 
 
 # ==================== WATCHLIST SCHEMAS ====================

@@ -116,20 +116,22 @@ class MyntraScraper(BasePlatformHandler):
         filters: Optional[Dict[str, Any]] = None
     ) -> SearchResult:
         """
-        Search products on Myntra with API interception
-        
-        Strategy:
-        1. Navigate to search URL
-        2. Intercept JSON search results
-        3. Fallback to __NEXT_DATA__ or DOM if interception fails
+        ✅ FIXED: Search with API interception + full diagnostics
         """
         start_time = datetime.utcnow()
         filters = filters or {}
         
+        # ✅ NEW: Extraction diagnostics
+        extraction_attempts = {
+            "api_intercepted": {"attempted": False, "success": False, "error": None, "count": 0},
+            "next_data": {"attempted": False, "success": False, "error": None, "count": 0},
+            "dom": {"attempted": False, "success": False, "error": None, "count": 0},
+            "ai_healed": {"attempted": False, "success": False, "error": None, "count": 0},
+        }
+        
         try:
             await self.rate_limiter.acquire("myntra")
             
-            # Myntra uses path-based search
             search_query = query.replace(" ", "-").lower()
             search_url = f"{self.BASE_URL}/{search_query}"
             if page > 1:
@@ -141,55 +143,162 @@ class MyntraScraper(BasePlatformHandler):
             products = []
             extraction_method = ExtractionMethod.DOM_SELECTOR
             
-            # 🚀 USE API INTERCEPTION
             async with browser.get_page(
-                block_resources=False,  # Need to load JS for API calls
+                block_resources=False,
                 stealth=True,
-                intercept_api=True  # Enable interception!
+                intercept_api=True
             ) as page_obj:
                 
-                # Set interception patterns
                 browser.set_interception_patterns(self.API_PATTERNS)
                 
-                # Navigate
                 await browser.safe_goto(page_obj, search_url, wait_until='networkidle', timeout=45000)
-                
-                # Wait for API calls to complete
                 await page_obj.wait_for_timeout(3000)
-                
-                # Scroll to trigger lazy loading
                 await browser.scroll_page(page_obj, scroll_count=3)
                 await page_obj.wait_for_timeout(2000)
                 
-                # 🚀 STRATEGY 1: Get intercepted JSON
-                search_json = browser.get_intercepted_json('/search/') or browser.get_intercepted_json('/api/')
+                # ========================================
+                # TIER 1: API Interception
+                # ========================================
+                extraction_attempts["api_intercepted"]["attempted"] = True
+                tier1_start = time.time()
                 
-                if search_json:
-                    logger.info("✅ Extracted search results from intercepted JSON")
-                    products = self._parse_search_json(search_json)
-                    extraction_method = ExtractionMethod.API_INTERCEPTED
-                
-                # 🔄 STRATEGY 2: Try __NEXT_DATA__
-                if not products:
-                    logger.info("🔄 Trying __NEXT_DATA__ extraction...")
-                    html_content = await page_obj.content()
-                    next_data = await self.extract_from_next_data(html_content)
+                try:
+                    search_json = browser.get_intercepted_json('/search/') or browser.get_intercepted_json('/api/')
                     
-                    if next_data:
-                        products = self._parse_next_data_search(next_data)
-                        extraction_method = ExtractionMethod.NEXT_DATA
-                        logger.info(f"✅ Extracted {len(products)} products from __NEXT_DATA__")
+                    if search_json:
+                        products = self._parse_search_json(search_json)
+                        extraction_attempts["api_intercepted"]["count"] = len(products)
+                        extraction_attempts["api_intercepted"]["duration_ms"] = int((time.time() - tier1_start) * 1000)
+                        
+                        if products:
+                            extraction_attempts["api_intercepted"]["success"] = True
+                            extraction_method = ExtractionMethod.API_INTERCEPTED
+                            logger.info(f"✅ TIER 1 (API): {len(products)} products")
+                        else:
+                            extraction_attempts["api_intercepted"]["error"] = "JSON parsed but no products"
+                    else:
+                        extraction_attempts["api_intercepted"]["error"] = "No JSON intercepted"
+                except Exception as e:
+                    extraction_attempts["api_intercepted"]["error"] = str(e)[:200]
                 
-                # 🔄 STRATEGY 3: Fallback to DOM scraping
+                # ========================================
+                # TIER 2: __NEXT_DATA__
+                # ========================================
                 if not products:
-                    logger.warning("⚠️ API interception failed, using DOM fallback")
-                    products = await self._extract_search_dom(page_obj)
-                    extraction_method = ExtractionMethod.DOM_SELECTOR
+                    extraction_attempts["next_data"]["attempted"] = True
+                    tier2_start = time.time()
+                    
+                    logger.info("🔄 Trying __NEXT_DATA__ extraction...")
+                    
+                    try:
+                        html_content = await page_obj.content()
+                        next_data = await self.extract_from_next_data(html_content)
+                        
+                        if next_data:
+                            products = self._parse_next_data_search(next_data)
+                            extraction_attempts["next_data"]["count"] = len(products)
+                            extraction_attempts["next_data"]["duration_ms"] = int((time.time() - tier2_start) * 1000)
+                            
+                            if products:
+                                extraction_attempts["next_data"]["success"] = True
+                                extraction_method = ExtractionMethod.NEXT_DATA
+                                logger.info(f"✅ TIER 2 (NEXT_DATA): {len(products)} products")
+                            else:
+                                extraction_attempts["next_data"]["error"] = "__NEXT_DATA__ parsed but no products"
+                        else:
+                            extraction_attempts["next_data"]["error"] = "No __NEXT_DATA__ found"
+                    except Exception as e:
+                        extraction_attempts["next_data"]["error"] = str(e)[:200]
+                
+                # ========================================
+                # TIER 3: DOM Fallback
+                # ========================================
+                if not products:
+                    extraction_attempts["dom"]["attempted"] = True
+                    tier3_start = time.time()
+                    
+                    logger.warning("⚠️ API/NEXT_DATA failed, using DOM fallback")
+                    
+                    try:
+                        products = await self._extract_search_dom(page_obj)
+                        extraction_attempts["dom"]["count"] = len(products)
+                        extraction_attempts["dom"]["duration_ms"] = int((time.time() - tier3_start) * 1000)
+                        
+                        if products:
+                            extraction_attempts["dom"]["success"] = True
+                            extraction_method = ExtractionMethod.DOM_SELECTOR
+                            logger.info(f"✅ TIER 3 (DOM): {len(products)} products")
+                        else:
+                            extraction_attempts["dom"]["error"] = "DOM extraction returned no products"
+                    except Exception as e:
+                        extraction_attempts["dom"]["error"] = str(e)[:200]
+                
+                # ========================================
+                # TIER 4: AI Healing (last resort)
+                # ========================================
+                if not products:
+                    extraction_attempts["ai_healed"]["attempted"] = True
+                    tier4_start = time.time()
+                    
+                    logger.warning("⚠️ All standard methods failed, trying AI healing...")
+                    
+                    try:
+                        healed_product = await self._extract_search_with_ai_healing(page_obj)
+                        extraction_attempts["ai_healed"]["duration_ms"] = int((time.time() - tier4_start) * 1000)
+                        
+                        if healed_product:
+                            extraction_attempts["ai_healed"]["count"] = 1
+                            extraction_attempts["ai_healed"]["success"] = True
+                            products = [healed_product]
+                            extraction_method = ExtractionMethod.AI_HEALED
+                            logger.info("✅ TIER 4 (AI HEALED): 1 product recovered")
+                        else:
+                            extraction_attempts["ai_healed"]["error"] = "AI healing returned no product"
+                    except Exception as e:
+                        extraction_attempts["ai_healed"]["error"] = str(e)[:200]
+                
+                # ✅ NEW: Log comprehensive failure
+                if not products:
+                    logger.error(
+                        f"❌ ALL EXTRACTION METHODS FAILED for Myntra search '{query}'\n"
+                        f"Diagnostics:\n"
+                        f"  TIER 1 (API): {extraction_attempts['api_intercepted']}\n"
+                        f"  TIER 2 (NEXT_DATA): {extraction_attempts['next_data']}\n"
+                        f"  TIER 3 (DOM): {extraction_attempts['dom']}\n"
+                        f"  TIER 4 (AI): {extraction_attempts['ai_healed']}"
+                    )
+            
+            # ✅ NEW: Validate products
+            validated_products = []
+            validation_failures = 0
+            
+            for product in products:
+                try:
+                    product.validate()
+                    validated_products.append(product)
+                except ValueError as e:
+                    validation_failures += 1
+                    logger.warning(f"Product validation failed: {e}")
+            
+            extraction_attempts["_validation"] = {
+                "total": len(products),
+                "valid": len(validated_products),
+                "failed": validation_failures
+            }
+            
+            products = validated_products
             
             await self.rate_limiter.record_success("myntra")
             self.record_success()
             
             search_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            
+            extraction_attempts["_summary"] = {
+                "total_attempts": sum(1 for v in extraction_attempts.values() if isinstance(v, dict) and v.get("attempted")),
+                "successful_tiers": sum(1 for v in extraction_attempts.values() if isinstance(v, dict) and v.get("success")),
+                "final_method": extraction_method.value,
+                "final_count": len(products)
+            }
             
             logger.info(f"✅ Myntra search complete: {len(products)} products ({extraction_method.value})")
             
@@ -202,6 +311,7 @@ class MyntraScraper(BasePlatformHandler):
                 has_more=len(products) >= 15,
                 search_time_ms=search_time,
                 extraction_method=extraction_method,
+                metadata=extraction_attempts,
                 success=True
             )
         
@@ -210,19 +320,24 @@ class MyntraScraper(BasePlatformHandler):
                 query=query,
                 platform_name="myntra",
                 success=False,
-                error_message=f"Rate limited: {e.retry_after}s"
+                error_message=f"Rate limited: {e.retry_after}s",
+                metadata=extraction_attempts
             )
         
         except Exception as e:
             logger.error(f"❌ Myntra search error: {e}")
             await self.rate_limiter.record_failure("myntra", ThreatLevel.WARNING)
+            
+            extraction_attempts["_fatal_error"] = str(e)[:500]
+            
             return SearchResult(
                 query=query,
                 platform_name="myntra",
                 success=False,
-                error_message=str(e)
+                error_message=str(e),
+                metadata=extraction_attempts
             )
-    
+        
     def _parse_search_json(self, json_data: Dict[str, Any]) -> List[ProductData]:
         """Parse intercepted search JSON response"""
         products = []

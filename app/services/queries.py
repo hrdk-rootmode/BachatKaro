@@ -487,6 +487,67 @@ class QueryService:
             .limit(limit)
         )
         return result.scalars().all()
+
+    async def get_cross_platform_products(
+        self,
+        limit: int = 10,
+        min_platforms: int = 2,
+    ) -> List[Tuple[Product, int]]:
+        """
+        Get products present on multiple platforms.
+
+        Args:
+            limit: Max products to return
+            min_platforms: Minimum distinct platform count
+
+        Returns:
+            List of tuples: (Product, distinct_platform_count)
+        """
+        min_platforms = max(2, int(min_platforms or 2))
+        limit = max(1, int(limit or 10))
+
+        self.logger.debug(
+            f"Query: get_cross_platform_products(limit={limit}, min_platforms={min_platforms})"
+        )
+
+        platform_stats = (
+            select(
+                ProductListing.product_id.label("product_id"),
+                func.count(func.distinct(ProductListing.platform_id)).label("platform_count"),
+                func.max(
+                    func.coalesce(
+                        ProductListing.last_scraped,
+                        ProductListing.last_price_change_at,
+                        ProductListing.created_at,
+                    )
+                ).label("last_listing_activity"),
+            )
+            .where(
+                ProductListing.in_stock == True,
+                ProductListing.current_price.isnot(None),
+            )
+            .group_by(ProductListing.product_id)
+            .having(func.count(func.distinct(ProductListing.platform_id)) >= min_platforms)
+            .subquery()
+        )
+
+        result = await self.db.execute(
+            select(Product, platform_stats.c.platform_count)
+            .join(platform_stats, Product.id == platform_stats.c.product_id)
+            .where(
+                Product.image_url.isnot(None),
+                Product.title.isnot(None),
+            )
+            .order_by(
+                platform_stats.c.platform_count.desc(),
+                platform_stats.c.last_listing_activity.desc(),
+                func.coalesce(Product.updated_at, Product.created_at).desc(),
+            )
+            .limit(limit)
+        )
+
+        rows = result.all()
+        return [(row[0], int(row[1] or 0)) for row in rows]
     
     # ========================================================================
     # USER QUERIES

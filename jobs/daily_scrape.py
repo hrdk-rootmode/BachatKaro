@@ -19,6 +19,7 @@ Version: 2.0 (Cleaned & Enhanced)
 import logging
 import asyncio
 import random
+import re
 import pytz
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional
@@ -78,6 +79,100 @@ _RUN_LOCK = asyncio.Lock()
 # MAIN JOB FUNCTION
 # =============================================================================
 
+def is_rate_limit_or_block(
+    error: Exception = None,
+    error_text: str = None,
+    status_code: int = None,
+    headers: Dict[str, str] = None
+) -> bool:
+    """
+    ✅ NEW: Enhanced rate limit/block detection
+    
+    Checks multiple signals:
+    - HTTP status codes (429, 503, 520, 522, 524)
+    - Retry-After header
+    - X-RateLimit headers
+    - Error text patterns
+    - Captcha/challenge HTML
+    
+    Args:
+        error: Exception object
+        error_text: Error message text
+        status_code: HTTP status code
+        headers: Response headers dict
+    
+    Returns:
+        True if rate limited or blocked
+    """
+    # 1. Check HTTP status codes
+    if status_code in [429, 503, 520, 522, 524]:
+        return True
+    
+    # 2. Check Retry-After header (standard)
+    if headers:
+        if 'Retry-After' in headers or 'retry-after' in headers:
+            return True
+        
+        # Check X-RateLimit-Remaining
+        remaining = headers.get('X-RateLimit-Remaining') or headers.get('x-ratelimit-remaining')
+        if remaining is not None:
+            try:
+                if int(remaining) == 0:
+                    return True
+            except (ValueError, TypeError):
+                pass
+    
+    # 3. Check error text patterns
+    if error_text:
+        error_lower = error_text.lower()
+        rate_limit_keywords = [
+            "rate limit", "429", "burst limit", "too many requests",
+            "cooling down", "please slow down", "too many login attempts",
+            "captcha", "challenge", "verify you're human", "403 forbidden",
+            "access denied", "blocked", "bot detection", "cloudflare",
+            "akamai", "perimeter", "security check"
+        ]
+        if any(keyword in error_lower for keyword in rate_limit_keywords):
+            return True
+    
+    # 4. Check exception type
+    if error:
+        error_str = str(error).lower()
+        if any(keyword in error_str for keyword in ["rate limit", "too many", "captcha", "blocked"]):
+            return True
+        
+        # Check exception class name
+        error_class = error.__class__.__name__.lower()
+        if "ratelimit" in error_class or "throttle" in error_class:
+            return True
+    
+    return False
+
+
+def _extract_retry_after_seconds(error: Exception = None, error_text: str = None) -> Optional[int]:
+    """Extract retry-after seconds from exception metadata or message text."""
+    if error is not None:
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is not None:
+            try:
+                return max(1, int(retry_after))
+            except (TypeError, ValueError):
+                pass
+
+    text = error_text or (str(error) if error is not None else "")
+    if not text:
+        return None
+
+    match = re.search(r"retry\s*after\s*(\d+)\s*s?", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    match = re.search(r"cool(?:ing)?\s*down\s*for\s*(\d+)\s*s?", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    return None
+
 def _platform_interval_minutes(platform_name: str) -> int:
     """Get base interval in minutes for a platform."""
     return PLATFORM_INTERVAL_MINUTES.get(platform_name.lower(), DEFAULT_INTERVAL_MINUTES)
@@ -131,6 +226,7 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
         "products_updated": 0,
         "products_failed": 0,
         "price_changes": 0,
+        "history_records": 0,
         "platforms": {},
         "errors": [],
         "duration_seconds": 0
@@ -183,6 +279,7 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
                     stats["products_updated"] += platform_stats["updated"]
                     stats["products_failed"] += platform_stats["failed"]
                     stats["price_changes"] += platform_stats["price_changes"]
+                    stats["history_records"] += platform_stats.get("history_records", 0)
 
                     if platform_stats.get("errors"):
                         stats["errors"].extend(platform_stats["errors"][:5])
@@ -312,30 +409,58 @@ def _group_by_platform(
     return grouped
 
 
+def _apply_platform_cooldown(
+    listings: List[ProductListing],
+    start_index: int,
+    cooldown_until: datetime,
+    reason: str,
+) -> None:
+    """Set next scrape time for current and remaining listings of a blocked platform."""
+    for pending in listings[start_index:]:
+        pending.next_scrape_at = cooldown_until
+        if not pending.last_error:
+            pending.last_error = reason[:500]
+
+
 async def _scrape_platform(
     db: AsyncSession,
     platform_name: str,
     listings: List[ProductListing],
     watchlisted_product_ids: set,
 ) -> Dict[str, Any]:
-    """Scrape all listings for a single platform with rate limiting"""
+    """
+    ✅ FIXED: Better error tracking - separate product vs platform failures
+    
+    Scrapes all listings for a platform with smart error handling:
+    - Tracks consecutive_general_errors and consecutive_rate_limits separately
+    - Skips individual products on transient errors (not whole platform)
+    - Only skips platform after 5 consecutive rate limits
+    - Uses enhanced rate limit detection
+    """
     logger.info(f"📱 Scraping {platform_name}: {len(listings)} products")
     
     stats = {
         "scraped": 0,
         "updated": 0,
         "failed": 0,
+        "history_records": 0,
         "marked_out_of_stock": 0,
         "skipped_low_confidence": 0,
+        "skipped_products": 0,  # NEW: Track skipped products
         "price_changes": 0,
         "errors": []
     }
     
-    consecutive_errors = 0
+    # ✅ NEW: Separate error tracking
+    consecutive_general_errors = 0
+    consecutive_rate_limits = 0
+    max_rate_limits_before_platform_skip = 5
     
     for i, listing in enumerate(listings, 1):
         now_utc = datetime.now(pytz.UTC)
         is_watchlisted = listing.product_id in watchlisted_product_ids
+        
+        # Skip low confidence products
         min_confidence = float(getattr(settings, "MIN_LISTING_CONFIDENCE", 0.6))
         if listing.extraction_confidence is not None and listing.extraction_confidence < min_confidence:
             stats["skipped_low_confidence"] += 1
@@ -347,22 +472,27 @@ async def _scrape_platform(
                 error_streak=0,
             )
             continue
-
-        # Skip platform if too many errors
-        if consecutive_errors >= MAX_ERRORS_BEFORE_SKIP:
-            logger.warning(f"⚠️ Skipping {platform_name} after {consecutive_errors} errors")
-            stats["errors"].append(f"Skipped after {consecutive_errors} consecutive errors")
+        
+        # ✅ NEW: Check if too many rate limits (platform-level skip)
+        if consecutive_rate_limits >= max_rate_limits_before_platform_skip:
+            logger.error(
+                f"⚠️ Skipping {platform_name} after {consecutive_rate_limits} "
+                f"consecutive rate limits (platform-level)"
+            )
+            stats["errors"].append(
+                f"Platform skipped after {consecutive_rate_limits} rate limits"
+            )
             break
         
         try:
             # Scrape product price
             previous_in_stock = listing.in_stock
-            new_price, scraped_in_stock = await _scrape_product_price(platform_name, listing)
-
+            new_price, scraped_in_stock = await _scrape_product_price(db, platform_name, listing)
+            
             if scraped_in_stock is not None:
                 listing.in_stock = scraped_in_stock
-
-            # Explicit out-of-stock is a valid scrape result; keep it out of failed bucket.
+            
+            # Handle explicit out-of-stock (valid result)
             if scraped_in_stock is False:
                 listing.last_scraped = now_utc
                 listing.scrape_error_count = 0
@@ -370,6 +500,15 @@ async def _scrape_platform(
                 stock_changed = previous_in_stock is not False
                 if stock_changed:
                     listing.last_price_change_at = now_utc
+
+                if listing.current_price is not None and await _record_price_history(
+                    db,
+                    listing,
+                    float(listing.current_price),
+                    recorded_at=now_utc,
+                ):
+                    stats["history_records"] += 1
+
                 listing.next_scrape_at = _compute_next_scrape_at(
                     platform_name,
                     is_watchlisted=is_watchlisted,
@@ -380,38 +519,44 @@ async def _scrape_platform(
                 stats["scraped"] += 1
                 stats["updated"] += 1
                 stats["marked_out_of_stock"] += 1
-                consecutive_errors = 0
+                
+                # ✅ Reset error counters on success
+                consecutive_general_errors = 0
+                consecutive_rate_limits = 0
                 continue
             
+            # Handle successful price scrape
             if new_price is not None:
                 old_price = listing.current_price
                 price_changed = bool(old_price and abs(float(new_price) - float(old_price)) > 0.01)
+                prev_stock = previous_in_stock if previous_in_stock is not None else True
+                curr_stock = listing.in_stock if listing.in_stock is not None else True
+                stock_changed = bool(prev_stock) != bool(curr_stock)
                 
-                # Update listing
                 listing.last_scraped = now_utc
                 listing.scrape_error_count = 0
                 listing.last_error = None
                 
-                # Check for price change
                 if price_changed:
                     listing.current_price = new_price
                     stats["price_changes"] += 1
                     stats["updated"] += 1
                     listing.last_price_change_at = now_utc
-                    
-                    # Record price history
-                    await _record_price_history(db, listing, new_price)
-                    
-                    logger.debug(
-                        f"💰 Price change: {listing.external_id} "
-                        f"₹{old_price} → ₹{new_price}"
-                    )
+                    logger.debug(f"💰 Price change: {listing.external_id} ₹{old_price} → ₹{new_price}")
                 else:
                     listing.current_price = new_price
                     stats["updated"] += 1
+
+                # Dedupe against last recorded row so baseline can be rebuilt safely.
+                if await _record_price_history(db, listing, new_price, recorded_at=now_utc):
+                    stats["history_records"] += 1
                 
                 stats["scraped"] += 1
-                consecutive_errors = 0
+                
+                # ✅ Reset error counters on success
+                consecutive_general_errors = 0
+                consecutive_rate_limits = 0
+                
                 listing.next_scrape_at = _compute_next_scrape_at(
                     platform_name,
                     is_watchlisted=is_watchlisted,
@@ -419,10 +564,10 @@ async def _scrape_platform(
                     scrape_failed=False,
                     error_streak=0,
                 )
-                
             else:
+                # No price extracted (soft failure)
                 stats["failed"] += 1
-                consecutive_errors += 1
+                stats["skipped_products"] += 1
                 listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
                 listing.last_error = "No price extracted"
                 listing.next_scrape_at = _compute_next_scrape_at(
@@ -432,38 +577,105 @@ async def _scrape_platform(
                     scrape_failed=True,
                     error_streak=listing.scrape_error_count,
                 )
-                
+                consecutive_general_errors += 1
+        
         except Exception as e:
             stats["failed"] += 1
+            stats["skipped_products"] += 1
+            
             error_text = str(e).lower()
-            is_rate_limited = any(
-                token in error_text
-                for token in ["rate limit", "429", "burst limit", "too many requests", "cooling down"]
+            
+            # ✅ NEW: Enhanced rate limit detection
+            is_rate_limited = is_rate_limit_or_block(
+                error=e,
+                error_text=error_text
             )
-
+            
             listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
             listing.last_error = str(e)[:500]
-            listing.next_scrape_at = _compute_next_scrape_at(
-                platform_name,
-                is_watchlisted=is_watchlisted,
-                price_changed=False,
-                scrape_failed=True,
-                error_streak=listing.scrape_error_count,
-            )
-
+            
             if is_rate_limited:
-                # Avoid tripping platform skip too early on burst windows.
-                consecutive_errors = max(0, consecutive_errors - 1)
-                cooldown = RATE_LIMIT_COOLDOWN_SECONDS + random.uniform(10, 30)
-                logger.warning(f"⏳ {platform_name}: rate-limited, backing off for {cooldown:.0f}s")
-                await asyncio.sleep(cooldown)
+                # ✅ NEW: Track rate limits separately
+                consecutive_rate_limits += 1
+                # Don't increment general errors for rate limits
+                consecutive_general_errors = max(0, consecutive_general_errors - 1)
+
+                retry_after_seconds = _extract_retry_after_seconds(error=e, error_text=error_text)
+                cooldown_seconds = max(
+                    RATE_LIMIT_COOLDOWN_SECONDS,
+                    retry_after_seconds if retry_after_seconds is not None else RATE_LIMIT_COOLDOWN_SECONDS,
+                )
+
+                hard_blocked = any(token in error_text for token in [
+                    "blocked", "access denied", "akamai", "captcha", "security check"
+                ])
+
+                jittered_cooldown = cooldown_seconds + random.uniform(5, 20)
+                listing.next_scrape_at = now_utc + timedelta(seconds=jittered_cooldown)
+
+                logger.warning(
+                    f"⏳ {platform_name}: Rate limited on product {listing.external_id}, "
+                    f"backing off {jittered_cooldown:.0f}s (streak: {consecutive_rate_limits})"
+                )
+
+                # Add to error list
+                if len(stats["errors"]) < 10:
+                    stats["errors"].append(f"Rate limit: {listing.external_id}")
+
+                # Hard block or long retry-after: cool down whole platform for this cycle.
+                should_cooldown_platform = (
+                    hard_blocked or
+                    cooldown_seconds >= 600 or
+                    consecutive_rate_limits >= 2
+                )
+
+                if should_cooldown_platform:
+                    platform_cooldown_until = now_utc + timedelta(seconds=jittered_cooldown)
+                    _apply_platform_cooldown(
+                        listings=listings,
+                        start_index=max(0, i - 1),
+                        cooldown_until=platform_cooldown_until,
+                        reason=f"platform_rate_limited:{platform_name}",
+                    )
+
+                    logger.error(
+                        f"🚫 {platform_name}: applying platform cooldown until "
+                        f"{platform_cooldown_until.isoformat()} after rate limit/block"
+                    )
+                    if len(stats["errors"]) < 10:
+                        stats["errors"].append(
+                            f"Platform cooldown applied ({int(jittered_cooldown)}s)"
+                        )
+                    consecutive_rate_limits = max_rate_limits_before_platform_skip
+                    break
+
+                # Keep loop responsive in continuous mode; do not sleep for full retry window.
+                await asyncio.sleep(min(8.0, jittered_cooldown))
             else:
-                consecutive_errors += 1
-            
-            if len(stats["errors"]) < 10:
-                stats["errors"].append(f"{listing.external_id}: {str(e)[:100]}")
-            
-            logger.debug(f"Failed to scrape {listing.external_id}: {e}")
+                # ✅ NEW: Regular error - classify as transient or permanent
+                consecutive_general_errors += 1
+                error_type = type(e).__name__
+                
+                # Transient errors: retry sooner
+                if error_type in ["Timeout", "ConnectionError", "TimeoutError"]:
+                    listing.next_scrape_at = now_utc + timedelta(hours=2)
+                    logger.debug(f"Transient error ({error_type}), retry in 2h")
+                # Permanent errors: retry much later
+                elif error_type in ["ProductNotFound", "InvalidPrice", "ValueError"]:
+                    listing.next_scrape_at = now_utc + timedelta(days=7)
+                    logger.debug(f"Permanent error ({error_type}), retry in 7 days")
+                # Unknown: normal backoff
+                else:
+                    listing.next_scrape_at = _compute_next_scrape_at(
+                        platform_name,
+                        is_watchlisted=is_watchlisted,
+                        price_changed=False,
+                        scrape_failed=True,
+                        error_streak=listing.scrape_error_count,
+                    )
+                
+                if len(stats["errors"]) < 10:
+                    stats["errors"].append(f"{listing.external_id}: {str(e)[:100]}")
         
         # Commit in batches
         if i % BATCH_SIZE == 0:
@@ -473,7 +685,7 @@ async def _scrape_platform(
                 logger.error(f"Batch commit error: {e}")
                 await db.rollback()
         
-        # Rate limiting delay
+        # Rate limiting delay between products
         delay = DELAY_BETWEEN_PRODUCTS + random.uniform(0, 1)
         await asyncio.sleep(delay)
     
@@ -486,13 +698,15 @@ async def _scrape_platform(
     
     logger.info(
         f"   ✅ {platform_name}: Scraped={stats['scraped']}, "
-        f"Updated={stats['updated']}, Failed={stats['failed']}"
+        f"Updated={stats['updated']}, Failed={stats['failed']}, "
+        f"History={stats['history_records']}, "
+        f"Skipped={stats['skipped_products']}, RateLimits={consecutive_rate_limits}"
     )
     
     return stats
 
-
 async def _scrape_product_price(
+    db: AsyncSession,
     platform_name: str,
     listing: ProductListing
 ) -> tuple[Optional[float], Optional[bool]]:
@@ -519,13 +733,27 @@ async def _scrape_product_price(
     try:
         from app.services.scraper.factory import get_platform_handler
         
-        handler = await get_platform_handler(platform_name)
+        handler = await get_platform_handler(platform_name, db=db)
         if not handler:
             return None, None
         
         product_data = await handler.get_product(listing.product_url)
 
         if not product_data:
+            state = {}
+            rate_limiter = getattr(handler, "rate_limiter", None)
+            if rate_limiter and hasattr(rate_limiter, "get_circuit_state"):
+                try:
+                    state = rate_limiter.get_circuit_state(platform_name) or {}
+                except Exception:
+                    state = {}
+
+            state_name = str(state.get("state", "")).lower()
+            state_reason = str(state.get("reason", "")).lower()
+            if state_name == "open" or any(token in state_reason for token in ["retry after", "circuit open", "blocked"]):
+                raise RuntimeError(
+                    f"Platform blocked or rate-limited: {platform_name} circuit={state_name or 'unknown'} reason={state.get('reason', 'n/a')}"
+                )
             return None, None
 
         if getattr(product_data, "in_stock", True) is False:
@@ -544,19 +772,39 @@ async def _scrape_product_price(
 async def _record_price_history(
     db: AsyncSession,
     listing: ProductListing,
-    new_price: float
-):
-    """Record price change in history"""
+    new_price: float,
+    recorded_at: Optional[datetime] = None,
+)-> bool:
+    """Record history row only when price/stock differs from latest stored row."""
     try:
+        latest_result = await db.execute(
+            select(PriceHistory.price, PriceHistory.in_stock)
+            .where(PriceHistory.product_listing_id == listing.id)
+            .order_by(PriceHistory.recorded_at.desc(), PriceHistory.id.desc())
+            .limit(1)
+        )
+        latest_row = latest_result.first()
+
+        normalized_in_stock = listing.in_stock if listing.in_stock is not None else True
+        if latest_row is not None:
+            latest_price_raw, latest_in_stock_raw = latest_row
+            latest_price = float(latest_price_raw) if latest_price_raw is not None else None
+            latest_in_stock = latest_in_stock_raw if latest_in_stock_raw is not None else True
+
+            if latest_price is not None and abs(float(new_price) - latest_price) <= 0.01 and bool(latest_in_stock) == bool(normalized_in_stock):
+                return False
+
         history_entry = PriceHistory(
             product_listing_id=listing.id,
             price=Decimal(str(new_price)),
-            in_stock=listing.in_stock if listing.in_stock is not None else True,
-            recorded_at=datetime.now(pytz.UTC)
+            in_stock=normalized_in_stock,
+            recorded_at=recorded_at or datetime.now(pytz.UTC)
         )
         db.add(history_entry)
+        return True
     except Exception as e:
         logger.debug(f"Failed to record price history: {e}")
+        return False
 
 
 async def _log_scrape_results(
@@ -651,6 +899,7 @@ if __name__ == "__main__":
                     print(f"   Products Scraped: {result.get('products_scraped', 0)}")
                     print(f"   Products Updated: {result.get('products_updated', 0)}")
                     print(f"   Price Changes: {result.get('price_changes', 0)}")
+                    print(f"   History Records: {result.get('history_records', 0)}")
                     print(f"   Failed: {result.get('products_failed', 0)}")
                     print(f"   Duration: {result.get('duration_seconds', 0)}s")
 
@@ -676,6 +925,7 @@ if __name__ == "__main__":
             print(f"   Products Scraped: {result.get('products_scraped', 0)}")
             print(f"   Products Updated: {result.get('products_updated', 0)}")
             print(f"   Price Changes: {result.get('price_changes', 0)}")
+            print(f"   History Records: {result.get('history_records', 0)}")
             print(f"   Failed: {result.get('products_failed', 0)}")
             print(f"   Duration: {result.get('duration_seconds', 0)}s")
             

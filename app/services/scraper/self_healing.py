@@ -461,6 +461,7 @@ class UniversalSelfHealingEngine:
         # Performance tracking
         self._performance_data: Dict[str, Dict[str, Any]] = {}
         self._healing_attempts: Dict[str, int] = {}
+        self._successful_heal_attempts: Dict[str, int] = {}
         self._last_heal_time: Dict[str, datetime] = {}
         
         # Platform learning
@@ -582,18 +583,21 @@ class UniversalSelfHealingEngine:
         # TIER 1: Try primary selector
         primary_result = await self._try_primary_selector(field, test_func)
         if primary_result and primary_result.is_reliable:
+            self._mark_healing_success(field)
             primary_result.healing_time_ms = int((time.time() - start_time) * 1000)
             return primary_result
         
         # TIER 2: Try best healed selector
         best_healed_result = await self._try_best_healed_selector(field, test_func)
         if best_healed_result and best_healed_result.is_reliable:
+            self._mark_healing_success(field)
             best_healed_result.healing_time_ms = int((time.time() - start_time) * 1000)
             return best_healed_result
         
         # TIER 3: Try all healed selectors
         all_healed_result = await self._try_all_healed_selectors(field, test_func)
         if all_healed_result and all_healed_result.is_reliable:
+            self._mark_healing_success(field)
             all_healed_result.healing_time_ms = int((time.time() - start_time) * 1000)
             return all_healed_result
         
@@ -601,6 +605,7 @@ class UniversalSelfHealingEngine:
         if html_snippet and self.ai_available:
             ai_result = await self._try_ai_healing(field, html_snippet, test_func)
             if ai_result and ai_result.is_reliable:
+                self._mark_healing_success(field)
                 ai_result.healing_time_ms = int((time.time() - start_time) * 1000)
                 await self._save_new_healed_selector(field, ai_result.selector, HealingMethod.AI_GENERATED)
                 logger.info(f"🤖 [{self.platform_name}] AI healed {field}: {ai_result.selector[:50]}")
@@ -609,6 +614,7 @@ class UniversalSelfHealingEngine:
         # TIER 5: Fallback strategies
         fallback_result = await self._try_fallback_strategies(field, html_snippet, extract_func)
         if fallback_result and fallback_result.success:
+            self._mark_healing_success(field)
             fallback_result.healing_time_ms = int((time.time() - start_time) * 1000)
             return fallback_result
         
@@ -662,6 +668,10 @@ class UniversalSelfHealingEngine:
                 method=HealingMethod.PRIMARY,
                 confidence=0.8
             )
+
+    def _mark_healing_success(self, field: str) -> None:
+        """Track successful selector resolution per field for current runtime."""
+        self._successful_heal_attempts[field] = self._successful_heal_attempts.get(field, 0) + 1
     
     # =========================================================================
     # TIER 2: BEST HEALED SELECTOR
@@ -1068,9 +1078,13 @@ class UniversalSelfHealingEngine:
                 logger.warning(f"Platform {self.platform_name} not found in database")
                 return False
 
+            total_attempts = sum(self._healing_attempts.values())
+            successful_heals = sum(self._successful_heal_attempts.values())
+            successful_heals = min(successful_heals, total_attempts)
+
             healing_stats = {
-                "total_attempts": sum(self._healing_attempts.values()),
-                "successful_heals": len(self.healed_selectors),
+                "total_attempts": total_attempts,
+                "successful_heals": successful_heals,
                 "fields": {},
                 "last_updated": datetime.utcnow().isoformat(),
             }
@@ -1084,6 +1098,7 @@ class UniversalSelfHealingEngine:
 
                 healing_stats["fields"][field] = {
                     "attempts": self._healing_attempts.get(field, 0),
+                    "successful_heals": self._successful_heal_attempts.get(field, 0),
                     "selectors_count": len(selector_list),
                     "total_successes": total_success,
                     "total_failures": total_fail,

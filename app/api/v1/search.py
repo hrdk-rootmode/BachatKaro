@@ -13,10 +13,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, desc, Integer, cast
 from sqlalchemy.orm import selectinload
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 import hashlib
 import time
 import logging
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -56,11 +57,25 @@ router = APIRouter()
 # HELPER FUNCTIONS
 # =============================================================================
 
-def calculate_search_cache_key(query: str, filters: dict) -> str:
+def calculate_search_cache_key(
+    query: str,
+    filters: dict,
+    page: int = 1,
+    sort_by: str = "relevance"
+) -> str:
     """Generate cache key for search query"""
+    platforms = filters.get('platforms', 'all')
+    if isinstance(platforms, (list, tuple, set)):
+        normalized_platforms = [
+            getattr(platform, "value", str(platform)).lower()
+            for platform in platforms
+        ]
+        platforms = ",".join(sorted(normalized_platforms)) if normalized_platforms else "all"
+
     filter_str = (
-        f"{filters.get('platforms', 'all')}_{filters.get('min_price', 0)}_{filters.get('max_price', 999999)}"
-        f"_{getattr(settings, 'MIN_LISTING_CONFIDENCE', 0.6)}_{getattr(settings, 'CROMA_ENABLED', False)}"
+        f"{platforms}_{filters.get('min_price', 0)}_{filters.get('max_price', 999999)}"
+        f"_{sort_by}_{page}_{getattr(settings, 'MIN_LISTING_CONFIDENCE', 0.6)}"
+        f"_{getattr(settings, 'CROMA_ENABLED', False)}"
     )
     combined = f"{query.lower().strip()}_{filter_str}"
     return f"search:{hashlib.md5(combined.encode()).hexdigest()}"
@@ -81,6 +96,273 @@ def _listing_meets_quality(listing: ProductListing) -> bool:
     return confidence >= min_confidence
 
 
+SEARCH_STOP_WORDS: Set[str] = {
+    "a", "an", "and", "are", "at", "best", "buy", "for", "from", "in",
+    "is", "it", "latest", "new", "of", "on", "or", "price", "the", "to", "with",
+}
+
+
+SEARCH_SYNONYMS: Dict[str, Set[str]] = {
+    "cover": {"case", "backcover", "back", "protector"},
+    "case": {"cover", "backcover"},
+    "phone": {"mobile", "smartphone"},
+    "mobile": {"phone", "smartphone"},
+    "earbuds": {"earphones", "buds"},
+    "charger": {"adapter", "charging"},
+}
+
+
+SEARCH_INTENT_RULES: Dict[str, Dict[str, object]] = {
+    "mobile_accessories": {
+        "query_terms": {
+            "cover", "case", "tempered", "protector", "charger", "cable", "earbuds",
+            "earphones", "airpods", "powerbank", "magsafe", "backcover", "mobile stand",
+        },
+        "product_terms": {
+            "cover", "case", "tempered", "protector", "charger", "cable", "earbuds",
+            "earphones", "airpods", "powerbank", "magsafe", "mobile stand", "holder", "strap",
+        },
+        "category_terms": {"accessories", "mobile accessories", "phone accessories"},
+        "strict": True,
+    },
+    "laptop_accessories": {
+        "query_terms": {
+            "laptop bag", "sleeve", "mouse", "keyboard", "cooling", "dock", "docking",
+            "usb hub", "webcam", "external ssd", "external hard disk", "laptop charger",
+        },
+        "product_terms": {
+            "laptop bag", "sleeve", "mouse", "keyboard", "cooling", "dock", "docking",
+            "usb hub", "webcam", "external ssd", "external hard disk", "laptop charger",
+        },
+        "category_terms": {"accessories", "laptop accessories", "computer accessories"},
+        "strict": True,
+    },
+    "mobiles": {
+        "query_terms": {
+            "iphone", "samsung", "oneplus", "realme", "vivo", "oppo", "xiaomi",
+            "redmi", "pixel", "mobile", "phone", "smartphone",
+        },
+        "product_terms": {
+            "iphone", "samsung", "oneplus", "realme", "vivo", "oppo", "xiaomi",
+            "redmi", "pixel", "mobile", "phone", "smartphone",
+        },
+        "category_terms": {"electronics", "mobiles", "smartphones", "phones"},
+        "strict": False,
+    },
+    "tablets": {
+        "query_terms": {"tablet", "ipad", "tab"},
+        "product_terms": {"tablet", "ipad", "tab"},
+        "category_terms": {"electronics", "tablets"},
+        "strict": False,
+    },
+    "laptops": {
+        "query_terms": {"laptop", "notebook", "macbook", "chromebook", "ultrabook"},
+        "product_terms": {"laptop", "notebook", "macbook", "chromebook", "ultrabook"},
+        "category_terms": {"electronics", "laptops", "computers"},
+        "strict": False,
+    },
+    "fashion": {
+        "query_terms": {"fashion", "shirt", "tshirt", "jeans", "dress", "saree", "kurta", "shoes"},
+        "product_terms": {"fashion", "shirt", "tshirt", "jeans", "dress", "saree", "kurta", "shoes"},
+        "category_terms": {"fashion", "clothing", "apparel"},
+        "strict": False,
+    },
+    "beauty": {
+        "query_terms": {"beauty", "skincare", "makeup", "lipstick", "cleanser", "serum", "sunscreen"},
+        "product_terms": {"beauty", "skincare", "makeup", "lipstick", "cleanser", "serum", "sunscreen"},
+        "category_terms": {"beauty", "cosmetics", "personal care"},
+        "strict": False,
+    },
+    "home_kitchen": {
+        "query_terms": {"home", "kitchen", "cookware", "mixer", "furniture", "vacuum"},
+        "product_terms": {"home", "kitchen", "cookware", "mixer", "furniture", "vacuum"},
+        "category_terms": {"home", "kitchen", "home & kitchen"},
+        "strict": False,
+    },
+    "books": {
+        "query_terms": {"book", "novel", "author", "paperback", "hardcover"},
+        "product_terms": {"book", "novel", "author", "paperback", "hardcover"},
+        "category_terms": {"books"},
+        "strict": False,
+    },
+}
+
+
+def _normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _tokenize_query(query: str) -> List[str]:
+    tokens = [token for token in _normalize_text(query).split(" ") if token]
+    unique_tokens: List[str] = []
+    seen: Set[str] = set()
+
+    for token in tokens:
+        if token in SEARCH_STOP_WORDS:
+            continue
+        if len(token) < 2:
+            continue
+        if token in seen:
+            continue
+        unique_tokens.append(token)
+        seen.add(token)
+
+    return unique_tokens
+
+
+def _term_present(term: str, normalized_text: str) -> bool:
+    term_text = _normalize_text(term)
+    if not term_text:
+        return False
+    return term_text in normalized_text
+
+
+def _expand_query_tokens(tokens: List[str]) -> List[str]:
+    expanded: List[str] = []
+    seen: Set[str] = set()
+
+    for token in tokens:
+        if token not in seen:
+            expanded.append(token)
+            seen.add(token)
+
+        for synonym in SEARCH_SYNONYMS.get(token, set()):
+            synonym_norm = _normalize_text(synonym)
+            if not synonym_norm or synonym_norm in seen:
+                continue
+            expanded.append(synonym_norm)
+            seen.add(synonym_norm)
+
+    return expanded
+
+
+def _build_product_blob(product: Product) -> Dict[str, str]:
+    ai_metadata = product.ai_metadata or {}
+    tags = ai_metadata.get("tags", []) if isinstance(ai_metadata, dict) else []
+
+    title = _normalize_text(product.title)
+    category = _normalize_text(f"{product.category or ''} {product.subcategory or ''}")
+    brand = _normalize_text(product.brand)
+    tags_text = _normalize_text(" ".join(tags) if isinstance(tags, list) else "")
+    essence = _normalize_text(ai_metadata.get("essence") if isinstance(ai_metadata, dict) else "")
+    all_text = _normalize_text(" ".join([title, category, brand, tags_text, essence]))
+
+    return {
+        "title": title,
+        "category": category,
+        "brand": brand,
+        "tags": tags_text,
+        "essence": essence,
+        "all": all_text,
+    }
+
+
+def _detect_intent(tokens: List[str], expanded_tokens: List[str]) -> Optional[str]:
+    query_blob = _normalize_text(" ".join(tokens or expanded_tokens))
+    if not query_blob:
+        return None
+
+    best_intent: Optional[str] = None
+    best_score = 0
+
+    for intent, rule in SEARCH_INTENT_RULES.items():
+        query_terms = rule.get("query_terms", set())
+        score = 0
+
+        for term in query_terms:
+            if _term_present(str(term), query_blob):
+                score += 3
+
+        if score > best_score:
+            best_score = score
+            best_intent = intent
+
+    return best_intent if best_score >= 3 else None
+
+
+def _product_matches_intent(blob: Dict[str, str], intent: Optional[str]) -> bool:
+    if not intent:
+        return True
+
+    rule = SEARCH_INTENT_RULES.get(intent)
+    if not rule:
+        return True
+
+    category_terms = rule.get("category_terms", set())
+    product_terms = rule.get("product_terms", set())
+
+    category_match = any(_term_present(str(term), blob["category"]) for term in category_terms)
+    term_match = any(_term_present(str(term), blob["all"]) for term in product_terms)
+
+    return category_match or term_match
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _calculate_relevance_score(
+    product: Product,
+    query_tokens: List[str],
+    expanded_tokens: List[str],
+    intent: Optional[str]
+) -> Tuple[float, int, bool]:
+    blob = _build_product_blob(product)
+    query_phrase = _normalize_text(" ".join(query_tokens))
+
+    score = 0.0
+    matched_primary_tokens = 0
+    matched_expanded_tokens = 0
+
+    if query_phrase and _term_present(query_phrase, blob["title"]):
+        score += 45
+
+    for token in query_tokens:
+        if _term_present(token, blob["title"]):
+            score += 20
+            matched_primary_tokens += 1
+            continue
+        if _term_present(token, blob["category"]):
+            score += 12
+            matched_primary_tokens += 1
+            continue
+        if _term_present(token, blob["tags"]) or _term_present(token, blob["essence"]):
+            score += 10
+            matched_primary_tokens += 1
+            continue
+        if _term_present(token, blob["brand"]):
+            score += 8
+            matched_primary_tokens += 1
+
+    for token in expanded_tokens:
+        if token in query_tokens:
+            continue
+        if _term_present(token, blob["title"]):
+            score += 8
+            matched_expanded_tokens += 1
+        elif _term_present(token, blob["category"]):
+            score += 5
+            matched_expanded_tokens += 1
+
+    if matched_primary_tokens == 0 and matched_expanded_tokens > 0:
+        matched_primary_tokens = 1
+
+    intent_match = _product_matches_intent(blob, intent)
+    if intent:
+        score += 35 if intent_match else -40
+
+    stats = product.stats or {}
+    score += min(12, (_safe_int(stats.get("searches")) // 15) + (_safe_int(stats.get("views")) // 50))
+
+    return score, matched_primary_tokens, intent_match
+
+
 # =============================================================================
 # DATABASE OPERATIONS
 # =============================================================================
@@ -91,44 +373,109 @@ async def search_database(
     platforms: Optional[List[Platform]] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
+    sort_by: str = "relevance",
     page: int = 1,
     limit: int = 20
-) -> List[Product]:
-    """Search products in database using title field"""
-    search_terms = query.lower().split()
-    
-    # Match against title
-    title_conditions = [
-        Product.title.ilike(f"%{term}%")
-        for term in search_terms
-    ]
-    
-    # ✅ FIXED: Handle empty search terms (fallback to empty query)
-    if not title_conditions:
-        title_conditions = [Product.title.ilike(f"%{query.lower()}%")]
-    
-    query_stmt = select(Product).where(or_(*title_conditions))
-    
-    # Pagination
-    offset = (page - 1) * limit
-    query_stmt = query_stmt.offset(offset).limit(limit)
-    
+) -> Tuple[List[Product], int]:
+    """Search products with intent-aware relevance scoring."""
+    query_tokens = _tokenize_query(query)
+    if not query_tokens:
+        fallback = _normalize_text(query)
+        query_tokens = [fallback] if fallback else []
+
+    expanded_tokens = _expand_query_tokens(query_tokens)
+    detected_intent = _detect_intent(query_tokens, expanded_tokens)
+
+    search_terms = expanded_tokens[:12] or query_tokens[:8]
+    search_conditions = []
+    for term in search_terms:
+        like = f"%{term}%"
+        search_conditions.extend([
+            Product.title.ilike(like),
+            Product.brand.ilike(like),
+            Product.category.ilike(like),
+            Product.subcategory.ilike(like),
+        ])
+
+    if not search_conditions:
+        raw_like = f"%{_normalize_text(query)}%"
+        search_conditions = [Product.title.ilike(raw_like)]
+
+    # Fetch a broader candidate set, then rank in memory.
+    candidate_limit = max(limit * max(page, 1) * 6, 120)
+    query_stmt = (
+        select(Product)
+        .where(or_(*search_conditions))
+        .order_by(Product.created_at.desc())
+        .limit(candidate_limit)
+    )
+
     result = await db.execute(query_stmt)
-    products = result.scalars().all()
-    
-    return list(products)
+    candidates = list(result.scalars().all())
+
+    scored_candidates: List[Tuple[Product, float]] = []
+    for product in candidates:
+        score, matched_token_count, intent_match = _calculate_relevance_score(
+            product=product,
+            query_tokens=query_tokens,
+            expanded_tokens=expanded_tokens,
+            intent=detected_intent,
+        )
+
+        if matched_token_count == 0:
+            continue
+
+        intent_rule = SEARCH_INTENT_RULES.get(detected_intent or "") if detected_intent else None
+        strict_intent = bool(intent_rule and intent_rule.get("strict", False))
+        if strict_intent and not intent_match:
+            continue
+
+        scored_candidates.append((product, score))
+
+    # Graceful fallback for strict intents if nothing matched.
+    if not scored_candidates and detected_intent:
+        for product in candidates:
+            score, matched_token_count, _ = _calculate_relevance_score(
+                product=product,
+                query_tokens=query_tokens,
+                expanded_tokens=expanded_tokens,
+                intent=None,
+            )
+            if matched_token_count > 0:
+                scored_candidates.append((product, score))
+
+    scored_candidates.sort(key=lambda item: item[1], reverse=True)
+    ranked_products = [product for product, _ in scored_candidates]
+
+    total_candidates = len(ranked_products)
+    offset = (page - 1) * limit
+    paged_products = ranked_products[offset:offset + limit]
+
+    logger.info(
+        f"Search intent resolved | Query: {query} | Intent: {detected_intent or 'none'} | "
+        f"Sort: {sort_by} | Candidates: {len(candidates)} | Ranked: {total_candidates} | Page: {page}"
+    )
+
+    return paged_products, total_candidates
 
 
 async def get_product_listings(
     product_id,
     db: AsyncSession,
-    platforms: Optional[List[Platform]] = None
+    platforms: Optional[List[Platform]] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
 ) -> List[ProductListing]:
     """Get all listings for a product (✅ FIXED: Eager load platform relationship)"""
     query = select(ProductListing).where(
         ProductListing.product_id == product_id,
         ProductListing.in_stock == True
     ).options(selectinload(ProductListing.platform))  # ✅ Eager load platform
+
+    if min_price is not None:
+        query = query.where(ProductListing.current_price >= float(min_price))
+    if max_price is not None:
+        query = query.where(ProductListing.current_price <= float(max_price))
     
     query = query.order_by(ProductListing.current_price.asc())
     
@@ -231,6 +578,22 @@ def format_product_response(
         storage_gb=product.storage_gb,
         color=product.color,
         condition=product.condition,
+        # Product base info
+        title=product.title,
+        brand=product.brand,
+        category=product.category,
+        subcategory=product.subcategory,
+        image_url=product.image_url,
+        specifications=product.specifications or {},
+        # Confidence and provenance
+        brand_confidence=product.brand_confidence,
+        brand_source=product.brand_source,
+        color_confidence=product.color_confidence,
+        color_source=product.color_source,
+        specs_confidence=product.specs_confidence,
+        specs_source=product.specs_source,
+        last_enriched_at=product.last_enriched_at,
+        enrichment_version=product.enrichment_version,
         # Pricing
         best_price=best_price,
         best_platform=best_platform,
@@ -240,7 +603,10 @@ def format_product_response(
         ai_generated_essence=ai_metadata.get("essence", product.title),
         ai_extracted_specs=product.specifications or {},
         ai_tags=ai_metadata.get("tags", []),
+        ai_metadata=ai_metadata,
+        stats=product.stats or {},
         created_at=product.created_at,
+        updated_at=product.updated_at,
         listings=[
             format_listing_response(listing, product)
             for listing in listings
@@ -304,11 +670,14 @@ async def scrape_and_match(
     # STEP 3: SAVE TO DATABASE (✅ USING CENTRALIZED SERVICE)
     # =========================================================================
     try:
-        await product_service.save_product(
+        saved_source_product = await product_service.save_product(
             product_data=source_product,
             db=db,
             is_user_search=True  # User-initiated search
         )
+        if saved_source_product:
+            source_product.raw_data = source_product.raw_data or {}
+            source_product.raw_data["db_product_id"] = str(saved_source_product.id)
     except Exception as e:
         logger.error(f"Database save failed (continuing): {e}")
     
@@ -382,7 +751,9 @@ async def format_url_search_response(
     
     return {
         "success": True,
+        "product_id": str(product.id),
         "source": {
+            "product_id": str(product.id),
             "platform": source_platform,
             "title": product.title,
             "price": float(source_listing.current_price) if source_listing else 0,
@@ -392,7 +763,9 @@ async def format_url_search_response(
             "image_url": product.image_url,
             "url": url_detector.get_affiliate_url(source_listing.product_url) if source_listing else source_url,
             "in_stock": source_listing.in_stock if source_listing else True,
-            "brand": product.brand
+            "brand": product.brand,
+            "category": product.category,
+            "subcategory": product.subcategory,
         },
         "alternatives": [
             {
@@ -424,6 +797,43 @@ async def format_url_search_response(
     }
 
 
+async def resolve_product_id_from_source(
+    source_product: ProductData,
+    db: AsyncSession
+) -> Optional[str]:
+    """Resolve saved Product ID from scraped ProductData fingerprints."""
+    variant_fingerprint = None
+    try:
+        variant_fingerprint = source_product.get_variant_fingerprint()
+    except Exception:
+        variant_fingerprint = None
+
+    if variant_fingerprint:
+        variant_result = await db.execute(
+            select(Product.id)
+            .where(Product.variant_fingerprint == variant_fingerprint)
+            .order_by(Product.created_at.desc())
+            .limit(1)
+        )
+        variant_match = variant_result.scalar_one_or_none()
+        if variant_match:
+            return str(variant_match)
+
+    fingerprint = getattr(source_product, "fingerprint", None)
+    if fingerprint:
+        fingerprint_result = await db.execute(
+            select(Product.id)
+            .where(Product.fingerprint == fingerprint)
+            .order_by(Product.created_at.desc())
+            .limit(1)
+        )
+        fingerprint_match = fingerprint_result.scalar_one_or_none()
+        if fingerprint_match:
+            return str(fingerprint_match)
+
+    return None
+
+
 # =============================================================================
 # API ROUTES
 # =============================================================================
@@ -444,14 +854,29 @@ async def search_products(
     filters = {
         'platforms': request.platforms,
         'min_price': request.min_price,
-        'max_price': request.max_price
+        'max_price': request.max_price,
     }
-    cache_key = calculate_search_cache_key(request.query, filters)
+    cache_key = calculate_search_cache_key(
+        query=request.query,
+        filters=filters,
+        page=request.page,
+        sort_by=request.sort_by or "relevance",
+    )
     
     # TIER 1: Check Redis cache
     cached_results = await redis.get_json(cache_key)
     
     if cached_results:
+        if isinstance(cached_results, dict):
+            cached_products = cached_results.get("products", [])
+            cached_total = int(cached_results.get("total_results", len(cached_products)))
+        elif isinstance(cached_results, list):
+            cached_products = cached_results
+            cached_total = len(cached_products)
+        else:
+            cached_products = []
+            cached_total = 0
+
         search_time_ms = int((time.time() - start_time) * 1000)
         logger.info(
             f"Cache HIT: {request.query} | "
@@ -461,20 +886,21 @@ async def search_products(
         
         return SearchResponse(
             query=request.query,
-            total_results=len(cached_results),
+            total_results=cached_total,
             page=request.page,
-            products=cached_results,
+            products=cached_products,
             cache_hit=True,
             search_time_ms=search_time_ms
         )
     
     # TIER 2: Search database
-    products = await search_database(
+    products, total_candidates = await search_database(
         query=request.query,
         db=db,
         platforms=request.platforms,
         min_price=request.min_price,
         max_price=request.max_price,
+        sort_by=request.sort_by or "relevance",
         page=request.page
     )
     
@@ -483,16 +909,34 @@ async def search_products(
         listings = await get_product_listings(
             product.id,
             db,
-            platforms=request.platforms
+            platforms=request.platforms,
+            min_price=request.min_price,
+            max_price=request.max_price,
         )
         
         if listings:
             results.append(format_product_response(product, listings))
+
+    if request.sort_by == "price_low":
+        results.sort(key=lambda p: float(p.best_price or 0))
+    elif request.sort_by == "price_high":
+        results.sort(key=lambda p: float(p.best_price or 0), reverse=True)
+    elif request.sort_by == "rating":
+        results.sort(
+            key=lambda p: max((float(listing.rating or 0) for listing in p.listings), default=0.0),
+            reverse=True,
+        )
+
+    total_results = max(total_candidates, len(results))
     
     if results:
         await redis.set_json(
             cache_key,
-            [r.model_dump(mode='json') for r in results],
+            {
+                "products": [r.model_dump(mode='json') for r in results],
+                "total_results": total_results,
+                "page": request.page,
+            },
             ttl=3600
         )
     
@@ -518,7 +962,7 @@ async def search_products(
     
     return SearchResponse(
         query=request.query,
-        total_results=len(results),
+        total_results=total_results,
         page=request.page,
         products=results,
         cache_hit=False,
@@ -582,7 +1026,13 @@ async def search_by_url(
     # Step 3: Check database cache first
     cache_key = f"url_search:{hashlib.md5(url.encode()).hexdigest()}"
     cached_result = await redis.get_json(cache_key)
-    
+
+    if cached_result and isinstance(cached_result, dict) and isinstance(cached_result.get("source"), str):
+        logger.warning(
+            f"Ignoring legacy malformed URL cache payload for: {url[:50]}"
+        )
+        cached_result = None
+
     if cached_result:
         search_time_ms = int((time.time() - start_time) * 1000)
         logger.info(f"URL search cache HIT: {url[:50]} | Time: {search_time_ms}ms")
@@ -627,7 +1077,7 @@ async def search_by_url(
                 
                 search_time_ms = int((time.time() - start_time) * 1000)
                 response["cache_hit"] = False
-                response["source"] = "database"
+                response["response_origin"] = "database"
                 response["search_time_ms"] = search_time_ms
                 
                 logger.info(
@@ -693,13 +1143,22 @@ async def search_by_url(
         p for p in alternatives
         if p.platform_name != source_product.platform_name
     ]
+
+    source_product_id = None
+    if isinstance(getattr(source_product, "raw_data", None), dict):
+        source_product_id = source_product.raw_data.get("db_product_id")
+
+    if not source_product_id:
+        source_product_id = await resolve_product_id_from_source(source_product, db)
     
     # Calculate savings
     savings_info = cross_platform_matcher.calculate_savings(alternatives)
     
     response = {
         "success": True,
+        "product_id": source_product_id,
         "source": {
+            "product_id": source_product_id,
             "platform": source_product.platform_name,
             "title": source_product.title,
             "price": float(source_product.current_price),
@@ -711,6 +1170,8 @@ async def search_by_url(
             "url": url_detector.get_affiliate_url(source_product.product_url),
             "in_stock": source_product.in_stock,
             "brand": source_product.brand,
+            "category": source_product.category,
+            "subcategory": source_product.subcategory,
             "ai_essence": source_product.ai_essence,
             "ai_tags": source_product.ai_tags,
             "ai_quality_score": source_product.ai_quality_score
@@ -745,7 +1206,7 @@ async def search_by_url(
         "total_options": len(alternatives),
         "fingerprint": source_product.fingerprint,
         "cache_hit": False,
-        "source": "live_scrape"
+        "response_origin": "live_scrape"
     }
     
     # Update user stats

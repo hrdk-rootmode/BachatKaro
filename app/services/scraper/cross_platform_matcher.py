@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # Optional database imports
 try:
     from sqlalchemy.ext.asyncio import AsyncSession
-    from sqlalchemy import select
+    from sqlalchemy import select, or_
     from sqlalchemy.orm import selectinload
     from app.models import Product, ProductListing, Platform as PlatformModel
     DB_AVAILABLE = True
@@ -614,72 +614,116 @@ class CrossPlatformMatcher:
             return []
         
         try:
-            # Fingerprint match
+            # Prefer explicit variant/base fingerprints over generic fingerprint.
+            source_variant_fp = None
+            source_base_fp = None
+            try:
+                source_variant_fp = source_product.get_variant_fingerprint()
+            except Exception:
+                source_variant_fp = None
+
+            try:
+                source_base_fp = source_product.get_base_fingerprint()
+            except Exception:
+                source_base_fp = None
+
+            fingerprint_candidates = set()
+            legacy_fingerprint = getattr(source_product, "_cached_fingerprint", None) or getattr(source_product, "_fingerprint", None)
+            if legacy_fingerprint:
+                fingerprint_candidates.add(str(legacy_fingerprint))
+
+            try:
+                if getattr(source_product, "fingerprint", None):
+                    fingerprint_candidates.add(str(source_product.fingerprint))
+            except Exception:
+                pass
+
+            filters = []
+            if source_variant_fp:
+                filters.append(Product.variant_fingerprint == source_variant_fp)
+                filters.append(Product.fingerprint == source_variant_fp)
+
+            for candidate_fp in fingerprint_candidates:
+                filters.append(Product.fingerprint == candidate_fp)
+
+            if source_base_fp:
+                filters.append(Product.base_fingerprint == source_base_fp)
+
+            if not filters:
+                return []
+
             result = await db.execute(
                 select(Product)
-                .where(Product.fingerprint == source_product.fingerprint)
+                .where(or_(*filters))
                 .options(selectinload(Product.listings))
             )
-            product = result.scalar_one_or_none()
+            products = result.scalars().all()
             
-            if not product:
+            if not products:
                 return []
             
             alternatives = []
+            seen_listing_ids: Set[str] = set()
             
-            for listing in product.listings:
-                platform_result = await db.execute(
-                    select(PlatformModel).where(PlatformModel.id == listing.platform_id)
-                )
-                platform = platform_result.scalar_one_or_none()
-                
-                if not platform or platform.name.lower() in skip_platforms:
-                    continue
-                
-                if not listing.in_stock:
-                    continue
-                
-                # Extract specs from listing
-                target_specs = extract_specs(
-                    product.title,
-                    float(listing.current_price) if listing.current_price else None,
-                    product.category or "general"
-                )
-                
-                # Tier 1: Hard reject
-                passed, reject_reason = self._tier1_spec_reject(
-                    source_specs,
-                    target_specs,
-                    source_title=source_product.title,
-                    target_title=product.title,
-                )
-                if not passed:
-                    logger.debug(f"DB listing rejected: {reject_reason}")
-                    continue
-                
-                alternatives.append(ProductData(
-                    external_id=listing.external_id or str(listing.id),
-                    title=product.title,
-                    current_price=Decimal(str(listing.current_price)),
-                    original_price=Decimal(str(listing.original_price)) if listing.original_price else None,
-                    discount_percent=listing.discount_percent,
-                    product_url=listing.product_url,
-                    platform_name=platform.name,
-                    image_url=product.image_url,
-                    rating=listing.rating,
-                    review_count=listing.review_count,
-                    in_stock=listing.in_stock,
-                    brand=product.brand,
-                    category=product.category,
-                    subcategory=product.subcategory,
-                    specifications=product.specifications or {},
-                    ai_essence=product.ai_metadata.get("essence") if product.ai_metadata else None,
-                    ai_tags=product.ai_metadata.get("tags", []) if product.ai_metadata else [],
-                    ai_quality_score=product.ai_metadata.get("quality_score", 0) if product.ai_metadata else 0,
-                    ai_processed=True,
-                    data_source=HandlerType.SCRAPER,
-                    _fingerprint=product.fingerprint
-                ))
+            for product in products:
+                for listing in product.listings:
+                    listing_id = str(listing.id)
+                    if listing_id in seen_listing_ids:
+                        continue
+
+                    platform_result = await db.execute(
+                        select(PlatformModel).where(PlatformModel.id == listing.platform_id)
+                    )
+                    platform = platform_result.scalar_one_or_none()
+                    
+                    if not platform or platform.name.lower() in skip_platforms:
+                        continue
+                    
+                    if not listing.in_stock:
+                        continue
+                    
+                    # Extract specs from listing
+                    target_specs = extract_specs(
+                        product.title,
+                        float(listing.current_price) if listing.current_price else None,
+                        product.category or "general"
+                    )
+                    
+                    # Tier 1: Hard reject
+                    passed, reject_reason = self._tier1_spec_reject(
+                        source_specs,
+                        target_specs,
+                        source_title=source_product.title,
+                        target_title=product.title,
+                    )
+                    if not passed:
+                        logger.debug(f"DB listing rejected: {reject_reason}")
+                        continue
+                    
+                    alternatives.append(ProductData(
+                        external_id=listing.external_id or str(listing.id),
+                        title=product.title,
+                        current_price=Decimal(str(listing.current_price)),
+                        original_price=Decimal(str(listing.original_price)) if listing.original_price else None,
+                        discount_percent=listing.discount_percent,
+                        product_url=listing.product_url,
+                        platform_name=platform.name,
+                        image_url=product.image_url,
+                        rating=listing.rating,
+                        review_count=listing.review_count,
+                        in_stock=listing.in_stock,
+                        brand=product.brand,
+                        category=product.category,
+                        subcategory=product.subcategory,
+                        specifications=product.specifications or {},
+                        ai_essence=product.ai_metadata.get("essence") if product.ai_metadata else None,
+                        ai_tags=product.ai_metadata.get("tags", []) if product.ai_metadata else [],
+                        ai_quality_score=product.ai_metadata.get("quality_score", 0) if product.ai_metadata else 0,
+                        ai_processed=True,
+                        data_source=HandlerType.SCRAPER,
+                        _fingerprint=product.fingerprint
+                    ))
+                    seen_listing_ids.add(listing_id)
             
             return alternatives
         
