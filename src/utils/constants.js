@@ -13,6 +13,26 @@ import {
   APP_NAME,
   APP_VERSION,
 } from '@env';
+import Constants from 'expo-constants';
+
+const getExpoDevHost = () => {
+  try {
+    const hostUri =
+      Constants?.expoConfig?.hostUri ||
+      Constants?.manifest2?.extra?.expoGo?.debuggerHost ||
+      Constants?.manifest?.debuggerHost ||
+      null;
+
+    if (!hostUri || typeof hostUri !== 'string') return null;
+    return hostUri.split(':')[0] || null;
+  } catch {
+    return null;
+  }
+};
+
+const expoDevHost = getExpoDevHost();
+const autoDetectedBaseUrl = expoDevHost ? `http://${expoDevHost}:8000/api/v1` : null;
+const resolvedApiBaseUrl = autoDetectedBaseUrl || API_BASE_URL || 'http://10.127.4.203:8000/api/v1';
 
 
 // --------------------------------------------
@@ -30,12 +50,13 @@ export const FIREBASE_CONFIG = {
 
 // --------------------------------------------
 // API CONFIGURATION
-// For physical Android device: Use WiFi IP (10.239.221.203)
+// For physical Android device: Use WiFi IP (10.127.4.203)
 // For emulator/localhost: Use 127.0.0.1
 // Run: ipconfig | findstr IPv4
+// Last verified: March 20, 2026
 // --------------------------------------------
 export const API = {
-  BASE_URL: API_BASE_URL || 'http://10.239.221.203:8000/api/v1',
+  BASE_URL: resolvedApiBaseUrl,
   TIMEOUT: 30000, // 30 seconds
   
   // Auth Endpoints
@@ -130,6 +151,23 @@ export const APP = {
 };
 
 // --------------------------------------------
+// STREAK MILESTONES & REWARDS (Part 4)
+// --------------------------------------------
+export const STREAK_MILESTONES = {
+  3:  { duration_hours: 12, tier: 'BASIC', label: '12 Hours Basic Access' },
+  7:  { duration_hours: 24, tier: 'PRO',   label: '24 Hours Pro Access' },
+  14: { duration_hours: 48, tier: 'PRO',   label: '48 Hours Pro Access' },
+  30: { duration_hours: 168, tier: 'PRO',  label: '7 Days Pro Access' },
+};
+
+export const STREAK_MESSAGES = {
+  FIRST_DAY: "Welcome! Start your streak today 🚀",
+  STREAK_ALIVE: "Keep it going! Come back tomorrow 🔥",
+  STREAK_BROKEN: "Your streak was reset. Start fresh today! 💪",
+  MILESTONE_NEAR: (days) => `Only ${days} more day${days > 1 ? 's' : ''} until your next reward! 🎁`,
+};
+
+// --------------------------------------------
 // THEME COLORS
 // --------------------------------------------
 export const COLORS = {
@@ -201,6 +239,7 @@ export const REFERRAL_REWARDS = {
 export const ERROR_MESSAGES = {
   NETWORK_ERROR: 'Network error. Please check your connection.',
   SERVER_ERROR: 'Server error. Please try again later.',
+  TOO_MANY_REQUESTS: 'Too many requests. Please try again in a moment.',
   INVALID_CREDENTIALS: 'Invalid email or password.',
   EMAIL_IN_USE: 'This email is already registered.',
   WEAK_PASSWORD: 'Password must be at least 8 characters with 1 uppercase letter and 1 number.',
@@ -208,6 +247,7 @@ export const ERROR_MESSAGES = {
   INVALID_REFERRAL: 'Invalid referral code.',
   DEVICE_LIMIT: 'Maximum 3 accounts per device reached.',
   IP_LIMIT: 'Too many signups from your location. Try again tomorrow.',
+  SEARCH_LIMIT: 'Daily search limit reached. Upgrade your plan for more searches.',
   TOKEN_EXPIRED: 'Session expired. Please login again.',
   UNKNOWN_ERROR: 'Something went wrong. Please try again.',
 };

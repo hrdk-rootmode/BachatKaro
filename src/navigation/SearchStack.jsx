@@ -1,0 +1,71 @@
+// ============================================
+// DEALHUNT APP - SEARCH STACK NAVIGATOR (UPDATED)
+// ============================================
+
+import React from 'react';
+import { createStackNavigator } from '@react-navigation/stack';
+
+// Real screens
+import SearchScreen from '../screens/search/SearchScreen';
+import SearchResultsScreen from '../screens/search/SearchResultsScreen';
+import URLSearchScreen from '../screens/search/URLSearchScreen';
+import ProductDetailScreen from '../screens/product/ProductDetailScreen';
+import CrossPlatformComparisonScreen from '../screens/product/CrossPlatformComparisonScreen';
+
+// Constants
+import { COLORS } from '../utils/constants';
+
+// --------------------------------------------
+// SEARCH STACK NAVIGATOR
+// --------------------------------------------
+
+const Stack = createStackNavigator();
+
+const SearchStack = () => {
+  return (
+    <Stack.Navigator
+      screenOptions={{
+        headerShown: false,
+        cardStyle: { backgroundColor: COLORS.background },
+        // Smooth transitions
+        cardStyleInterpolator: ({ current, layouts }) => {
+          return {
+            cardStyle: {
+              transform: [
+                {
+                  translateX: current.progress.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [layouts.screen.width, 0],
+                  }),
+                },
+              ],
+            },
+          };
+        },
+      }}
+    >
+      <Stack.Screen 
+        name="SearchMain" 
+        component={SearchScreen}
+      />
+      <Stack.Screen 
+        name="SearchResults" 
+        component={SearchResultsScreen}
+      />
+      <Stack.Screen 
+        name="URLSearch" 
+        component={URLSearchScreen}
+      />
+      <Stack.Screen 
+        name="ProductDetail" 
+        component={ProductDetailScreen}
+      />
+      <Stack.Screen 
+        name="CrossPlatformComparison" 
+        component={CrossPlatformComparisonScreen}
+      />
+    </Stack.Navigator>
+  );
+};
+
+export default SearchStack;

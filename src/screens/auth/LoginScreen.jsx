@@ -264,7 +264,7 @@ const LoginScreen = () => {
               </Text>
               <TouchableOpacity onPress={toggleMode}>
                 <Text style={styles.toggleLink}>
-                  {isSignup ? ' Sign In' : ' Sign Up'}
+                  {isSignup ? 'Sign In' : 'Sign Up'}
                 </Text>
               </TouchableOpacity>
             </View>
@@ -284,6 +284,7 @@ const LoginScreen = () => {
           {/* Footer */}
           <Text style={styles.footer}>
             By continuing, you agree to our Terms of Service
+            
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>

@@ -1,5 +1,5 @@
 // ============================================
-// DEALHUNT APP - REDUX STORE CONFIGURATION
+// DEALHUNT APP - REDUX STORE CONFIGURATION (UPDATED)
 // ============================================
 
 import { configureStore, combineReducers } from '@reduxjs/toolkit';
@@ -17,7 +17,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Import slices
 import authReducer from './authSlice';
-
+import searchReducer from './searchSlice';
+import watchlistReducer from './watchlistSlice'; 
+import streakReducer from './streakSlice';
+// Part 3
 // --------------------------------------------
 // PERSIST CONFIGURATION
 // --------------------------------------------
@@ -26,8 +29,8 @@ const persistConfig = {
   key: 'dealhunt_root',
   version: 1,
   storage: AsyncStorage,
-  whitelist: ['auth'], // Only persist auth state
-  // blacklist: [], // Don't persist these
+  whitelist: ['auth'], // Only persist auth state (NOT search)
+  // blacklist: ['search'], // Alternative way
 };
 
 // --------------------------------------------
@@ -36,10 +39,10 @@ const persistConfig = {
 
 const rootReducer = combineReducers({
   auth: authReducer,
-  // Add more slices here in future parts:
-  // search: searchReducer,     // Part 2
-  // watchlist: watchlistReducer, // Part 3
-  // streak: streakReducer,     // Part 4
+  search: searchReducer, // NEW: Added search reducer
+  // Future slices:
+  watchlist: watchlistReducer, // Part 3
+  streak: streakReducer,       // Part 4
   // subscription: subscriptionReducer, // Part 5
 });
 
@@ -87,6 +90,20 @@ export const persistor = persistStore(store);
  *     error: string | null,
  *     referralCode: string | null,
  *     referralValid: Object | null,
+ *   },
+ *   search: {
+ *     query: string,
+ *     filters: Object,
+ *     results: Array,
+ *     totalResults: number,
+ *     currentPage: number,
+ *     hasMore: boolean,
+ *     isSearching: boolean,
+ *     searchError: string | null,
+ *     recentSearches: Array,
+ *     trendingProducts: Array,
+ *     isTrendingLoading: boolean,
+ *     currentProduct: Object | null,
  *   }
  * }
  */

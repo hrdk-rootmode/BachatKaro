@@ -16,11 +16,14 @@ import { getFreshIdToken } from './firebase';
 const apiClient = axios.create({
   baseURL: API.BASE_URL,
   timeout: API.TIMEOUT,
+
   headers: {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
   },
 });
+
+console.log('API Client initialized with base URL:', API.BASE_URL);
 
 // --------------------------------------------
 // GET OR CREATE HARDWARE ID
@@ -58,86 +61,54 @@ const getDeviceHardwareId = async () => {
 // REQUEST INTERCEPTOR
 // Add auth token to all requests
 // --------------------------------------------
-
+// REPLACE the request interceptor with this:
 apiClient.interceptors.request.use(
   async (config) => {
     try {
-      // Get stored Firebase token
       const token = await getAuthToken();
-      
-      // Log token status
-      console.log(`API Request: ${config.method?.toUpperCase()} ${config.url}`);
-      console.log(`  Token present: ${token ? 'YES' : 'NO (⚠️ AUTH TOKEN MISSING)'}`);
-      console.log(`  Full URL: ${apiClient.defaults.baseURL}${config.url}`);
       
       if (token) {
         config.headers.Authorization = `Bearer ${token}`;
-        console.log(`  Authorization header set: Bearer ${token.substring(0, 20)}...`);
-      } else {
-        console.warn('  ⚠️ No token stored! User may not be authenticated');
       }
       
-      // Add hardware ID to relevant requests (signup, login)
+      // Add hardware ID to ALL auth endpoints
       if (config.url?.includes('/auth/')) {
         const hardwareId = await getDeviceHardwareId();
         config.headers['X-Hardware-ID'] = hardwareId;
-        console.log(`  Hardware ID: ${hardwareId}`);
       }
       
       return config;
     } catch (error) {
-      console.error('API: Request interceptor error:', error.message);
       return config;
     }
   },
-  (error) => {
-    console.error('API: Request error:', error.message);
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error)
 );
 
-// --------------------------------------------
-// RESPONSE INTERCEPTOR
-// Handle token refresh on 401
-// --------------------------------------------
-
+// REPLACE the response interceptor with this simpler version:
 apiClient.interceptors.response.use(
-  (response) => {
-    // Log success (development only)
-    console.log(`API Response: ${response.status} ${response.config.url}`);
-    return response;
-  },
+  (response) => response,
   async (error) => {
     const originalRequest = error.config;
     
-    // Handle 401 Unauthorized (token expired)
+    // Only retry ONCE on 401, no complex logic
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
       
-      console.log('API: Token expired, attempting refresh...');
-      
       try {
-        // Get fresh token from Firebase
+        // Simple token refresh
         const result = await getFreshIdToken(true);
-        
-        if (result.success && result.idToken) {
-          // Store new token
+        if (result.success) {
           await storeAuthToken(result.idToken);
-          
-          // Update header and retry
           originalRequest.headers.Authorization = `Bearer ${result.idToken}`;
-          
-          console.log('API: Token refreshed, retrying request...');
           return apiClient(originalRequest);
         }
-      } catch (refreshError) {
-        console.error('API: Token refresh failed:', refreshError.message);
+      } catch (e) {
+        // Silent fail, let error handler below process it
       }
     }
     
-    // Handle other errors
-    const errorResponse = handleApiError(error);
-    return Promise.reject(errorResponse);
+    return Promise.reject(handleApiError(error));
   }
 );
 
@@ -175,9 +146,18 @@ const handleApiError = (error) => {
       case 409:
         errorMessage = error.response.data?.detail || 'Account already exists.';
         break;
-      case 429:
-        errorMessage = ERROR_MESSAGES.IP_LIMIT;
+      case 429: {
+        const backendMessage = error.response.data?.detail || error.response.data?.message;
+        const requestUrl = error.config?.url || '';
+
+        // Keep signup-specific copy only for auth/signup endpoints.
+        if (requestUrl.includes('/auth/signup-public')) {
+          errorMessage = backendMessage || ERROR_MESSAGES.IP_LIMIT;
+        } else {
+          errorMessage = backendMessage || 'Too many requests. Please try again shortly.';
+        }
         break;
+      }
       case 500:
         errorMessage = ERROR_MESSAGES.SERVER_ERROR;
         break;

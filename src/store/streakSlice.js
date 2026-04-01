@@ -1,0 +1,408 @@
+// ============================================
+// DEALHUNT APP - STREAK REDUX SLICE
+// Part 4: Gamification & Engagement System
+// ============================================
+
+import { createSlice, createAsyncThunk, createSelector } from '@reduxjs/toolkit';
+import { streakAPI } from '../services/streakApi';
+import { activateProTrial } from './authSlice';
+import { STREAK_MILESTONES } from '../utils/constants';
+
+const milestoneDaysAsc = Object.keys(STREAK_MILESTONES)
+  .map(Number)
+  .sort((a, b) => a - b);
+
+const getNextMilestoneDay = (streakDays) => {
+  return milestoneDaysAsc.find((day) => day > streakDays) || null;
+};
+
+// --------------------------------------------
+// INITIAL STATE
+// --------------------------------------------
+
+const initialState = {
+  // Streak data
+  currentStreak: 0,
+  longestStreak: 0,
+  todayCompleted: false,
+  lastVisitDate: null, // 'YYYY-MM-DD' format
+  
+  // Additional data from backend
+  nextMilestone: null,
+  streakHistory: [],
+  
+  // Loading states
+  isLoading: false,
+  isCheckingIn: false,
+  error: null,
+  
+  // Reward system
+  unlockedReward: null, // { milestone, reward_type, details: { duration_hours, message } }
+  isRewardModalVisible: false,
+  
+  // Metadata
+  lastCheckedAt: null, // Timestamp of last check
+};
+
+// --------------------------------------------
+// ASYNC THUNKS
+// --------------------------------------------
+
+/**
+ * Check and mark streak on app launch
+ * Implements the core app-launch data flow:
+ * 1. First GET current status
+ * 2. If today not completed, POST check-in
+ * 3. Update streak state
+ * 4. Trigger reward modal if milestone reached
+ */
+export const checkAndMarkStreak = createAsyncThunk(
+  'streak/checkAndMark',
+  async (_, { rejectWithValue }) => {
+    try {
+      // Step 1: Get current status without modifying
+      const statusResult = await streakAPI.getStreakStatus();
+      
+      if (!statusResult.success) {
+        // Non-critical: don't block app if streak service is down
+        console.warn('[StreakSlice] Status check failed (non-critical):', statusResult.error);
+        return rejectWithValue(statusResult.error || 'Failed to get streak status');
+      }
+      
+      const statusData = statusResult.data;
+      
+      // Step 2: If already checked in today, return status
+      if (statusData.todayCompleted) {
+        console.log('[StreakSlice] Already checked in today. Current streak:', statusData.currentStreak);
+        return {
+          currentStreak: statusData.currentStreak,
+          longestStreak: statusData.longestStreak,
+          todayCompleted: statusData.todayCompleted,
+          lastVisitDate: statusData.lastVisitDate,
+          nextMilestone: statusData.nextMilestone,
+          streakHistory: statusData.streakHistory,
+          streakMilestoneReward: statusData.streakMilestoneReward || null,
+        };
+      }
+      
+      // Step 3: Not checked in yet, perform check-in
+      console.log('[StreakSlice] Checking in for today...');
+      const checkInResult = await streakAPI.checkIn();
+      
+      if (!checkInResult.success) {
+        console.warn('[StreakSlice] Check-in failed (non-critical):', checkInResult.error);
+        // Return the status we got earlier rather than failing completely
+        return {
+          currentStreak: statusData.currentStreak,
+          longestStreak: statusData.longestStreak,
+          todayCompleted: statusData.todayCompleted,
+          lastVisitDate: statusData.lastVisitDate,
+          nextMilestone: statusData.nextMilestone,
+          streakHistory: statusData.streakHistory,
+          streakMilestoneReward: null,
+        };
+      }
+      
+      // Step 4: Return updated data from check-in
+      const checkInData = checkInResult.data;
+      
+      // Log streak events
+      if (checkInData.isNewStreak) {
+        console.log('[StreakSlice] 🎉 New streak started!');
+      }
+      if (checkInData.wasReset) {
+        console.log('[StreakSlice] 💔 Streak was reset. Starting fresh.');
+      }
+      if (checkInData.streakMilestoneReward) {
+        console.log('[StreakSlice] 🎁 Milestone reward unlocked!', checkInData.streakMilestoneReward);
+      }
+      
+      return {
+        currentStreak: checkInData.currentStreak,
+        longestStreak: checkInData.longestStreak,
+        todayCompleted: checkInData.todayCompleted,
+        lastVisitDate: checkInData.lastVisitDate,
+        nextMilestone: checkInData.nextMilestone || null,
+        streakHistory: checkInData.streakHistory || [],
+        streakMilestoneReward: checkInData.streakMilestoneReward || null,
+        message: checkInData.message,
+        isNewStreak: checkInData.isNewStreak,
+        wasReset: checkInData.wasReset,
+      };
+    } catch (error) {
+      console.error('[StreakSlice] checkAndMarkStreak error:', error);
+      // Non-critical: don't block app launch
+      return rejectWithValue(error.message || 'Streak check failed');
+    }
+  }
+);
+
+/**
+ * Fetch milestone information
+ * Optional: Load milestone data separately for milestone screen
+ */
+export const fetchMilestones = createAsyncThunk(
+  'streak/fetchMilestones',
+  async (_, { rejectWithValue }) => {
+    try {
+      const result = await streakAPI.getMilestones();
+      
+      if (!result.success) {
+        return rejectWithValue(result.error || 'Failed to fetch milestones');
+      }
+      
+      return result.data;
+    } catch (error) {
+      console.error('[StreakSlice] fetchMilestones error:', error);
+      return rejectWithValue(error.message || 'Failed to fetch milestones');
+    }
+  }
+);
+
+/**
+ * Claim streak reward
+ * This will be connected to authSlice in Phase 2
+ * @param {Object} reward - The reward object from backend
+ */
+export const claimStreakReward = createAsyncThunk(
+  'streak/claimReward',
+  async (reward, { dispatch, rejectWithValue }) => {
+    try {
+      console.log('[StreakSlice] Claiming reward:', reward);
+
+      const durationHours = Number(reward?.details?.duration_hours || 24);
+      if (!Number.isFinite(durationHours) || durationHours <= 0) {
+        return rejectWithValue('Invalid reward duration');
+      }
+
+      // Activate temporary Pro access from claimed streak reward.
+      dispatch(activateProTrial({ durationHours }));
+      
+      // Hide the modal
+      dispatch(hideRewardModal());
+      
+      return { success: true, durationHours };
+    } catch (error) {
+      console.error('[StreakSlice] claimStreakReward error:', error);
+      return rejectWithValue(error.message || 'Failed to claim reward');
+    }
+  }
+);
+
+// --------------------------------------------
+// STREAK SLICE
+// --------------------------------------------
+
+const streakSlice = createSlice({
+  name: 'streak',
+  initialState,
+  
+  reducers: {
+    /**
+     * Hide the reward modal
+     */
+    hideRewardModal: (state) => {
+      state.isRewardModalVisible = false;
+      state.unlockedReward = null;
+    },
+    
+    /**
+     * Manually reset streak state (for testing/debugging)
+     */
+    resetStreakState: () => initialState,
+    
+    /**
+     * Clear error state
+     */
+    clearStreakError: (state) => {
+      state.error = null;
+    },
+    
+    /**
+     * Update last checked timestamp
+     */
+    updateLastChecked: (state) => {
+      state.lastCheckedAt = new Date().toISOString();
+    },
+
+    /**
+     * Development-only helper: increases streak for quick UI testing.
+     */
+    debugIncreaseStreakForDev: (state, action) => {
+      const increment = Math.max(1, Number(action.payload?.days || 1));
+      const previous = Math.max(0, Number(state.currentStreak || 0));
+      const next = previous + increment;
+
+      state.currentStreak = next;
+      state.longestStreak = Math.max(Number(state.longestStreak || 0), next);
+      state.todayCompleted = true;
+      state.lastVisitDate = new Date().toISOString().split('T')[0];
+      state.nextMilestone = getNextMilestoneDay(next);
+      state.lastCheckedAt = new Date().toISOString();
+      state.error = null;
+      state.isLoading = false;
+      state.isCheckingIn = false;
+
+      const milestoneReached = milestoneDaysAsc.find((day) => day > previous && day <= next);
+      if (milestoneReached) {
+        const rewardMeta = STREAK_MILESTONES[milestoneReached];
+        state.unlockedReward = {
+          milestone: milestoneReached,
+          reward_type: 'PRO_TRIAL',
+          details: {
+            duration_hours: rewardMeta?.duration_hours || 24,
+            message: `Great work! You unlocked ${rewardMeta?.label || 'a streak reward'}.`,
+          },
+        };
+        state.isRewardModalVisible = true;
+      }
+    },
+
+    /**
+     * Development-only helper: resets streak state for repeat testing.
+     */
+    debugResetStreakForDev: (state) => {
+      state.currentStreak = 0;
+      state.longestStreak = 0;
+      state.todayCompleted = false;
+      state.lastVisitDate = null;
+      state.nextMilestone = getNextMilestoneDay(0);
+      state.streakHistory = [];
+      state.unlockedReward = null;
+      state.isRewardModalVisible = false;
+      state.error = null;
+      state.isLoading = false;
+      state.isCheckingIn = false;
+      state.lastCheckedAt = new Date().toISOString();
+    },
+  },
+  
+  extraReducers: (builder) => {
+    // --------------------------------------------
+    // CHECK AND MARK STREAK
+    // --------------------------------------------
+    builder.addCase(checkAndMarkStreak.pending, (state) => {
+      state.isLoading = true;
+      state.isCheckingIn = true;
+      state.error = null;
+    });
+    
+    builder.addCase(checkAndMarkStreak.fulfilled, (state, action) => {
+      const payload = action.payload;
+      
+      state.isLoading = false;
+      state.isCheckingIn = false;
+      state.currentStreak = payload.currentStreak;
+      state.longestStreak = payload.longestStreak;
+      state.todayCompleted = payload.todayCompleted;
+      state.lastVisitDate = payload.lastVisitDate;
+      state.nextMilestone = payload.nextMilestone;
+      state.streakHistory = payload.streakHistory || [];
+      state.lastCheckedAt = new Date().toISOString();
+      state.error = null;
+      
+      // CRITICAL: Check if milestone reward was returned
+      if (payload.streakMilestoneReward) {
+        state.unlockedReward = payload.streakMilestoneReward;
+        state.isRewardModalVisible = true;
+      }
+    });
+    
+    builder.addCase(checkAndMarkStreak.rejected, (state, action) => {
+      state.isLoading = false;
+      state.isCheckingIn = false;
+      state.error = action.payload || 'Failed to check streak';
+      
+      // Don't show error to user - streak is non-critical feature
+      console.warn('[StreakSlice] Streak check failed (non-critical):', state.error);
+    });
+    
+    // --------------------------------------------
+    // FETCH MILESTONES
+    // --------------------------------------------
+    builder.addCase(fetchMilestones.pending, (state) => {
+      state.isLoading = true;
+      state.error = null;
+    });
+    
+    builder.addCase(fetchMilestones.fulfilled, (state, action) => {
+      state.isLoading = false;
+      state.nextMilestone = action.payload.nextMilestone;
+      // Could store milestones array if needed for UI
+    });
+    
+    builder.addCase(fetchMilestones.rejected, (state, action) => {
+      state.isLoading = false;
+      state.error = action.payload || 'Failed to fetch milestones';
+    });
+    
+    // --------------------------------------------
+    // CLAIM REWARD
+    // --------------------------------------------
+    builder.addCase(claimStreakReward.pending, (state) => {
+      state.isLoading = true;
+    });
+    
+    builder.addCase(claimStreakReward.fulfilled, (state) => {
+      state.isLoading = false;
+      // Modal already hidden by the thunk dispatching hideRewardModal
+    });
+    
+    builder.addCase(claimStreakReward.rejected, (state, action) => {
+      state.isLoading = false;
+      state.error = action.payload || action.error.message || 'Failed to claim reward';
+    });
+  },
+});
+
+// --------------------------------------------
+// EXPORTS
+// --------------------------------------------
+
+// Actions
+export const {
+  hideRewardModal,
+  resetStreakState,
+  clearStreakError,
+  updateLastChecked,
+  debugIncreaseStreakForDev,
+  debugResetStreakForDev,
+} = streakSlice.actions;
+
+// Selectors
+export const selectCurrentStreak = (state) => state.streak.currentStreak;
+export const selectLongestStreak = (state) => state.streak.longestStreak;
+export const selectTodayCompleted = (state) => state.streak.todayCompleted;
+export const selectLastVisitDate = (state) => state.streak.lastVisitDate;
+export const selectNextMilestone = (state) => state.streak.nextMilestone;
+export const selectStreakHistory = (state) => state.streak.streakHistory;
+export const selectStreakLoading = (state) => state.streak.isLoading;
+export const selectStreakError = (state) => state.streak.error;
+export const selectUnlockedReward = (state) => state.streak.unlockedReward;
+export const selectIsRewardModalVisible = (state) => state.streak.isRewardModalVisible;
+export const selectLastCheckedAt = (state) => state.streak.lastCheckedAt;
+
+// Composite selector for UI
+export const selectStreakData = createSelector(
+  [
+    selectCurrentStreak,
+    selectLongestStreak,
+    selectTodayCompleted,
+    selectLastVisitDate,
+    selectNextMilestone,
+    selectStreakLoading,
+    selectLastCheckedAt,
+  ],
+  (currentStreak, longestStreak, todayCompleted, lastVisitDate, nextMilestone, isLoading, lastCheckedAt) => ({
+    currentStreak,
+    longestStreak,
+    todayCompleted,
+    lastVisitDate,
+    nextMilestone,
+    isLoading,
+    lastCheckedAt,
+  })
+);
+
+// Reducer
+export default streakSlice.reducer;

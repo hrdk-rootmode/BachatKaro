@@ -1,8 +1,10 @@
 // ============================================
 // DEALHUNT APP - AUTH REDUX SLICE
+// Part 4 Update: Added Pro Trial Management
 // ============================================
 
-import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
+import { createSlice, createAsyncThunk, createSelector } from '@reduxjs/toolkit';
+import { REHYDRATE } from 'redux-persist';
 
 import { signInWithEmail, signUpWithEmail, firebaseSignOut, getFreshIdToken } from '../services/firebase';
 import { authAPI } from '../services/api';
@@ -37,6 +39,42 @@ const initialState = {
   // Referral
   referralCode: null, // User's own referral code
   referralValid: null, // Validation result for entered code
+  
+  // ✅ NEW: Pro Trial System (Part 4)
+  isPro: false,                    // Permanent Pro status from backend
+  proTrialActive: false,           // Temporary trial from streak rewards
+  proTrialExpiresAt: null,         // ISO timestamp when trial ends
+  proTrialDurationHours: null,     // How many hours the trial lasts
+};
+
+// --------------------------------------------
+// HELPERS
+// --------------------------------------------
+
+const withTimeout = (promise, timeoutMs, label) => {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    }),
+  ]);
+};
+
+const buildFallbackUserFromFirebase = (firebaseUser) => ({
+  uid: firebaseUser?.uid,
+  firebase_uid: firebaseUser?.uid,
+  email: firebaseUser?.email,
+  plan: 'free',
+  daily_limit: 10,
+  searches_today: 0,
+  watchlist_count: 0,
+  current_streak: 0,
+});
+
+// ✅ NEW: Check if Pro trial is still valid
+const isProTrialValid = (expiresAt) => {
+  if (!expiresAt) return false;
+  return new Date(expiresAt).getTime() > Date.now();
 };
 
 // --------------------------------------------
@@ -57,18 +95,31 @@ export const loginWithEmail = createAsyncThunk(
         return rejectWithValue(firebaseResult.error);
       }
       
-      // Step 2: Store Firebase token
+      // Step 2: Store token ONCE
       await storeAuthToken(firebaseResult.idToken);
       await storeFirebaseUid(firebaseResult.user.uid);
       
-      // Step 3: Get user profile from backend (auto-creates if new)
-      const backendResult = await authAPI.getMe();
+      // Step 3: Wait 1 second to avoid clock skew
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Step 4: Single backend call with retry
+      let backendResult = await authAPI.getMe();
       
       if (!backendResult.success) {
-        return rejectWithValue(backendResult.error);
+        // ONE retry with fresh token
+        const freshToken = await getFreshIdToken(true);
+        if (freshToken.success) {
+          await storeAuthToken(freshToken.idToken);
+          backendResult = await authAPI.getMe();
+        }
+        
+        if (!backendResult.success) {
+          // Don't create fallback user - just fail
+          await clearAllAuthData();
+          return rejectWithValue('Backend connection failed. Please try again.');
+        }
       }
       
-      // Step 4: Store user data
       await storeUserData(backendResult.data);
       
       return {
@@ -77,7 +128,7 @@ export const loginWithEmail = createAsyncThunk(
         idToken: firebaseResult.idToken,
       };
     } catch (error) {
-      console.error('Login error:', error);
+      await clearAllAuthData();
       return rejectWithValue(error.message || 'Login failed');
     }
   }
@@ -100,13 +151,39 @@ export const signupWithEmail = createAsyncThunk(
       // Step 2: Store Firebase token
       await storeAuthToken(firebaseResult.idToken);
       await storeFirebaseUid(firebaseResult.user.uid);
+
+      // Ensure we use a freshly minted token before backend bootstrap.
+      const freshTokenResult = await getFreshIdToken(true);
+      if (freshTokenResult.success && freshTokenResult.idToken) {
+        await storeAuthToken(freshTokenResult.idToken);
+      }
       
       // Step 3: Get/create user profile from backend
       // Backend auto-creates user on first /auth/me call
       // If referral code provided, backend will process it
-      const backendResult = await authAPI.getMe();
+      let backendResult = await authAPI.getMe();
+
+      // One more hard retry for 401 with a forced fresh token.
+      if (!backendResult.success && backendResult.statusCode === 401) {
+        const retryTokenResult = await getFreshIdToken(true);
+        if (retryTokenResult.success && retryTokenResult.idToken) {
+          await storeAuthToken(retryTokenResult.idToken);
+          backendResult = await authAPI.getMe();
+        }
+      }
       
       if (!backendResult.success) {
+        if (backendResult.statusCode === 401) {
+          const fallbackUser = buildFallbackUserFromFirebase(firebaseResult.user);
+          await storeUserData(fallbackUser);
+          return {
+            user: fallbackUser,
+            firebaseUser: firebaseResult.user,
+            idToken: firebaseResult.idToken,
+            isNewUser: true,
+            backendSync: false,
+          };
+        }
         return rejectWithValue(backendResult.error);
       }
       
@@ -134,17 +211,36 @@ export const checkAuthStatus = createAsyncThunk(
   async (_, { rejectWithValue }) => {
     try {
       // Step 1: Check for stored token
-      const storedToken = await getAuthToken();
-      const storedUser = await getUserData();
+      const storedToken = await withTimeout(getAuthToken(), 5000, 'Read auth token');
+      const storedUser = await withTimeout(getUserData(), 5000, 'Read user data');
       
       if (!storedToken || !storedUser) {
         return { isLoggedIn: false };
       }
       
       // Step 2: Verify token is still valid by calling backend
-      const backendResult = await authAPI.getMe();
+      let backendResult = await withTimeout(authAPI.getMe(), 12000, 'Verify auth session');
+
+      // If token is expired, attempt a forced token refresh and retry once.
+      if (!backendResult.success && backendResult.statusCode === 401) {
+        const refreshResult = await withTimeout(getFreshIdToken(true), 8000, 'Refresh Firebase token');
+        if (refreshResult.success && refreshResult.idToken) {
+          await storeAuthToken(refreshResult.idToken);
+          backendResult = await withTimeout(authAPI.getMe(), 12000, 'Verify auth session retry');
+        }
+      }
       
       if (!backendResult.success) {
+        // If backend /auth/me is rejecting with 401 but we have cached user+token,
+        // keep user logged in to avoid blocking app usage.
+        if (backendResult.statusCode === 401 && storedUser) {
+          return {
+            isLoggedIn: true,
+            user: storedUser,
+            backendSync: false,
+          };
+        }
+
         // Token invalid, clear storage
         await clearAllAuthData();
         return { isLoggedIn: false };
@@ -241,6 +337,12 @@ const authSlice = createSlice({
   initialState,
   
   reducers: {
+    // Force end initialization if startup flow hangs
+    forceFinishInitialization: (state) => {
+      state.isInitializing = false;
+      state.isLoading = false;
+    },
+
     // Clear error
     clearError: (state) => {
       state.error = null;
@@ -265,11 +367,101 @@ const authSlice = createSlice({
     
     // Reset auth state (for testing)
     resetAuth: () => initialState,
+    
+    // ✅ NEW: Activate Pro Trial (Part 4)
+    activateProTrial: (state, action) => {
+      const { durationHours } = action.payload;
+      
+      if (!durationHours || durationHours <= 0) {
+        console.warn('[AuthSlice] Invalid trial duration:', durationHours);
+        return;
+      }
+      
+      const now = Date.now();
+      const expiresAt = new Date(now + durationHours * 60 * 60 * 1000).toISOString();
+      
+      state.proTrialActive = true;
+      state.proTrialExpiresAt = expiresAt;
+      state.proTrialDurationHours = durationHours;
+      
+      console.log(`[AuthSlice] ✅ Pro trial activated: ${durationHours}h (expires: ${expiresAt})`);
+    },
+    
+    // ✅ NEW: Clear Pro Trial (when expired or manually cleared)
+    clearProTrial: (state) => {
+      state.proTrialActive = false;
+      state.proTrialExpiresAt = null;
+      state.proTrialDurationHours = null;
+      console.log('[AuthSlice] Pro trial cleared');
+    },
+    
+    // ✅ NEW: Check if Pro trial has expired (call this periodically)
+    checkProTrialExpiration: (state) => {
+      if (state.proTrialActive && state.proTrialExpiresAt) {
+        if (!isProTrialValid(state.proTrialExpiresAt)) {
+          console.log('[AuthSlice] Pro trial expired');
+          state.proTrialActive = false;
+          state.proTrialExpiresAt = null;
+          state.proTrialDurationHours = null;
+        }
+      }
+    },
+
+    // Development-only helper: nudge trial expiry forward/backward for faster testing.
+    debugAdjustProTrialMinutesForDev: (state, action) => {
+      const minutesDelta = Number(action.payload?.minutesDelta || 0);
+      if (!Number.isFinite(minutesDelta) || minutesDelta === 0) {
+        return;
+      }
+
+      if (!state.proTrialActive || !state.proTrialExpiresAt) {
+        console.warn('[AuthSlice] Cannot adjust trial time: no active trial');
+        return;
+      }
+
+      const now = Date.now();
+      const currentExpiry = new Date(state.proTrialExpiresAt).getTime();
+      const safeCurrentExpiry = Number.isFinite(currentExpiry) ? currentExpiry : now;
+      const adjustedExpiry = safeCurrentExpiry + minutesDelta * 60 * 1000;
+
+      if (adjustedExpiry <= now) {
+        state.proTrialActive = false;
+        state.proTrialExpiresAt = null;
+        state.proTrialDurationHours = null;
+        return;
+      }
+
+      state.proTrialExpiresAt = new Date(adjustedExpiry).toISOString();
+      state.proTrialDurationHours = Math.max(1, Math.ceil((adjustedExpiry - now) / (1000 * 60 * 60)));
+    },
   },
   
   extraReducers: (builder) => {
     // --------------------------------------------
+    // REHYDRATION GUARD
+    // Reset volatile UI flags that should not survive app restarts
+    // ✅ UPDATED: Check Pro trial expiration on rehydration
+    // --------------------------------------------
+    builder.addCase(REHYDRATE, (state) => {
+      state.isLoading = false;
+      state.isInitializing = true;
+      state.error = null;
+      state.referralValid = null;
+      
+      // Check if Pro trial expired while app was closed
+      if (state.proTrialActive && state.proTrialExpiresAt) {
+        if (!isProTrialValid(state.proTrialExpiresAt)) {
+          console.log('[AuthSlice] Pro trial expired during rehydration');
+          state.proTrialActive = false;
+          state.proTrialExpiresAt = null;
+          state.proTrialDurationHours = null;
+        }
+      }
+    });
+
+    // --------------------------------------------
     // LOGIN
+    // ✅ UPDATED: Set isPro from user data
     // --------------------------------------------
     builder.addCase(loginWithEmail.pending, (state) => {
       state.isLoading = true;
@@ -279,10 +471,15 @@ const authSlice = createSlice({
     builder.addCase(loginWithEmail.fulfilled, (state, action) => {
       state.isLoading = false;
       state.isAuthenticated = true;
+      state.isInitializing = false;
       state.user = action.payload.user;
       state.firebaseUser = action.payload.firebaseUser;
       state.referralCode = action.payload.user?.referral_code;
       state.error = null;
+      
+      // ✅ NEW: Set permanent Pro status from user plan
+      const userPlan = action.payload.user?.plan?.toLowerCase();
+      state.isPro = userPlan === 'pro' || userPlan === 'premium';
     });
     
     builder.addCase(loginWithEmail.rejected, (state, action) => {
@@ -293,6 +490,7 @@ const authSlice = createSlice({
     
     // --------------------------------------------
     // SIGNUP
+    // ✅ UPDATED: Set isPro from user data
     // --------------------------------------------
     builder.addCase(signupWithEmail.pending, (state) => {
       state.isLoading = true;
@@ -302,10 +500,15 @@ const authSlice = createSlice({
     builder.addCase(signupWithEmail.fulfilled, (state, action) => {
       state.isLoading = false;
       state.isAuthenticated = true;
+      state.isInitializing = false;
       state.user = action.payload.user;
       state.firebaseUser = action.payload.firebaseUser;
       state.referralCode = action.payload.user?.referral_code;
       state.error = null;
+      
+      // ✅ NEW: Set permanent Pro status from user plan
+      const userPlan = action.payload.user?.plan?.toLowerCase();
+      state.isPro = userPlan === 'pro' || userPlan === 'premium';
     });
     
     builder.addCase(signupWithEmail.rejected, (state, action) => {
@@ -316,6 +519,7 @@ const authSlice = createSlice({
     
     // --------------------------------------------
     // CHECK AUTH STATUS
+    // ✅ UPDATED: Set isPro from user data
     // --------------------------------------------
     builder.addCase(checkAuthStatus.pending, (state) => {
       state.isInitializing = true;
@@ -326,16 +530,26 @@ const authSlice = createSlice({
       state.isAuthenticated = action.payload.isLoggedIn;
       state.user = action.payload.user || null;
       state.referralCode = action.payload.user?.referral_code || null;
+      
+      // ✅ NEW: Set permanent Pro status from user plan
+      if (action.payload.user) {
+        const userPlan = action.payload.user?.plan?.toLowerCase();
+        state.isPro = userPlan === 'pro' || userPlan === 'premium';
+      } else {
+        state.isPro = false;
+      }
     });
     
     builder.addCase(checkAuthStatus.rejected, (state) => {
       state.isInitializing = false;
       state.isAuthenticated = false;
       state.user = null;
+      state.isPro = false;
     });
     
     // --------------------------------------------
     // LOGOUT
+    // ✅ UPDATED: Clear Pro trial on logout
     // --------------------------------------------
     builder.addCase(logout.pending, (state) => {
       state.isLoading = true;
@@ -348,6 +562,12 @@ const authSlice = createSlice({
       state.firebaseUser = null;
       state.referralCode = null;
       state.error = null;
+      
+      // ✅ NEW: Clear Pro trial
+      state.isPro = false;
+      state.proTrialActive = false;
+      state.proTrialExpiresAt = null;
+      state.proTrialDurationHours = null;
     });
     
     builder.addCase(logout.rejected, (state) => {
@@ -356,6 +576,12 @@ const authSlice = createSlice({
       state.isAuthenticated = false;
       state.user = null;
       state.firebaseUser = null;
+      
+      // ✅ NEW: Clear Pro trial
+      state.isPro = false;
+      state.proTrialActive = false;
+      state.proTrialExpiresAt = null;
+      state.proTrialDurationHours = null;
     });
     
     // --------------------------------------------
@@ -381,10 +607,15 @@ const authSlice = createSlice({
     
     // --------------------------------------------
     // REFRESH USER DATA
+    // ✅ UPDATED: Update isPro when refreshing user data
     // --------------------------------------------
     builder.addCase(refreshUserData.fulfilled, (state, action) => {
       state.user = action.payload;
       state.referralCode = action.payload?.referral_code;
+      
+      // ✅ NEW: Update Pro status
+      const userPlan = action.payload?.plan?.toLowerCase();
+      state.isPro = userPlan === 'pro' || userPlan === 'premium';
     });
   },
 });
@@ -394,11 +625,16 @@ const authSlice = createSlice({
 // --------------------------------------------
 
 export const {
+  forceFinishInitialization,
   clearError,
   clearReferralValidation,
   updateUserLocal,
   setLoading,
   resetAuth,
+  activateProTrial,          // ✅ NEW
+  clearProTrial,             // ✅ NEW
+  checkProTrialExpiration,   // ✅ NEW
+  debugAdjustProTrialMinutesForDev,
 } = authSlice.actions;
 
 // Selectors
@@ -409,5 +645,42 @@ export const selectIsInitializing = (state) => state.auth.isInitializing;
 export const selectAuthError = (state) => state.auth.error;
 export const selectReferralCode = (state) => state.auth.referralCode;
 export const selectReferralValid = (state) => state.auth.referralValid;
+
+// ✅ NEW: Pro Trial Selectors
+export const selectIsPermanentPro = (state) => state.auth.isPro;
+export const selectProTrialActive = (state) => state.auth.proTrialActive;
+export const selectProTrialExpiresAt = (state) => state.auth.proTrialExpiresAt;
+export const selectProTrialDurationHours = (state) => state.auth.proTrialDurationHours;
+
+/**
+ * ✅ NEW: Master Pro selector
+ * Returns true if user has EITHER permanent Pro OR active trial
+ */
+export const selectIsPro = (state) => {
+  const permanentPro = state.auth.isPro;
+  const trialActive = state.auth.proTrialActive;
+  const trialExpiry = state.auth.proTrialExpiresAt;
+
+  if (permanentPro) return true;
+  return Boolean(trialActive && trialExpiry);
+};
+
+/**
+ * ✅ NEW: Get Pro trial info for UI display
+ */
+export const selectProTrialInfo = createSelector(
+  [selectProTrialActive, selectProTrialExpiresAt, selectProTrialDurationHours],
+  (isActive, expiresAt, durationHours) => {
+    if (!isActive || !expiresAt) {
+      return null;
+    }
+
+    return {
+      isActive: true,
+      expiresAt,
+      durationHours,
+    };
+  }
+);
 
 export default authSlice.reducer;
