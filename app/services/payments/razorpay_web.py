@@ -16,11 +16,29 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _is_placeholder_credential(value: str) -> bool:
+    """Treat obvious sample/dummy credentials as non-production and force mock mode."""
+    text = (value or "").strip().lower()
+    if not text:
+        return True
+
+    placeholder_markers = (
+        "placeholder",
+        "your_",
+        "change_me",
+        "dummy",
+        "xxxx",
+    )
+    return any(marker in text for marker in placeholder_markers)
+
 # Check if we have real Razorpay credentials
 RAZORPAY_ENABLED = (
-    settings.RAZORPAY_KEY_ID and 
+    settings.RAZORPAY_ENABLED and
+    settings.RAZORPAY_KEY_ID and
     settings.RAZORPAY_KEY_SECRET and
-    not settings.RAZORPAY_KEY_ID.startswith("rzp_test_placeholder")
+    not _is_placeholder_credential(settings.RAZORPAY_KEY_ID) and
+    not _is_placeholder_credential(settings.RAZORPAY_KEY_SECRET)
 )
 
 # Only import razorpay if we have real credentials

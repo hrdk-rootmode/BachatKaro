@@ -307,6 +307,8 @@ class TrendingProductResponse(BaseModel):
     
     product_id: str  # ✅ UUID as string
     title: str
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
     # ✅ NEW: Variant fingerprinting
     variant_fingerprint: Optional[str] = Field(None, description="Exact variant fingerprint")
     base_fingerprint: Optional[str] = Field(None, description="Base product fingerprint")
@@ -320,6 +322,14 @@ class TrendingProductResponse(BaseModel):
     rank: int
     # ✅ NEW: Cross-platform availability (for home page badge)
     platform_count: int = Field(1, description="How many platforms have this product")
+    last_updated_at: Optional[datetime] = Field(
+        default=None,
+        description="Latest listing scrape timestamp used for freshness ranking",
+    )
+    last_price_change_at: Optional[datetime] = Field(
+        default=None,
+        description="Last observed listing price-change timestamp",
+    )
 
 
 # ==================== PRICE HISTORY SCHEMAS ====================

@@ -327,10 +327,19 @@ class Settings(BaseSettings):
     @property
     def is_razorpay_configured(self) -> bool:
         """Check if Razorpay credentials are set up"""
+        key_id = (self.RAZORPAY_KEY_ID or "").strip().lower()
+        key_secret = (self.RAZORPAY_KEY_SECRET or "").strip().lower()
+        placeholder_markers = ("placeholder", "your_", "change_me", "dummy", "xxxx")
+
+        has_placeholder = any(marker in key_id for marker in placeholder_markers) or any(
+            marker in key_secret for marker in placeholder_markers
+        )
+
         return bool(
-            self.RAZORPAY_KEY_ID and 
+            self.RAZORPAY_ENABLED and
+            self.RAZORPAY_KEY_ID and
             self.RAZORPAY_KEY_SECRET and
-            not self.RAZORPAY_KEY_ID.startswith("rzp_test_placeholder")
+            not has_placeholder
         )
     
     class Config:

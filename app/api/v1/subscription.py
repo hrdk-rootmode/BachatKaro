@@ -6,9 +6,9 @@ Supports mock mode for development without credentials
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 import json
@@ -116,6 +116,20 @@ def get_plan_from_sku(sku: str) -> Optional[str]:
     return None
 
 
+def _utc_now() -> datetime:
+    """Return a timezone-aware UTC datetime for all subscription comparisons."""
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize datetimes to timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 async def create_transaction(
     db: AsyncSession,
     user_id,
@@ -169,12 +183,15 @@ async def activate_subscription(
     """
     plan_config = get_plan_config(plan_id)
     duration_days = plan_config["duration_days"]
+
+    current_expiry = _as_utc(user.plan_expires_at)
+    now = _utc_now()
     
     # Extend if already subscribed, else start fresh
-    if user.plan_expires_at and user.plan_expires_at > datetime.utcnow():
-        new_expiry = user.plan_expires_at + timedelta(days=duration_days)
+    if current_expiry and current_expiry > now:
+        new_expiry = current_expiry + timedelta(days=duration_days)
     else:
-        new_expiry = datetime.utcnow() + timedelta(days=duration_days)
+        new_expiry = now + timedelta(days=duration_days)
     
     # Update user
     user.plan = plan_id
@@ -183,7 +200,7 @@ async def activate_subscription(
     
     if user.usage_stats is None:
         user.usage_stats = {}
-    user.usage_stats["subscription_activated_at"] = datetime.utcnow().isoformat()
+    user.usage_stats["subscription_activated_at"] = _utc_now().isoformat()
     user.usage_stats["subscription_platform"] = platform
     
     await db.commit()
@@ -304,7 +321,7 @@ async def create_payment_order(
     # WEB (Razorpay)
     # =========================================================================
     if platform == "web":
-        receipt = f"sub_{user.id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        receipt = f"sub_{user.id}_{_utc_now().strftime('%Y%m%d%H%M%S')}"
         
         try:
             order = razorpay_client.create_order(
@@ -483,7 +500,7 @@ async def verify_razorpay_payment(
     transaction.status = "success"
     transaction.razorpay_payment_id = request.razorpay_payment_id
     transaction.razorpay_signature = request.razorpay_signature
-    transaction.processed_at = datetime.utcnow()
+    transaction.processed_at = _utc_now()
     
     # Activate subscription
     plan_id = transaction.meta_data.get("plan_id", "pro")
@@ -497,7 +514,7 @@ async def verify_razorpay_payment(
         redis=redis
     )
     
-    transaction.meta_data["activated_at"] = datetime.utcnow().isoformat()
+    transaction.meta_data["activated_at"] = _utc_now().isoformat()
     await db.commit()
     
     logger.info(
@@ -593,7 +610,7 @@ async def verify_google_play_purchase(
             "expiry_time_millis": result.get("expiry_time_millis")
         }
     )
-    transaction.processed_at = datetime.utcnow()
+    transaction.processed_at = _utc_now()
     
     # Activate subscription
     new_expiry = await activate_subscription(
@@ -611,7 +628,7 @@ async def verify_google_play_purchase(
     )
     
     transaction.acknowledgement_state = "acknowledged" if acknowledged else "pending"
-    transaction.meta_data["acknowledged_at"] = datetime.utcnow().isoformat() if acknowledged else None
+    transaction.meta_data["acknowledged_at"] = _utc_now().isoformat() if acknowledged else None
     
     await db.commit()
     
@@ -675,7 +692,7 @@ async def acknowledge_google_play_purchase(
     if success:
         transaction.acknowledgement_state = "acknowledged"
         transaction.meta_data = transaction.meta_data or {}
-        transaction.meta_data["acknowledged_at"] = datetime.utcnow().isoformat()
+        transaction.meta_data["acknowledged_at"] = _utc_now().isoformat()
         await db.commit()
         
         logger.info(f"Purchase acknowledged | User: {user.id} | Token: {request.purchase_token[:20]}...")
@@ -752,7 +769,7 @@ async def google_play_webhook(
                     # Don't immediately cancel - let current period expire
                     if user.usage_stats is None:
                         user.usage_stats = {}
-                    user.usage_stats["subscription_cancelled_at"] = datetime.utcnow().isoformat()
+                    user.usage_stats["subscription_cancelled_at"] = _utc_now().isoformat()
                     user.usage_stats["cancellation_source"] = "google_webhook"
                     await db.commit()
                     
@@ -787,7 +804,7 @@ async def google_play_webhook(
                         if user:
                             expiry_millis = verify_result.get("expiry_time_millis", 0)
                             if expiry_millis:
-                                user.plan_expires_at = datetime.fromtimestamp(expiry_millis / 1000)
+                                user.plan_expires_at = datetime.fromtimestamp(expiry_millis / 1000, tz=timezone.utc)
                                 await db.commit()
                                 logger.info(f"Subscription renewed via webhook | User: {user.id}")
                 except Exception as e:
@@ -814,13 +831,13 @@ async def get_subscription_status(
     
     days_remaining = None
     if user.plan_expires_at:
-        delta = user.plan_expires_at - datetime.utcnow()
+        delta = _as_utc(user.plan_expires_at) - _utc_now()
         days_remaining = max(0, delta.days)
     
     plan = user.plan
     expires_at = user.plan_expires_at
     
-    if plan != "free" and expires_at and expires_at < datetime.utcnow():
+    if plan != "free" and expires_at and _as_utc(expires_at) < _utc_now():
         plan = "free"
         expires_at = None
         days_remaining = None
@@ -848,11 +865,13 @@ async def get_subscription_status(
 
 @router.get("/history")
 async def get_payment_history(
-    limit: int = 20,
+    limit: int = 100,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Get user's payment/transaction history"""
+    limit = max(1, min(int(limit or 100), 500))
+
     result = await db.execute(
         select(Transaction)
         .where(
@@ -887,6 +906,93 @@ async def get_payment_history(
     }
 
 
+@router.delete("/history/{transaction_id}")
+async def delete_payment_history_item(
+    transaction_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_redis)
+):
+    """Delete a single payment history item. Allowed in non-production development builds."""
+    if settings.ENVIRONMENT.lower() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Transaction deletion is disabled in production."
+        )
+
+    result = await db.execute(
+        select(Transaction).where(
+            Transaction.id == transaction_id,
+            Transaction.user_id == user.id,
+            Transaction.type == "payment"
+        )
+    )
+    transaction = result.scalar_one_or_none()
+
+    if not transaction:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Transaction not found"
+        )
+
+    await db.delete(transaction)
+    await db.commit()
+    await redis.delete(f"subscription:{user.id}")
+
+    return {
+        "success": True,
+        "deleted_id": str(transaction.id),
+        "message": "Transaction deleted successfully."
+    }
+
+
+@router.delete("/history")
+async def clear_payment_history(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_redis)
+):
+    """Clear all payment history and reset demo subscription state in development."""
+    if settings.ENVIRONMENT.lower() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Demo cleanup is disabled in production."
+        )
+
+    transaction_result = await db.execute(
+        delete(Transaction).where(
+            Transaction.user_id == user.id,
+            Transaction.type == "payment"
+        )
+    )
+
+    deleted_count = int(getattr(transaction_result, "rowcount", 0) or 0)
+
+    user.plan = "free"
+    user.plan_expires_at = None
+    user.subscription_platform = None
+
+    if user.usage_stats is None:
+        user.usage_stats = {}
+
+    user.usage_stats.pop("subscription_activated_at", None)
+    user.usage_stats.pop("subscription_cancelled_at", None)
+    user.usage_stats.pop("auto_renew", None)
+    user.usage_stats["demo_subscription_cleared_at"] = _utc_now().isoformat()
+
+    await db.commit()
+
+    await redis.delete(f"user:{user.id}")
+    await redis.delete(f"subscription:{user.id}")
+    await redis.delete(f"watchlist:{user.id}")
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "message": "Demo subscription data cleared successfully."
+    }
+
+
 @router.post("/cancel")
 async def cancel_subscription(
     user: User = Depends(get_current_user),
@@ -903,7 +1009,7 @@ async def cancel_subscription(
     if user.usage_stats is None:
         user.usage_stats = {}
     
-    user.usage_stats["subscription_cancelled_at"] = datetime.utcnow().isoformat()
+    user.usage_stats["subscription_cancelled_at"] = _utc_now().isoformat()
     user.usage_stats["auto_renew"] = False
     
     await db.commit()
@@ -961,7 +1067,7 @@ async def razorpay_webhook(
         if transaction and transaction.status == "pending":
             transaction.status = "success"
             transaction.razorpay_payment_id = payment.get("id")
-            transaction.processed_at = datetime.utcnow()
+            transaction.processed_at = _utc_now()
             await db.commit()
             logger.info(f"Transaction updated via webhook | Order: {order_id}")
     

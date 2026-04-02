@@ -723,6 +723,8 @@ class BusinessLogic:
         return TrendingProductResponse(
             product_id=str(product.id),
             title=ai_metadata.get("essence") or product.title or "Product",
+            category=getattr(product, "category", None),
+            subcategory=getattr(product, "subcategory", None),
             image_url=product.image_url,
             best_price=Decimal(str(listing.current_price or 0)),
             best_platform=best_platform_enum,
@@ -733,7 +735,9 @@ class BusinessLogic:
             variant_fingerprint=getattr(listing, "variant_fingerprint", None),
             base_fingerprint=getattr(product, "base_fingerprint", None),
             variant_type=getattr(product, "variant_type", None),
-            platform_count=platform_count
+            platform_count=platform_count,
+            last_updated_at=getattr(listing, "last_scraped", None),
+            last_price_change_at=getattr(listing, "last_price_change_at", None),
         )
     
     # ========================================================================
