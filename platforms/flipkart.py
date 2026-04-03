@@ -280,24 +280,39 @@ class FlipkartScraper(BasePlatformHandler):
                 };
 
                 const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = []) => {
-                    const uniquePrimary = Array
-                        .from(new Set((primaryCandidates || []).filter(Boolean)))
-                        .sort((a, b) => a - b);
+                    const uniquePrimary = [];
+                    (primaryCandidates || []).forEach((value) => {
+                        if (value && !uniquePrimary.includes(value)) {
+                            uniquePrimary.push(value);
+                        }
+                    });
 
                     if (uniquePrimary.length > 0) {
-                        if (uniquePrimary.length >= 2 && uniquePrimary[0] <= uniquePrimary[uniquePrimary.length - 1] * 0.2) {
-                            return uniquePrimary[1];
+                        if (uniquePrimary.length >= 2) {
+                            const maxPrimary = Math.max(...uniquePrimary);
+                            const minPrimary = Math.min(...uniquePrimary);
+                            if (minPrimary > 0 && maxPrimary / minPrimary >= 8 && minPrimary < 100 && maxPrimary >= 1000) {
+                                return maxPrimary;
+                            }
                         }
+
                         return uniquePrimary[0];
                     }
 
-                    const uniqueFallback = Array
-                        .from(new Set((fallbackCandidates || []).filter(Boolean)))
-                        .sort((a, b) => a - b);
+                    const uniqueFallback = [];
+                    (fallbackCandidates || []).forEach((value) => {
+                        if (value && !uniqueFallback.includes(value)) {
+                            uniqueFallback.push(value);
+                        }
+                    });
 
                     if (uniqueFallback.length === 0) return null;
-                    if (uniqueFallback.length >= 2 && uniqueFallback[0] <= uniqueFallback[uniqueFallback.length - 1] * 0.2) {
-                        return uniqueFallback[1];
+                    if (uniqueFallback.length >= 2) {
+                        const maxFallback = Math.max(...uniqueFallback);
+                        const minFallback = Math.min(...uniqueFallback);
+                        if (minFallback > 0 && maxFallback / minFallback >= 8 && minFallback < 100 && maxFallback >= 1000) {
+                            return maxFallback;
+                        }
                     }
                     return uniqueFallback[0];
                 };
@@ -561,24 +576,39 @@ class FlipkartScraper(BasePlatformHandler):
                 };
 
                 const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = []) => {
-                    const uniquePrimary = Array
-                        .from(new Set((primaryCandidates || []).filter(Boolean)))
-                        .sort((a, b) => a - b);
+                    const uniquePrimary = [];
+                    (primaryCandidates || []).forEach((value) => {
+                        if (value && !uniquePrimary.includes(value)) {
+                            uniquePrimary.push(value);
+                        }
+                    });
 
                     if (uniquePrimary.length > 0) {
-                        if (uniquePrimary.length >= 2 && uniquePrimary[0] <= uniquePrimary[uniquePrimary.length - 1] * 0.2) {
-                            return uniquePrimary[1];
+                        if (uniquePrimary.length >= 2) {
+                            const maxPrimary = Math.max(...uniquePrimary);
+                            const minPrimary = Math.min(...uniquePrimary);
+                            if (minPrimary > 0 && maxPrimary / minPrimary >= 8 && minPrimary < 100 && maxPrimary >= 1000) {
+                                return maxPrimary;
+                            }
                         }
+
                         return uniquePrimary[0];
                     }
 
-                    const uniqueFallback = Array
-                        .from(new Set((fallbackCandidates || []).filter(Boolean)))
-                        .sort((a, b) => a - b);
+                    const uniqueFallback = [];
+                    (fallbackCandidates || []).forEach((value) => {
+                        if (value && !uniqueFallback.includes(value)) {
+                            uniqueFallback.push(value);
+                        }
+                    });
 
                     if (uniqueFallback.length === 0) return null;
-                    if (uniqueFallback.length >= 2 && uniqueFallback[0] <= uniqueFallback[uniqueFallback.length - 1] * 0.2) {
-                        return uniqueFallback[1];
+                    if (uniqueFallback.length >= 2) {
+                        const maxFallback = Math.max(...uniqueFallback);
+                        const minFallback = Math.min(...uniqueFallback);
+                        if (minFallback > 0 && maxFallback / minFallback >= 8 && minFallback < 100 && maxFallback >= 1000) {
+                            return maxFallback;
+                        }
                     }
                     return uniqueFallback[0];
                 };

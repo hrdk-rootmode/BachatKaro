@@ -133,3 +133,11 @@ python jobs/daily_scrape.py --force-all --max-products 500
 - Very low max-products compared to total listing count
 
 If you want, I can add a “coverage report” log per cycle (total listings, due listings, processed, remaining by platform) so you can verify 100% coverage health continuously.
+
+
+
+BUILD APK : 
+ Push-Location "C:\PROJECT\collage\dealhunt-app\android"; $env:JAVA_HOME='C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot'; $env:PATH="$env:JAVA_HOME\bin;$env:PATH"; $env:NODE_ENV='production'; .\gradlew.bat :app:installRelease -x lintVitalAnalyzeRelease --no-daemon; Pop-Location
+
+Install and Lunch in Device: 
+$adb='C:\Users\patel\AppData\Local\Android\Sdk\platform-tools\adb.exe'; & $adb shell am force-stop com.dealhunt.app; & $adb shell monkey -p com.dealhunt.app -c android.intent.category.LAUNCHER 1

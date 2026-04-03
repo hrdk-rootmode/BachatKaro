@@ -917,6 +917,8 @@ class ProductService:
 
         best_candidate = None
         best_score = 0.0
+        has_variant_hints = bool(incoming_storage or incoming_color)
+        min_similarity = 0.74 if has_variant_hints else 0.88
 
         for candidate in candidates:
             listing_check = await db.execute(
@@ -948,7 +950,7 @@ class ProductService:
                 best_score = similarity
                 best_candidate = candidate
 
-        if best_candidate and best_score >= 0.74:
+        if best_candidate and best_score >= min_similarity:
             logger.info(
                 f"🔗 BASE-FP fallback match: product_id={best_candidate.id} "
                 f"(title_similarity={best_score:.2f})"
