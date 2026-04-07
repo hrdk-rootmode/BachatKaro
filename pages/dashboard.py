@@ -3,6 +3,8 @@ from auth import get_auth_state, enforce_session_timeout
 from config import load_settings
 from api_client import AdminApiClient, ApiError
 import pandas as pd
+import numpy as np
+import datetime
 
 st.set_page_config(
     page_title="Dashboard",
@@ -57,12 +59,37 @@ try:
 except ApiError as e:
     health_error = str(e)
 
+logs_data = {}
+logs_error = None
+try:
+    logs_data = api.system_logs(token, days=30)
+except ApiError as e:
+    logs_error = str(e)
+
 if stats_error:
     st.warning(f"Stats endpoint issue: {stats_error}")
 if revenue_error:
     st.warning(f"Revenue endpoint issue: {revenue_error}")
 if health_error:
     st.warning(f"Health endpoint issue: {health_error}")
+if logs_error:
+    st.warning(f"Logs endpoint issue: {logs_error}")
+
+logs_list = logs_data.get("logs", [])
+if logs_list:
+    df_logs = pd.DataFrame([
+        {
+            "Date": pd.to_datetime(L["date"]),
+            "DAU": L.get("analytics", {}).get("active_users", 0),
+            "Revenue": L.get("analytics", {}).get("revenue_inr", 0),
+            "Searches": L.get("analytics", {}).get("searches_performed", 0),
+            "Scraped": L.get("scraping_summary", {}).get("products_scraped", 0)
+        }
+        for L in logs_list
+    ]).set_index("Date").sort_index()
+else:
+    df_logs = pd.DataFrame(columns=["DAU", "Revenue", "Searches", "Scraped"])
+    df_logs.index.name = "Date"
 
 traffic = stats.get("traffic", {})
 engagement = stats.get("engagement", {})
@@ -89,7 +116,7 @@ today_total = float(revenue.get("today", {}).get("total", 0) or 0)
 affiliate_clicks = int(stats.get("conversions", {}).get("affiliate_clicks_today", 0) or 0)
 
 if "dashboard_focus" not in st.session_state:
-    st.session_state["dashboard_focus"] = "today"
+    st.session_state["dashboard_focus"] = None
 
 focus = st.session_state["dashboard_focus"]
 
@@ -140,87 +167,172 @@ with card_cols[4]:
 
 st.divider()
 
-with st.expander("Today Analysis", expanded=focus == "today"):
-    t1, t2, t3, t4 = st.columns(4)
-    with t1:
-        st.metric("Searches Today", f"{searches:,}")
-    with t2:
-        st.metric("Revenue Today", f"₹{today_total:,.0f}")
-    with t3:
-        st.metric("Scraped Today", f"{scraped_today:,}")
-    with t4:
-        st.metric("Affiliate Clicks", f"{affiliate_clicks:,}")
-    st.write(f"Cache hit rate: {cache_hit_rate:.1f}%")
+if focus == "today":
+    st.markdown("### Today Analysis")
+    with st.container(border=True):
+        t1, t2, t3, t4 = st.columns(4)
+        with t1:
+            st.metric("Searches Today", f"{searches:,}")
+        with t2:
+            st.metric("Revenue Today", f"₹{today_total:,.0f}")
+        with t3:
+            st.metric("Scraped Today", f"{scraped_today:,}")
+        with t4:
+            st.metric("Affiliate Clicks", f"{affiliate_clicks:,}")
+        st.write(f"Cache hit rate: {cache_hit_rate:.1f}%")
 
-with st.expander("Users Analysis", expanded=focus == "users"):
-    u1, u2, u3, u4 = st.columns(4)
-    with u1:
-        st.metric("Total Users", f"{total_users:,}")
-    with u2:
-        st.metric("DAU", f"{dau:,}")
-    with u3:
-        st.metric("WAU", f"{wau:,}")
-    with u4:
-        st.metric("MAU", f"{mau:,}")
+        st.markdown("#### Recent 7 Days Trend")
+        if not df_logs.empty and len(df_logs) >= 1:
+            st.line_chart(df_logs.tail(7)[["Searches", "Revenue"]])
+        else:
+            st.info("Not enough historical log data for a trend chart.")
 
-    segment_rows = [
-        {"Segment": "Free", "Users": free_users},
-        {"Segment": "Pro", "Users": pro_users},
-        {"Segment": "Premium", "Users": premium_users},
-    ]
-    segment_df = pd.DataFrame(segment_rows)
-    if total_users > 0:
-        segment_df["Share %"] = segment_df["Users"].apply(lambda x: round((x / total_users) * 100, 1))
-    else:
-        segment_df["Share %"] = 0.0
-    st.dataframe(segment_df, hide_index=True, use_container_width=True)
+elif focus == "users":
+    st.markdown("### Users Analysis")
+    with st.container(border=True):
+        u1, u2, u3, u4 = st.columns(4)
+        with u1:
+            st.metric("Total Users", f"{total_users:,}")
+        with u2:
+            st.metric("DAU", f"{dau:,}")
+        with u3:
+            st.metric("WAU", f"{wau:,}")
+        with u4:
+            st.metric("MAU", f"{mau:,}")
 
-with st.expander("Products Analysis", expanded=focus == "products"):
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.metric("Total Products", f"{total_products:,}")
-    with p2:
-        st.metric("Active Listings", f"{active_products:,}")
-    with p3:
-        active_ratio = round((active_products / total_products) * 100, 1) if total_products > 0 else 0
-        st.metric("Active Ratio", f"{active_ratio:.1f}%")
-    st.write(f"Products scraped today: {scraped_today:,}")
+        tabs = st.tabs(["Daily", "Weekly", "Monthly"])
+        with tabs[0]:
+            if not df_logs.empty:
+                st.bar_chart(df_logs["DAU"])
+        with tabs[1]:
+            if not df_logs.empty:
+                st.line_chart(df_logs["DAU"].resample('W').mean())
+        with tabs[2]:
+            if not df_logs.empty:
+                st.line_chart(df_logs["DAU"].resample('ME').mean())
 
-with st.expander("Revenue Analysis", expanded=focus == "revenue"):
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        st.metric("Total Revenue", f"₹{revenue_val:,.0f}")
-    with r2:
-        st.metric("MRR", f"₹{mrr:,.0f}")
-    with r3:
-        st.metric("Conversion Rate", f"{conversion:.2f}%")
+        st.markdown("#### Plan Segments")
+        segment_rows = [
+            {"Segment": "Free", "Users": free_users},
+            {"Segment": "Pro", "Users": pro_users},
+            {"Segment": "Premium", "Users": premium_users},
+        ]
+        segment_df = pd.DataFrame(segment_rows)
+        if total_users > 0:
+            segment_df["Share %"] = segment_df["Users"].apply(lambda x: round((x / total_users) * 100, 1))
+        else:
+            segment_df["Share %"] = 0.0
+        
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.dataframe(segment_df, hide_index=True, use_container_width=True)
+        with c2:
+            st.bar_chart(segment_df.set_index("Segment")["Users"])
 
-    this_month = revenue.get("this_month", {})
-    rev_df = pd.DataFrame([
-        {"Metric": "This Month Total", "Value": float(this_month.get("total", 0) or 0)},
-        {"Metric": "This Month MRR", "Value": float(this_month.get("mrr", 0) or 0)},
-        {"Metric": "Affiliate", "Value": float(this_month.get("affiliate", 0) or 0)},
-        {"Metric": "Promotions", "Value": float(this_month.get("promotions", 0) or 0)},
-        {"Metric": "Growth vs Last Month %", "Value": float(this_month.get("growth_vs_last_month", 0) or 0)},
-    ])
-    st.dataframe(rev_df, hide_index=True, use_container_width=True)
+elif focus == "products":
+    st.markdown("### Products Analysis")
+    with st.container(border=True):
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            st.metric("Total Products", f"{total_products:,}")
+        with p2:
+            st.metric("Active Listings", f"{active_products:,}")
+        with p3:
+            active_ratio = round((active_products / total_products) * 100, 1) if total_products > 0 else 0
+            st.metric("Active Ratio", f"{active_ratio:.1f}%")
+        st.write(f"Products scraped today: {scraped_today:,}")
 
-with st.expander("System Analysis", expanded=focus == "system"):
-    s1, s2, s3 = st.columns(3)
-    redis_health = health.get("redis", {})
-    redis_status = redis_health.get("status", "unknown")
-    overall_status = health.get("overall", "unknown")
+        st.markdown("#### Scrape History")
+        tabs = st.tabs(["Daily", "Weekly", "Monthly"])
+        with tabs[0]:
+            if not df_logs.empty:
+                st.bar_chart(df_logs["Scraped"])
+        with tabs[1]:
+            if not df_logs.empty:
+                st.line_chart(df_logs["Scraped"].resample('W').sum())
+        with tabs[2]:
+            if not df_logs.empty:
+                st.line_chart(df_logs["Scraped"].resample('ME').sum())
 
-    with s1:
-        st.metric("Database", db_status.upper(), f"{db_health.get('connections', 0)} connections")
-    with s2:
-        redis_detail = redis_health.get("memory_used") or redis_health.get("message", "N/A")
-        st.metric("Redis", redis_status.upper(), redis_detail)
-    with s3:
-        st.metric("Overall", str(overall_status).upper(), f"Cache hit {cache_hit_rate:.1f}%")
+        st.markdown("#### Category Breakdown")
+        categories_dict = products.get("by_category", {})
+        if categories_dict:
+            cat_df = pd.DataFrame(list(categories_dict.items()), columns=["Category", "Count"]).set_index("Category")
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.dataframe(cat_df, use_container_width=True)
+            with c2:
+                st.bar_chart(cat_df)
+        else:
+            st.info("Category breakdown data is not available currently from backend.")
 
-    st.write("**Scraper Health**")
-    st.write(health.get("scrapers", {}))
+elif focus == "revenue":
+    st.markdown("### Revenue Analysis")
+    with st.container(border=True):
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            st.metric("Total Revenue", f"₹{revenue_val:,.0f}")
+        with r2:
+            st.metric("MRR", f"₹{mrr:,.0f}")
+        with r3:
+            st.metric("Conversion Rate", f"{conversion:.2f}%")
+
+        st.markdown("#### Revenue Trends")
+        tabs = st.tabs(["Daily", "Weekly", "Monthly"])
+        with tabs[0]:
+            if not df_logs.empty:
+                st.bar_chart(df_logs["Revenue"])
+        with tabs[1]:
+            if not df_logs.empty:
+                st.line_chart(df_logs["Revenue"].resample('W').sum())
+        with tabs[2]:
+            if not df_logs.empty:
+                st.line_chart(df_logs["Revenue"].resample('ME').sum())
+
+        this_month = revenue.get("this_month", {})
+        rev_df = pd.DataFrame([
+            {"Metric": "This Month Total", "Value": float(this_month.get("total", 0) or 0)},
+            {"Metric": "This Month MRR", "Value": float(this_month.get("mrr", 0) or 0)},
+            {"Metric": "Affiliate", "Value": float(this_month.get("affiliate", 0) or 0)},
+            {"Metric": "Promotions", "Value": float(this_month.get("promotions", 0) or 0)},
+            {"Metric": "Growth vs Last Month %", "Value": float(this_month.get("growth_vs_last_month", 0) or 0)},
+        ])
+        st.dataframe(rev_df, hide_index=True, use_container_width=True)
+
+elif focus == "system":
+    st.markdown("### System Analysis")
+    with st.container(border=True):
+        s1, s2, s3 = st.columns(3)
+        redis_health = health.get("redis", {})
+        redis_status = redis_health.get("status", "unknown")
+        overall_status = health.get("overall", "unknown")
+
+        with s1:
+            st.metric("Database", db_status.upper(), f"{db_health.get('connections', 0)} connections")
+        with s2:
+            redis_detail = redis_health.get("memory_used") or redis_health.get("message", "N/A")
+            st.metric("Redis", redis_status.upper(), redis_detail)
+        with s3:
+            st.metric("Overall", str(overall_status).upper(), f"Cache hit {cache_hit_rate:.1f}%")
+
+        st.markdown("#### 🕷️ Platform Scrapers")
+        scrapers = health.get("scrapers", {})
+        if scrapers:
+            cols = st.columns(min(len(scrapers), 4) or 1)
+            for idx, (plat, plat_data) in enumerate(scrapers.items()):
+                with cols[idx % len(cols)]:
+                    with st.container(border=True):
+                        if isinstance(plat_data, dict):
+                            status = plat_data.get("status", "unknown")
+                            st.write(f"**{plat.upper()}** - {'🟢' if status == 'ok' else '🔴' if status == 'error' else '🟠'}")
+                            for k, v in plat_data.items():
+                                if k != "status":
+                                    st.caption(f"{k}: {v}")
+                        else:
+                            st.write(f"**{plat.upper()}**")
+                            st.write(str(plat_data))
+        else:
+            st.info("No scraper data collected yet.")
 
 # Recent transactions
 st.divider()

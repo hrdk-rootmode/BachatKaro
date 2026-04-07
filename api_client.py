@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -121,6 +122,10 @@ class AdminApiClient:
     def admin_health(self, token: str) -> Any:
         return self._data(self._request("GET", "/admin/system/health", token=token))
 
+    def system_logs(self, token: str, days: int = 30) -> Any:
+        params = {"days": days}
+        return self._data(self._request("GET", "/admin/system/logs", token=token, params=params))
+
     # Users CRUD
     def list_users(
         self,
@@ -210,6 +215,34 @@ class AdminApiClient:
         payload = {"job_id": job_id}
         return self._data(self._request("POST", "/admin/system/trigger-job", token=token, json=payload))
 
+    # Product Management
+    def list_products(
+        self,
+        token: str,
+        page: int = 1,
+        limit: int = 50,
+        search: str | None = None,
+        category: str | None = None,
+        brand: str | None = None,
+        platform: str | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {"page": page, "limit": limit}
+        if search: params["search"] = search
+        if category: params["category"] = category
+        if brand: params["brand"] = brand
+        if platform: params["platform"] = platform
+        
+        return self._data(self._request("GET", "/admin/products", token=token, params=params))
+
+    def product_detail(self, token: str, product_id: str) -> Any:
+        return self._data(self._request("GET", f"/admin/products/{product_id}", token=token))
+
+    def update_product(self, token: str, product_id: str, update_data: dict) -> Any:
+        return self._data(self._request("PUT", f"/admin/products/{product_id}", token=token, json=update_data))
+
+    def delete_product(self, token: str, product_id: str) -> Any:
+        return self._data(self._request("DELETE", f"/admin/products/{product_id}", token=token))
+
     def force_scrape(
         self,
         token: str,
@@ -221,3 +254,48 @@ class AdminApiClient:
         if category:
             payload["category"] = category
         return self._data(self._request("POST", "/admin/system/force-scrape", token=token, json=payload))
+
+    # Price Management
+    def update_listing_price(
+        self,
+        token: str,
+        listing_id: str,
+        new_price: float,
+        original_price: float | None = None,
+    ) -> Any:
+        payload = {
+            "current_price": new_price,
+        }
+        if original_price is not None:
+            payload["original_price"] = original_price
+        return self._data(self._request("PUT", f"/admin/listings/{listing_id}/price", token=token, json=payload))
+
+    def get_price_history(
+        self,
+        token: str,
+        listing_id: str,
+        days: int = 30
+    ) -> Any:
+        params = {"days": days}
+        return self._data(self._request("GET", f"/admin/listings/{listing_id}/price-history", token=token, params=params))
+
+    def add_price_point(
+        self,
+        token: str,
+        listing_id: str,
+        price: float,
+        in_stock: bool = True
+    ) -> Any:
+        payload = {
+            "price": price,
+            "in_stock": in_stock,
+            "recorded_at": datetime.utcnow().isoformat()
+        }
+        return self._data(self._request("POST", f"/admin/listings/{listing_id}/price-history", token=token, json=payload))
+
+    def get_listing_performance(
+        self,
+        token: str,
+        listing_id: str
+    ) -> Any:
+        return self._data(self._request("GET", f"/admin/listings/{listing_id}/performance", token=token))
