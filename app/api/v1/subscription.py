@@ -16,7 +16,7 @@ import json
 from app.core.database import get_db
 from app.core.redis_client import RedisClient, get_redis
 from app.core.config import settings
-from app.models import User, SubscriptionPlan, Transaction
+from app.models import User, Transaction
 from app.schemas import (
     SubscriptionPlanResponse,
     CreateOrderRequest,
@@ -37,6 +37,12 @@ from app.schemas import (
     PaymentMethodStatus,
 )
 from app.api.deps import get_current_user
+from app.services.plan_catalog import (
+    get_plan_catalog,
+    get_plan_config,
+    get_plan_from_sku,
+    get_paid_plan_ids,
+)
 
 # ✨ NEW: Import payment services
 from app.services.payments import (
@@ -50,71 +56,8 @@ router = APIRouter()
 
 
 # =============================================================================
-# PLAN CONFIGURATION
-# =============================================================================
-
-PLAN_CONFIG = {
-    "pro": {
-        "name": "Pro",
-        "price_inr": settings.PLAN_PRO_PRICE,
-        "duration_days": settings.PLAN_PRO_DURATION_DAYS,
-        "features": {
-            "daily_searches": settings.PLAN_PRO_SEARCHES,
-            "watchlist_limit": settings.PLAN_PRO_WISHLIST,
-            "price_alerts": True,
-            "ad_free": False,
-            "streak_freezes": 5,
-            "priority_support": False
-        },
-        "limits": {
-            "searches_per_day": settings.PLAN_PRO_SEARCHES,
-            "watchlist_limit": settings.PLAN_PRO_WISHLIST
-        },
-        "popular": True,
-        "google_play_sku": settings.GOOGLE_PLAY_PRO_SKU
-    },
-    "premium": {
-        "name": "Premium",
-        "price_inr": settings.PLAN_PREMIUM_PRICE,
-        "duration_days": settings.PLAN_PREMIUM_DURATION_DAYS,
-        "features": {
-            "daily_searches": -1,
-            "watchlist_limit": -1,
-            "price_alerts": True,
-            "ad_free": True,
-            "streak_freezes": -1,
-            "priority_support": True,
-            "ai_chat": True,
-            "export_data": True
-        },
-        "limits": {
-            "searches_per_day": -1,
-            "watchlist_limit": -1
-        },
-        "popular": False,
-        "google_play_sku": settings.GOOGLE_PLAY_PREMIUM_SKU
-    }
-}
-
-
-# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
-
-def get_plan_config(plan_id: str) -> dict:
-    """Get plan configuration by ID"""
-    if plan_id not in PLAN_CONFIG:
-        raise ValueError(f"Invalid plan: {plan_id}")
-    return PLAN_CONFIG[plan_id]
-
-
-def get_plan_from_sku(sku: str) -> Optional[str]:
-    """Get plan ID from Google Play SKU"""
-    for plan_id, config in PLAN_CONFIG.items():
-        if config.get("google_play_sku") == sku:
-            return plan_id
-    return None
-
 
 def _utc_now() -> datetime:
     """Return a timezone-aware UTC datetime for all subscription comparisons."""
@@ -181,7 +124,7 @@ async def activate_subscription(
     Returns:
         New expiry datetime
     """
-    plan_config = get_plan_config(plan_id)
+    plan_config = await get_plan_config(db, plan_id)
     duration_days = plan_config["duration_days"]
 
     current_expiry = _as_utc(user.plan_expires_at)
@@ -221,6 +164,7 @@ async def activate_subscription(
 @router.get("/plans", response_model=List[SubscriptionPlanResponse])
 async def get_subscription_plans(
     platform: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
     """
@@ -233,12 +177,13 @@ async def get_subscription_plans(
         List of plans with features and pricing
     """
     plans = []
-    
-    for plan_id, config in PLAN_CONFIG.items():
+    catalog = await get_plan_catalog(db)
+
+    for _, config in catalog.items():
         plan_response = SubscriptionPlanResponse(
-            plan_id=plan_id,
-            name=config["name"],
-            price=Decimal(str(config["price_inr"] / 100)),
+            plan_id=config["plan_id"],
+            name=config.get("display_name") or config["name"],
+            price=Decimal(str(config["price_paise"] / 100)),
             duration_days=config["duration_days"],
             features=config["features"],
             limits=config["limits"],
@@ -306,15 +251,24 @@ async def create_payment_order(
     For web: Creates Razorpay order
     For android: Returns Google Play SKU
     """
+    plan_catalog = await get_plan_catalog(db)
+    paid_plan_ids = get_paid_plan_ids(plan_catalog)
+
+    if request.plan_id not in paid_plan_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only paid plans can be purchased. Available paid plans: {', '.join(paid_plan_ids)}"
+        )
+
     try:
-        plan_config = get_plan_config(request.plan_id)
+        plan_config = await get_plan_config(db, request.plan_id)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    
-    amount = plan_config["price_inr"]
+
+    amount = int(plan_config["price_paise"])
     platform = request.platform.value if hasattr(request.platform, 'value') else request.platform
     
     # =========================================================================
@@ -352,7 +306,7 @@ async def create_payment_order(
             razorpay_order_id=order["id"],
             metadata={
                 "plan_id": request.plan_id,
-                "plan_name": plan_config["name"],
+                "plan_name": plan_config.get("display_name") or plan_config["name"],
                 "duration_days": plan_config["duration_days"],
                 "mock_mode": razorpay_client.is_mock_mode
             }
@@ -504,7 +458,7 @@ async def verify_razorpay_payment(
     
     # Activate subscription
     plan_id = transaction.meta_data.get("plan_id", "pro")
-    plan_config = get_plan_config(plan_id)
+    plan_config = await get_plan_config(db, plan_id)
     
     new_expiry = await activate_subscription(
         user=user,
@@ -569,15 +523,17 @@ async def verify_google_play_purchase(
             detail=f"Purchase verification failed: {str(e)}"
         )
     
+    plan_catalog = await get_plan_catalog(db)
+
     # Get plan from SKU
-    plan_id = get_plan_from_sku(request.product_id)
+    plan_id = get_plan_from_sku(request.product_id, plan_catalog)
     if not plan_id:
         # Try direct match
         plan_id = request.product_id.replace("dealhunt_", "").replace("_monthly", "")
-        if plan_id not in PLAN_CONFIG:
+        if plan_id not in plan_catalog:
             plan_id = "pro"  # Default fallback
-    
-    plan_config = get_plan_config(plan_id)
+
+    plan_config = await get_plan_config(db, plan_id)
     
     # Check for duplicate transaction
     existing = await db.execute(
@@ -595,14 +551,14 @@ async def verify_google_play_purchase(
         db=db,
         user_id=user.id,
         transaction_type="payment",
-        amount=plan_config["price_inr"] / 100,
+        amount=plan_config["price_paise"] / 100,
         status="success",
         platform="android",
         purchase_token=request.purchase_token,
         google_order_id=result.get("order_id"),
         metadata={
             "plan_id": plan_id,
-            "plan_name": plan_config["name"],
+            "plan_name": plan_config.get("display_name") or plan_config["name"],
             "duration_days": plan_config["duration_days"],
             "product_id": request.product_id,
             "mock_mode": result.get("mock_mode", google_play_client.is_mock_mode),
@@ -1025,9 +981,16 @@ async def cancel_subscription(
     if user.subscription_platform == "android":
         cancel_instructions = " To stop future charges, please cancel your subscription in Google Play Store."
     
+    plan_display_name = user.plan.title()
+    try:
+        plan_cfg = await get_plan_config(db, user.plan, include_inactive=True)
+        plan_display_name = plan_cfg.get("display_name") or plan_cfg.get("name") or plan_display_name
+    except Exception:
+        pass
+
     return {
         "success": True,
-        "message": f"Subscription cancelled. You'll retain {user.plan} access until {user.plan_expires_at.strftime('%Y-%m-%d') if user.plan_expires_at else 'N/A'}.{cancel_instructions}",
+        "message": f"Subscription cancelled. You'll retain {plan_display_name} access until {user.plan_expires_at.strftime('%Y-%m-%d') if user.plan_expires_at else 'N/A'}.{cancel_instructions}",
         "access_until": user.plan_expires_at,
         "platform": user.subscription_platform
     }

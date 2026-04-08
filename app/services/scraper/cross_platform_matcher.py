@@ -408,6 +408,10 @@ class CrossPlatformMatcher:
     ESSENCE_MATCH_SCORE = 1.0
     MAX_CONCURRENT_SEARCHES = 4
     SEARCH_TIMEOUT_SECONDS = 30
+
+    # Fix S4: set to True to re-enable the relaxed recovery pass that skips
+    # RAM / variant guards.  Disabled by default to prevent cross-variant matches.
+    ENABLE_RELAXED_MATCHING = False
     
     # Price tolerances by category
     PRICE_TOLERANCE = {
@@ -907,7 +911,9 @@ class CrossPlatformMatcher:
                 best_score = score
 
         # Recovery pass: if strict pass found nothing, allow a guarded relaxed reject policy.
-        if not best_match:
+        # Fix S4: gated behind ENABLE_RELAXED_MATCHING (default False) to
+        # prevent cross-variant false positives (e.g. 4GB → 8GB, Pro → Standard).
+        if self.ENABLE_RELAXED_MATCHING and not best_match:
             relaxed_threshold = max(0.55, self.MIN_SIMILARITY_SCORE - 0.08)
             for candidate, target_specs in preprocessed_candidates:
                 passed, _ = check_quality_gate(candidate.title, target_specs)

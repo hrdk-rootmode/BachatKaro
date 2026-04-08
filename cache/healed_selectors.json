@@ -2,13 +2,13 @@
   "amazon": {
     "product_title": {
       "selector": "#productTitle",
-      "healed_at": "2026-04-03T15:58:43.975511",
+      "healed_at": "2026-04-08T06:03:34.248296",
       "method": "promoted",
       "version": 1,
-      "success_count": 452,
+      "success_count": 942,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-03T16:05:18.306520"
+      "last_success": "2026-04-08T08:43:28.310744"
     },
     "original_price": {
       "selector": "span[class*=\"price\"]",
@@ -22,23 +22,23 @@
     },
     "product_price": {
       "selector": "span.a-price-whole",
-      "healed_at": "2026-04-03T15:58:44.016590",
+      "healed_at": "2026-04-08T06:03:34.294472",
       "method": "promoted",
       "version": 1,
-      "success_count": 492,
-      "fail_count": 0,
+      "success_count": 942,
+      "fail_count": 2,
       "promoted": true,
-      "last_success": "2026-04-03T16:05:18.389898"
+      "last_success": "2026-04-08T08:43:28.351279"
     },
     "product_rating": {
       "selector": "span.a-icon-alt",
-      "healed_at": "2026-04-03T15:58:44.107536",
+      "healed_at": "2026-04-08T06:03:34.394141",
       "method": "promoted",
       "version": 1,
-      "success_count": 442,
+      "success_count": 930,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-03T16:05:18.483779"
+      "last_success": "2026-04-08T08:43:28.475522"
     },
     "review_count": {
       "selector": "span.a-icon-alt",
@@ -62,13 +62,13 @@
     },
     "brand": {
       "selector": "span.a-icon-alt",
-      "healed_at": "2026-04-03T15:58:44.150925",
+      "healed_at": "2026-04-08T06:03:34.443385",
       "method": "promoted",
       "version": 1,
-      "success_count": 448,
+      "success_count": 938,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-03T16:05:18.533756"
+      "last_success": "2026-04-08T08:43:28.511555"
     },
     "discount_percent": {
       "selector": "span.a-offscreen",
@@ -91,13 +91,13 @@
     },
     "product_image": {
       "selector": "img:nth-of-type(1)",
-      "healed_at": "2026-04-03T15:58:44.064995",
+      "healed_at": "2026-04-08T08:44:43.805982",
       "method": "promoted",
       "version": 4,
-      "success_count": 1802,
+      "success_count": 2482,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-03T16:05:18.439056"
+      "last_success": "2026-04-08T08:44:43.808062"
     }
   },
   "flipkart": {
@@ -136,13 +136,13 @@
   "meesho": {
     "product_title": {
       "selector": "h1",
-      "healed_at": "2026-03-30T06:46:41.978204",
+      "healed_at": "2026-04-05T06:29:48.777914",
       "method": "promoted",
       "version": 1,
-      "success_count": 38,
+      "success_count": 98,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-03-30T06:47:56.382294"
+      "last_success": "2026-04-05T06:29:48.780155"
     }
   }
 }

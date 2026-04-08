@@ -11,7 +11,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, case, text, distinct
+from sqlalchemy import select, func, and_, or_, case, text, distinct, Numeric
 from sqlalchemy.sql import extract
 
 from app.models import (
@@ -92,6 +92,9 @@ class AnalyticsService:
         
         # Total lifetime revenue
         total_revenue = await self._get_total_revenue(db)
+
+        # Recent successful payments for dashboard table
+        recent_transactions = await self._get_recent_transactions(db, limit=10)
         
         # Calculate growth
         growth_percent = 0
@@ -111,6 +114,9 @@ class AnalyticsService:
         
         return {
             "total_revenue_inr": round(total_revenue, 2),
+            "monthly_recurring_revenue": round(mrr, 2),
+            "conversion_rate": round(conversion_rate, 2),
+            "recent_transactions": recent_transactions,
             "today": {
                 "subscriptions": round(today_revenue.get("subscriptions", 0), 2),
                 "affiliate_conversions": round(today_revenue.get("affiliate", 0), 2),
@@ -179,7 +185,7 @@ class AnalyticsService:
         promo_result = await db.execute(
             select(func.coalesce(
                 func.sum(
-                    func.cast(Promotion.stats['revenue_earned'].astext, Decimal)
+                    func.cast(Promotion.stats['revenue_earned'].astext, Numeric)
                 ), 0
             ))
             .where(
@@ -213,6 +219,32 @@ class AnalyticsService:
             )
         )
         return float(result.scalar() or 0)
+
+    async def _get_recent_transactions(self, db: AsyncSession, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get latest successful payment transactions for admin dashboard."""
+        result = await db.execute(
+            select(Transaction)
+            .where(
+                and_(
+                    Transaction.type == "payment",
+                    Transaction.status == "success"
+                )
+            )
+            .order_by(Transaction.created_at.desc())
+            .limit(limit)
+        )
+        rows = result.scalars().all()
+
+        return [
+            {
+                "id": str(tx.id),
+                "type": tx.type,
+                "amount": float(tx.amount or 0),
+                "status": tx.status,
+                "created_at": tx.created_at.isoformat() if tx.created_at else None,
+            }
+            for tx in rows
+        ]
     
     async def calculate_mrr(self, db: AsyncSession) -> float:
         """
@@ -547,7 +579,8 @@ class AnalyticsService:
         return {
             "total_tracked": total,
             "with_active_listings": active,
-            "scraped_today": scraped_today
+            "scraped_today": scraped_today,
+            "by_category": await self.get_products_by_category(db)
         }
     
     async def get_searches_today(self, db: AsyncSession) -> int:
@@ -694,6 +727,16 @@ class AnalyticsService:
         log.analytics = analytics
         
         await db.commit()
+
+    async def get_products_by_category(self, db: AsyncSession) -> Dict[str, int]:
+        """Get product count by category"""
+        result = await db.execute(
+            select(Product.category, func.count(Product.id))
+            .group_by(Product.category)
+            .order_by(func.count(Product.id).desc())
+        )
+        rows = result.all()
+        return {row[0]: row[1] for row in rows}
 
 
 # =============================================================================

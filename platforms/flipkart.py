@@ -1,9 +1,9 @@
 """
-Flipkart.com Scraper - AI HEALING + JAVASCRIPT FALLBACK v2.0
+Flipkart.com Scraper - AI HEALING + JAVASCRIPT FALLBACK v2.2
 AI-first extraction with multiple fallback strategies
 
 Author: DealHunt
-Version: 2.0.0 - Production Grade
+Version: 2.2.0 - Production Grade (Universal Price Fix)
 Reliability: 95%
 """
 
@@ -13,7 +13,7 @@ import hashlib
 import asyncio
 import time
 from typing import Optional, List, Dict, Any
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from urllib.parse import urlencode, urlparse, parse_qs
 
@@ -58,6 +58,33 @@ class FlipkartScraper(BasePlatformHandler):
     
     BASE_URL = "https://www.flipkart.com"
     SEARCH_URL = "https://www.flipkart.com/search"
+
+    CATEGORY_PATTERNS = {
+        "mobile": ["mobile", "phone", "smartphone", "iphone", "pixel", "samsung", "oneplus", "xiaomi", "redmi", "oppo", "vivo", "realme"],
+        "laptop": ["laptop", "notebook", "macbook", "ultrabook", "chromebook", "thinkpad", "inspiron", "pavilion", "ideapad"],
+        "tablet": ["tablet", "ipad", "tab"],
+        "fashion": ["shirt", "dress", "tshirt", "t-shirt", "saree", "jeans", "trouser", "jacket", "shoes", "top", "pant", "kurta", "kurti"],
+        "home": ["table", "chair", "bed", "sofa", "mattress", "pillow", "cushion"],
+        "kitchen": ["cooker", "pan", "kadai", "mixer", "grinder", "fryer", "kettle", "cookware"],
+        "book": ["book", "ebook", "novel", "textbook", "paperback", "hardcover"],
+        "accessories": ["charger", "cable", "case", "cover", "pouch", "adapter", "cord", "wire", "earphone", "headphone", "earbuds", "tempered glass", "screen protector", "power bank", "airpods", "buds"],
+        "watch": ["watch", "smartwatch"],
+        "bag": ["bag", "backpack", "handbag", "suitcase", "luggage"],
+    }
+
+    PRICE_RANGES = {
+        "mobile": (2000, 600000),
+        "laptop": (10000, 1000000),
+        "tablet": (3000, 200000),
+        "fashion": (50, 150000),
+        "home": (100, 500000),
+        "kitchen": (100, 100000),
+        "book": (20, 5000),
+        "accessories": (20, 100000),
+        "watch": (100, 500000),
+        "bag": (100, 100000),
+        "general": (30, 1000000),
+    }
     
     def __init__(
         self,
@@ -70,10 +97,64 @@ class FlipkartScraper(BasePlatformHandler):
         self.browser_manager: Optional[BrowserManager] = None
         self.affiliate_id = config.affiliate_tag or getattr(settings, 'FLIPKART_AFFILIATE_ID', 'dealhunt')
         
-        logger.info(f"✅ FlipkartScraper v2.0 initialized (AI Healing: {'Active' if self.healing_engine else 'Inactive'})")
+        logger.info(f"✅ FlipkartScraper v2.2 initialized (AI Healing: {'Active' if self.healing_engine else 'Inactive'})")
+
+    def _detect_category(self, text: str) -> str:
+        """Detect product category from title or context."""
+        text_lower = (text or "").lower()
+        for category, keywords in self.CATEGORY_PATTERNS.items():
+            if any(keyword in text_lower for keyword in keywords):
+                return category
+        return "general"
+
+    def _validate_price_for_category(self, price: Optional[Decimal], title: str = "", context: str = "") -> tuple[bool, str]:
+        """Reject obvious ratings while keeping genuine low-price accessories."""
+        if price is None:
+            return False, "Price is None"
+
+        price_val = float(price)
+        title_context = f"{title} {context}".lower()
+        category = self._detect_category(title_context)
+
+        if 1.0 <= price_val <= 5.0 and price_val != int(price_val):
+            return False, f"Price ₹{price_val} looks like a rating"
+
+        if 1 <= price_val <= 9 and price_val == int(price_val) and category not in {"book", "accessories"}:
+            return False, f"Price ₹{price_val} looks like a review count"
+
+        min_price, max_price = self.PRICE_RANGES.get(category, self.PRICE_RANGES["general"])
+        if not (min_price <= price_val <= max_price):
+            return False, f"Price ₹{price_val} outside {category} range (₹{min_price}-₹{max_price})"
+
+        return True, "Valid"
+
+    def _apply_accessory_price_guard(
+        self,
+        title: str,
+        current_price: Optional[Decimal],
+        original_price: Optional[Decimal],
+        context_text: str = "",
+    ) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        """Keep accessory prices permissive while still dropping obvious bad originals."""
+        if current_price is None:
+            return None, None
+
+        current_valid, _ = self._validate_price_for_category(current_price, title, context_text)
+        if not current_valid:
+            return None, None
+
+        if original_price is not None:
+            original_valid, _ = self._validate_price_for_category(original_price, title, context_text)
+            if not original_valid or original_price <= current_price:
+                original_price = None
+
+        return current_price, original_price
 
     def _to_decimal_price(self, raw: Any) -> Optional[Decimal]:
-        """Convert extracted price value to Decimal safely."""
+        """
+        Convert extracted price value to Decimal safely.
+        ✅ FIXED: Better decimal handling and universal x100 detection
+        """
         if raw is None:
             return None
 
@@ -83,19 +164,63 @@ class FlipkartScraper(BasePlatformHandler):
         if isinstance(raw, (int, float)):
             try:
                 value = Decimal(str(raw))
-                return value if value > 0 else None
+                if value <= 0:
+                    return None
+                # ✅ Apply x100 fix universally
+                return self._fix_price_anomalies(value)
             except Exception:
                 return None
 
+        # Clean string input
         cleaned = re.sub(r"[^\d.]", "", str(raw))
         if not cleaned:
             return None
 
         try:
             value = Decimal(cleaned)
-            return value if value > 0 else None
+            if value <= 0:
+                return None
+            # ✅ Apply x100 fix universally
+            return self._fix_price_anomalies(value)
         except Exception:
             return None
+
+    def _fix_price_anomalies(self, price: Decimal) -> Decimal:
+        """
+        ✅ UNIVERSAL price anomaly detection and correction
+        Handles:
+        1. x100 inflation (99900 → 999)
+        2. Decimal-as-integer (21834 → 218)
+        3. Other weird Flipkart parsing issues
+        """
+        if price < Decimal("10"):
+            return price
+        
+        # Detect x100 inflation: price >= 10000
+        if price >= Decimal("10000"):
+            corrected = price / Decimal("100")
+            # If result is reasonable (₹20-₹50,000), use it
+            if Decimal("20") <= corrected <= Decimal("50000"):
+                logger.debug(f"🔧 x100 fix: ₹{price} → ₹{corrected}")
+                return corrected.quantize(Decimal('1'), rounding=ROUND_DOWN)
+        
+        # Detect decimal-as-integer: 21834 → 218.34 → 218
+        # This happens when "218.34" is parsed as "21834" (decimal point removed)
+        # Pattern: If price is 4-5 digits and ends in 34, 50, 75, 99 (common decimal endings)
+        price_int = int(price)
+        if 1000 <= price_int <= 99999:
+            last_two_digits = price_int % 100
+            # Common decimal endings that got merged: .34, .50, .75, .99, .25
+            if last_two_digits in [25, 34, 50, 75, 99]:
+                # Try dividing by 100
+                corrected = price / Decimal("100")
+                # If result is in reasonable book/product range (₹20-₹3000)
+                if Decimal("20") <= corrected <= Decimal("3000"):
+                    logger.debug(f"🔧 Decimal-as-integer fix: ₹{price} → ₹{corrected}")
+                    return corrected.quantize(Decimal('1'), rounding=ROUND_DOWN)
+        
+        # No anomaly detected, return as-is (rounded down)
+        return price.quantize(Decimal('1'), rounding=ROUND_DOWN)
 
     def _normalize_price_snapshot(
         self,
@@ -105,6 +230,7 @@ class FlipkartScraper(BasePlatformHandler):
     ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[float]]:
         """
         Ensure current_price is payable (discounted) and original_price is strike-through MRP.
+        ✅ FIXED: Always use LOWER price as current (payable)
         """
         current = self._to_decimal_price(current_price)
         original = self._to_decimal_price(original_price)
@@ -112,21 +238,27 @@ class FlipkartScraper(BasePlatformHandler):
         if current is None:
             return None, None, None
 
-        # If extraction swapped values, enforce lower value as payable current price.
+        # ✅ CRITICAL FIX: If original < current, ALWAYS swap (current must be payable price)
         if original is not None and original < current:
+            logger.info(f"🔄 Swapping to use lower price as current: ₹{current} ↔ ₹{original}")
             current, original = original, current
 
+        # Drop original if it's not higher than current
         if original is not None and original <= current:
             original = None
 
-        # Guard against parser outliers like 44 captured instead of 4499.
+        # Drop suspiciously high discounts (>95% = likely parse error)
         if original is not None and current > 0:
             try:
-                ratio = float(original) / float(current)
+                discount_pct = ((float(original) - float(current)) / float(original)) * 100
             except Exception:
-                ratio = 0.0
-            if ratio >= 8.0 and float(current) < 100.0 and float(original) >= 1000.0:
-                current = original
+                discount_pct = 0.0
+            
+            if discount_pct > 95:
+                logger.warning(
+                    f"⚠️ Suspicious discount: ₹{current} vs ₹{original} "
+                    f"({discount_pct:.1f}% off) - dropping original"
+                )
                 original = None
 
         computed_discount = self._calculate_discount(current, original)
@@ -260,77 +392,203 @@ class FlipkartScraper(BasePlatformHandler):
             products_data = await page_obj.evaluate('''() => {
                 const products = [];
 
-                const parseAmount = (value) => {
-                    if (value === null || value === undefined) return null;
-                    const digits = String(value).replace(/[^\d]/g, '');
-                    if (!digits) return null;
-                    const amount = parseInt(digits, 10);
-                    return Number.isFinite(amount) && amount > 0 ? amount : null;
+                // ✅ DEBUG: Enable detailed logging
+                const DEBUG = true;
+                const log = (msg, ...args) => {
+                    if (DEBUG) console.log(`[FLIPKART DEBUG] ${msg}`, ...args);
                 };
 
-                const collectPrices = (scope, selectors) => {
+                const categoryPatterns = {
+                    mobile: ['mobile', 'phone', 'smartphone', 'iphone', 'pixel', 'samsung', 'oneplus', 'xiaomi', 'redmi', 'oppo', 'vivo', 'realme'],
+                    laptop: ['laptop', 'notebook', 'macbook', 'ultrabook', 'chromebook', 'thinkpad', 'inspiron', 'pavilion', 'ideapad'],
+                    tablet: ['tablet', 'ipad', 'tab'],
+                    fashion: ['shirt', 'dress', 'tshirt', 't-shirt', 'saree', 'jeans', 'trouser', 'jacket', 'shoes', 'top', 'pant', 'kurta', 'kurti'],
+                    home: ['table', 'chair', 'bed', 'sofa', 'mattress', 'pillow', 'cushion'],
+                    kitchen: ['cooker', 'pan', 'kadai', 'mixer', 'grinder', 'fryer', 'kettle', 'cookware'],
+                    book: ['book', 'ebook', 'novel', 'textbook', 'paperback', 'hardcover'],
+                    accessories: ['charger', 'cable', 'case', 'cover', 'pouch', 'adapter', 'cord', 'wire', 'earphone', 'headphone', 'earbuds', 'tempered glass', 'screen protector', 'power bank', 'airpods', 'buds'],
+                    watch: ['watch', 'smartwatch'],
+                    bag: ['bag', 'backpack', 'handbag', 'suitcase', 'luggage']
+                };
+
+                const priceRanges = {
+                    mobile: { min: 2000, max: 600000 },
+                    laptop: { min: 10000, max: 1000000 },
+                    tablet: { min: 3000, max: 200000 },
+                    fashion: { min: 50, max: 150000 },
+                    home: { min: 100, max: 500000 },
+                    kitchen: { min: 100, max: 100000 },
+                    book: { min: 20, max: 5000 },
+                    accessories: { min: 20, max: 100000 },
+                    watch: { min: 100, max: 500000 },
+                    bag: { min: 100, max: 100000 },
+                    general: { min: 30, max: 1000000 }
+                };
+
+                const detectCategory = (text, href) => {
+                    const combined = `${String(text || '').toLowerCase()} ${String(href || '').toLowerCase()}`;
+                    for (const [category, keywords] of Object.entries(categoryPatterns)) {
+                        if (keywords.some((keyword) => combined.includes(keyword))) {
+                            return category;
+                        }
+                    }
+                    return 'general';
+                };
+
+                const parseAmount = (value) => {
+                    if (value === null || value === undefined) return null;
+                    const normalized = String(value)
+                        .replace(/[₹,\s]/g, '')
+                        .replace(/[^\d.]/g, '');
+                    if (!normalized) return null;
+                    const amount = parseFloat(normalized);
+                    return Number.isFinite(amount) && amount > 0 ? Math.floor(amount) : null;
+                };
+
+                const fixLikelyX100 = (amount, text, href) => {
+                    if (!amount || amount < 10000) return amount;
+                    const combined = `${String(text || '').toLowerCase()} ${String(href || '').toLowerCase()}`;
+                    const accessoryHints = ['charger', 'cable', 'case', 'cover', 'pouch', 'adapter', 'wire', 'earphone', 'headphone', 'buds', 'airpods'];
+                    if (!accessoryHints.some((hint) => combined.includes(hint))) return amount;
+
+                    const corrected = Math.floor(amount / 100);
+                    if (corrected >= 20 && corrected <= 50000) {
+                        log('💵 x100 correction:', amount, '→', corrected);
+                        return corrected;
+                    }
+                    return amount;
+                };
+
+                const isRatingOrCount = (price) => {
+                    if (price === null || price === undefined) return true;
+                    if (price >= 1 && price <= 5 && !Number.isInteger(price)) return true;
+                    if (price >= 1 && price <= 9 && Number.isInteger(price)) return true;
+                    return false;
+                };
+
+                const isValidPrice = (price, category) => {
+                    if (!price || price < 10) {
+                        log('❌ Rejected: price too low (<10):', price);
+                        return false;
+                    }
+                    if (isRatingOrCount(price)) {
+                        log('❌ Rejected: looks like rating/count:', price);
+                        return false;
+                    }
+                    const range = priceRanges[category] || priceRanges.general;
+                    const valid = price >= range.min && price <= range.max;
+                    if (!valid) {
+                        log(`❌ Rejected: ₹${price} outside ${category} range (₹${range.min}-₹${range.max})`);
+                    }
+                    return valid;
+                };
+
+                // ✅ DEBUG VERSION: Logs each selector match
+                const collectPrices = (scope, selectors, category, contextText, label = 'prices') => {
                     const values = [];
+                    const debugInfo = [];
+                    
+                    log(`\\n🔍 Collecting ${label} (category: ${category})`);
+                    
                     selectors.forEach((selector) => {
-                        scope.querySelectorAll(selector).forEach((el) => {
-                            const amount = parseAmount(el.textContent || el.innerText || '');
-                            if (amount) values.push(amount);
+                        const elements = scope.querySelectorAll(selector);
+                        
+                        if (elements.length === 0) {
+                            log(`   ⚪ ${selector}: No matches`);
+                            return;
+                        }
+                        
+                        elements.forEach((el, idx) => {
+                            const rawText = (el.textContent || el.innerText || '').trim();
+                            const amount = parseAmount(rawText);
+                            
+                            if (!amount) {
+                                log(`   ⚪ ${selector} [${idx}]: "${rawText}" → null (parse failed)`);
+                                return;
+                            }
+                            
+                            const valid = isValidPrice(amount, category);
+                            
+                            if (valid) {
+                                values.push(amount);
+                                log(`   ✅ ${selector} [${idx}]: "${rawText}" → ₹${amount} (VALID)`);
+                            } else {
+                                log(`   ❌ ${selector} [${idx}]: "${rawText}" → ₹${amount} (REJECTED)`);
+                            }
+                            
+                            debugInfo.push({
+                                selector,
+                                rawText,
+                                parsed: amount,
+                                valid
+                            });
                         });
                     });
+                    
+                    log(`   📊 Found ${values.length} valid prices:`, values);
+                    
                     return values;
                 };
 
-                const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = []) => {
-                    const uniquePrimary = [];
-                    (primaryCandidates || []).forEach((value) => {
-                        if (value && !uniquePrimary.includes(value)) {
-                            uniquePrimary.push(value);
-                        }
-                    });
-
+                const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = [], category = 'general') => {
+                    log('\\n🎯 Choosing current price:');
+                    log('   Primary candidates:', primaryCandidates);
+                    log('   Fallback candidates:', fallbackCandidates);
+                    
+                    const uniquePrimary = [...new Set((primaryCandidates || []).filter((value) => isValidPrice(value, category)))];
+                    
                     if (uniquePrimary.length > 0) {
-                        if (uniquePrimary.length >= 2) {
-                            const maxPrimary = Math.max(...uniquePrimary);
-                            const minPrimary = Math.min(...uniquePrimary);
-                            if (minPrimary > 0 && maxPrimary / minPrimary >= 8 && minPrimary < 100 && maxPrimary >= 1000) {
-                                return maxPrimary;
-                            }
-                        }
-
-                        return uniquePrimary[0];
+                        const chosen = Math.min(...uniquePrimary);
+                        log(`   ✅ Chosen from primary: ₹${chosen} (min of [${uniquePrimary}])`);
+                        return chosen;
                     }
 
-                    const uniqueFallback = [];
-                    (fallbackCandidates || []).forEach((value) => {
-                        if (value && !uniqueFallback.includes(value)) {
-                            uniqueFallback.push(value);
-                        }
-                    });
-
-                    if (uniqueFallback.length === 0) return null;
-                    if (uniqueFallback.length >= 2) {
-                        const maxFallback = Math.max(...uniqueFallback);
-                        const minFallback = Math.min(...uniqueFallback);
-                        if (minFallback > 0 && maxFallback / minFallback >= 8 && minFallback < 100 && maxFallback >= 1000) {
-                            return maxFallback;
-                        }
+                    const uniqueFallback = [...new Set((fallbackCandidates || []).filter((value) => isValidPrice(value, category)))];
+                    
+                    if (uniqueFallback.length === 0) {
+                        log('   ❌ No valid candidates found');
+                        return null;
                     }
-                    return uniqueFallback[0];
+                    
+                    const chosen = Math.min(...uniqueFallback);
+                    log(`   ✅ Chosen from fallback: ₹${chosen} (min of [${uniqueFallback}])`);
+                    return chosen;
                 };
                 
                 // Find all product links
                 const links = document.querySelectorAll('a[href*="/p/itm"], a[href*="/p/"]');
                 const seen = new Set();
                 
-                links.forEach(link => {
+                log(`\\n🔎 Found ${links.length} product links on page`);
+                
+                links.forEach((link, linkIndex) => {
                     const href = link.getAttribute('href');
                     if (!href || seen.has(href) || !href.includes('/p/')) return;
                     seen.add(href);
                     
-                    // Find parent container
                     let container = link.closest('[data-id]') || link.closest('div._1AtVbE') || link.parentElement.parentElement.parentElement;
-                    if (!container) return;
+                    if (!container) {
+                        log(`\\n⚠️ Product ${linkIndex}: No container found`);
+                        return;
+                    }
                     
-                    const text = container.innerText;
+                    const text = container.innerText || '';
+                    const category = detectCategory(text, href);
+                    
+                    // Extract title first for better logging
+                    const lines = text.split('\\n').filter(l => {
+                        const s = l.trim();
+                        return s.length > 10 && 
+                               !s.includes('Add to Compare') && 
+                               !s.includes('₹') && 
+                               !s.includes('% off');
+                    });
+                    const title = lines.length > 0 ? lines[0] : 'Unknown Product';
+                    
+                    log(`\\n${'='.repeat(80)}`);
+                    log(`📦 Product ${linkIndex + 1}: "${title.substring(0, 50)}..."`);
+                    log(`   Category: ${category}`);
+                    log(`   URL: ${href.substring(0, 60)}...`);
 
                     const currentSelectors = [
                         'div.Nx9bqj',
@@ -351,15 +609,19 @@ class FlipkartScraper(BasePlatformHandler):
                         'div[class*="_3I9_wc"]'
                     ];
 
-                    const currentCandidates = collectPrices(container, currentSelectors);
-                    const originalCandidates = collectPrices(container, originalSelectors);
+                    const currentCandidates = collectPrices(container, currentSelectors, category, text, 'CURRENT prices');
+                    const originalCandidates = collectPrices(container, originalSelectors, category, text, 'ORIGINAL prices');
 
                     const allPriceCandidates = Array
-                        .from(text.matchAll(/₹\s*([0-9,]+)(?!\s*\/?\s*month)/gi))
-                        .map((m) => parseAmount(m[1]))
+                        .from(text.matchAll(/₹\\s*([0-9,]+)(?!\\s*\\/?\\s*month)/gi))
+                        .map((m) => {
+                            const parsed = parseAmount(m[1]);
+                            log(`   💰 Regex found: "${m[0]}" → ₹${parsed}`);
+                            return parsed;
+                        })
                         .filter(Boolean);
 
-                    let currentPrice = chooseCurrentCandidate(currentCandidates, allPriceCandidates);
+                    let currentPrice = chooseCurrentCandidate(currentCandidates, allPriceCandidates, category);
 
                     let originalPrice = originalCandidates.length > 0
                         ? Math.max(...originalCandidates)
@@ -369,45 +631,74 @@ class FlipkartScraper(BasePlatformHandler):
                         const aboveCurrent = allPriceCandidates.filter((v) => v > currentPrice);
                         if (aboveCurrent.length > 0) {
                             originalPrice = Math.max(...aboveCurrent);
+                            log(`   🔄 Original from regex: ₹${originalPrice}`);
                         }
                     }
 
-                    if (!currentPrice) return;
-
-                    if (originalPrice && originalPrice <= currentPrice) {
-                        const low = Math.min(currentPrice, originalPrice);
-                        const high = Math.max(currentPrice, originalPrice);
-                        currentPrice = low;
-                        originalPrice = high > low ? high : null;
+                    if (!currentPrice) {
+                        log('   ❌ SKIPPED: No valid current price found\\n');
+                        return;
                     }
 
-                    if (currentPrice && originalPrice && originalPrice / currentPrice >= 8 && currentPrice < 100 && originalPrice >= 1000) {
+                    log(`\\n   💵 BEFORE x100 fix: current=₹${currentPrice}, original=₹${originalPrice}`);
+
+                    // Contextual x100 correction
+                    const beforeCurrent = currentPrice;
+                    const beforeOriginal = originalPrice;
+                    currentPrice = fixLikelyX100(currentPrice, text, href);
+                    if (originalPrice) {
+                        originalPrice = fixLikelyX100(originalPrice, text, href);
+                    }
+                    
+                    if (beforeCurrent !== currentPrice || beforeOriginal !== originalPrice) {
+                        log(`   💵 AFTER x100 fix: current=₹${currentPrice}, original=₹${originalPrice}`);
+                    }
+
+                    // Ensure current is lower
+                    if (originalPrice && originalPrice < currentPrice) {
+                        log(`   🔄 Swapping: current (₹${currentPrice}) ↔ original (₹${originalPrice})`);
+                        const temp = currentPrice;
                         currentPrice = originalPrice;
+                        originalPrice = temp;
+                    }
+
+                    if (originalPrice && originalPrice <= currentPrice) {
+                        log(`   ⚠️ Dropping original (₹${originalPrice}) - not higher than current (₹${currentPrice})`);
                         originalPrice = null;
                     }
 
-                    const discountMatch = text.match(/(\d{1,2})\s*%\s*off/i);
+                    // Drop suspicious originals
+                    if (currentPrice && originalPrice) {
+                        const ratio = originalPrice / currentPrice;
+                        const discount = ((originalPrice - currentPrice) / originalPrice) * 100;
+
+                        if (ratio >= 10 && currentPrice < 200 && originalPrice >= 1500 && discount > 90) {
+                            log(`   ⚠️ Suspicious original detected: ratio=${ratio.toFixed(1)}, discount=${discount.toFixed(1)}%`);
+                            log(`      Dropping original (₹${originalPrice})`);
+                            originalPrice = null;
+                        }
+                    }
+
+                    const discountMatch = text.match(/(\\d{1,2})\\s*%\\s*off/i);
                     const discount = discountMatch ? parseInt(discountMatch[1], 10) : null;
                     
-                    // Title - Filter out "Add to Compare" and junk
-                    const lines = text.split('\\n').filter(l => {
-                        const s = l.trim();
-                        return s.length > 10 && 
-                               !s.includes('Add to Compare') && 
-                               !s.includes('₹') && 
-                               !s.includes('% off');
-                    });
+                    if (!title) {
+                        log('   ❌ SKIPPED: No valid title found\\n');
+                        return;
+                    }
                     
-                    const title = lines.length > 0 ? lines[0] : null;
-                    
-                    if (!title) return;
-                    
-                    // Image
                     const img = container.querySelector('img');
                     const imgSrc = img ? (img.src || img.getAttribute('data-src')) : null;
                     
-                    // Rating
                     const ratingMatch = text.match(/([0-5]\\.?\\d?)\\s*[★|\\|]/);
+                    
+                    log(`\\n   ✅ FINAL RESULT:`);
+                    log(`      Title: "${title}"`);
+                    log(`      Current: ₹${currentPrice}`);
+                    log(`      Original: ₹${originalPrice || 'N/A'}`);
+                    log(`      Discount: ${discount || 'N/A'}%`);
+                    log(`      Rating: ${ratingMatch ? ratingMatch[1] : 'N/A'}`);
+                    log('');
                     
                     products.push({
                         title: title,
@@ -420,8 +711,13 @@ class FlipkartScraper(BasePlatformHandler):
                     });
                 });
                 
+                log(`\\n${'='.repeat(80)}`);
+                log(`📊 SUMMARY: Returning ${products.length} products\\n`);
+                
                 return products.slice(0, 20);
             }''')
+            
+            logger.info(f"📊 JavaScript returned {len(products_data)} raw products")
             
             products = []
             for item in products_data:
@@ -430,13 +726,24 @@ class FlipkartScraper(BasePlatformHandler):
                     extracted_original = self._to_decimal_price(item.get('originalPrice'))
                     discount_hint = item.get('discount')
 
+                    logger.debug(
+                        f"🔍 Raw JS: {item.get('title', '')[:50]}: "
+                        f"₹{extracted_current} (was ₹{extracted_original})"
+                    )
+
                     current_price, original_price, discount = self._normalize_price_snapshot(
                         current_price=extracted_current,
                         original_price=extracted_original,
                         discount_hint=discount_hint,
                     )
 
+                    if current_price and original_price and original_price > current_price:
+                        discount = round(((float(original_price) - float(current_price)) / float(original_price)) * 100, 1)
+                    elif current_price:
+                        discount = None
+
                     if not current_price:
+                        logger.warning(f"⚠️ Skipping product - no valid current price: {item.get('title', '')[:50]}")
                         continue
                     
                     url = item.get('url', '')
@@ -454,6 +761,12 @@ class FlipkartScraper(BasePlatformHandler):
                         except:
                             pass
                     
+                    logger.info(
+                        f"✅ Product extracted: {item.get('title', '')[:50]} - "
+                        f"₹{current_price} (was ₹{original_price if original_price else 'N/A'}) "
+                        f"{discount}% off" if discount else ""
+                    )
+                    
                     products.append(ProductData(
                         external_id=product_id,
                         title=item.get('title', '')[:200],
@@ -468,13 +781,14 @@ class FlipkartScraper(BasePlatformHandler):
                         extraction_method=ExtractionMethod.DOM_JAVASCRIPT,
                         data_source=HandlerType.SCRAPER
                     ))
-                except:
+                except Exception as e:
+                    logger.error(f"❌ Error processing product item: {e}", exc_info=True)
                     continue
             
             return products
         
         except Exception as e:
-            logger.error(f"JS extraction error: {e}")
+            logger.error(f"❌ JS extraction error: {e}", exc_info=True)
             return []
     
     # =========================================================================
@@ -521,7 +835,7 @@ class FlipkartScraper(BasePlatformHandler):
             raise
         
         except Exception as e:
-            logger.error(f"❌ Flipkart product error: {e}")
+            logger.error(f"❌ Flipkart product error: {e}", exc_info=True)
             return None
     
     async def _extract_product_javascript(
@@ -547,10 +861,12 @@ class FlipkartScraper(BasePlatformHandler):
 
                 const parseAmount = (value) => {
                     if (value === null || value === undefined) return null;
-                    const digits = String(value).replace(/[^\d]/g, '');
-                    if (!digits) return null;
-                    const amount = parseInt(digits, 10);
-                    return Number.isFinite(amount) && amount > 0 ? amount : null;
+                    const normalized = String(value)
+                        .replace(/[₹,\s]/g, '')
+                        .replace(/[^\d.]/g, '');
+                    if (!normalized) return null;
+                    const amount = parseFloat(normalized);
+                    return Number.isFinite(amount) && amount > 0 ? Math.floor(amount) : null;
                 };
 
                 const collectPrices = (selectors) => {
@@ -575,42 +891,66 @@ class FlipkartScraper(BasePlatformHandler):
                     return chunks.join(' | ');
                 };
 
-                const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = []) => {
-                    const uniquePrimary = [];
-                    (primaryCandidates || []).forEach((value) => {
-                        if (value && !uniquePrimary.includes(value)) {
-                            uniquePrimary.push(value);
-                        }
-                    });
+                const categoryPatterns = {
+                    mobile: ['mobile', 'phone', 'smartphone', 'iphone', 'pixel', 'samsung', 'oneplus', 'xiaomi', 'redmi', 'oppo', 'vivo', 'realme'],
+                    laptop: ['laptop', 'notebook', 'macbook', 'ultrabook', 'chromebook', 'thinkpad', 'inspiron', 'pavilion', 'ideapad'],
+                    tablet: ['tablet', 'ipad', 'tab'],
+                    fashion: ['shirt', 'dress', 'tshirt', 't-shirt', 'saree', 'jeans', 'trouser', 'jacket', 'shoes', 'top', 'pant', 'kurta', 'kurti'],
+                    home: ['table', 'chair', 'bed', 'sofa', 'mattress', 'pillow', 'cushion'],
+                    kitchen: ['cooker', 'pan', 'kadai', 'mixer', 'grinder', 'fryer', 'kettle', 'cookware'],
+                    book: ['book', 'ebook', 'novel', 'textbook', 'paperback', 'hardcover'],
+                    accessories: ['charger', 'cable', 'case', 'cover', 'pouch', 'adapter', 'cord', 'wire', 'earphone', 'headphone', 'earbuds', 'tempered glass', 'screen protector', 'power bank', 'airpods', 'buds'],
+                    watch: ['watch', 'smartwatch'],
+                    bag: ['bag', 'backpack', 'handbag', 'suitcase', 'luggage']
+                };
 
-                    if (uniquePrimary.length > 0) {
-                        if (uniquePrimary.length >= 2) {
-                            const maxPrimary = Math.max(...uniquePrimary);
-                            const minPrimary = Math.min(...uniquePrimary);
-                            if (minPrimary > 0 && maxPrimary / minPrimary >= 8 && minPrimary < 100 && maxPrimary >= 1000) {
-                                return maxPrimary;
-                            }
-                        }
+                const priceRanges = {
+                    mobile: { min: 500, max: 600000 },
+                    laptop: { min: 500, max: 1000000 },
+                    tablet: { min: 300, max: 200000 },
+                    fashion: { min: 50, max: 150000 },
+                    home: { min: 100, max: 500000 },
+                    kitchen: { min: 100, max: 100000 },
+                    book: { min: 20, max: 5000 },
+                    accessories: { min: 20, max: 100000 },
+                    watch: { min: 100, max: 500000 },
+                    bag: { min: 100, max: 100000 },
+                    general: { min: 30, max: 1000000 }
+                };
 
-                        return uniquePrimary[0];
+                const detectCategory = (text, href) => {
+                    const combined = `${String(text || '').toLowerCase()} ${String(href || '').toLowerCase()}`;
+                    for (const [category, keywords] of Object.entries(categoryPatterns)) {
+                        if (keywords.some((keyword) => combined.includes(keyword))) {
+                            return category;
+                        }
+                    }
+                    return 'general';
+                };
+
+                const isRatingOrCount = (price) => {
+                    if (price === null || price === undefined) return true;
+                    if (price >= 1 && price <= 5 && !Number.isInteger(price)) return true;
+                    if (price >= 1 && price <= 9 && Number.isInteger(price)) return true;
+                    return false;
+                };
+
+                const isValidPrice = (price, category) => {
+                    if (!price || price < 10) return false;
+                    if (isRatingOrCount(price)) return false;
+                    const range = priceRanges[category] || priceRanges.general;
+                    return price >= range.min && price <= range.max;
+                };
+
+                const chooseCurrentCandidate = (primaryCandidates, fallbackCandidates = [], category = 'general') => {
+                    const filteredPrimary = (primaryCandidates || []).filter((value) => isValidPrice(value, category));
+                    if (filteredPrimary.length > 0) {
+                        return Math.min(...new Set(filteredPrimary));
                     }
 
-                    const uniqueFallback = [];
-                    (fallbackCandidates || []).forEach((value) => {
-                        if (value && !uniqueFallback.includes(value)) {
-                            uniqueFallback.push(value);
-                        }
-                    });
-
-                    if (uniqueFallback.length === 0) return null;
-                    if (uniqueFallback.length >= 2) {
-                        const maxFallback = Math.max(...uniqueFallback);
-                        const minFallback = Math.min(...uniqueFallback);
-                        if (minFallback > 0 && maxFallback / minFallback >= 8 && minFallback < 100 && maxFallback >= 1000) {
-                            return maxFallback;
-                        }
-                    }
-                    return uniqueFallback[0];
+                    const filteredFallback = (fallbackCandidates || []).filter((value) => isValidPrice(value, category));
+                    if (filteredFallback.length === 0) return null;
+                    return Math.min(...new Set(filteredFallback));
                 };
 
                 const extractFromJsonLd = () => {
@@ -757,6 +1097,9 @@ class FlipkartScraper(BasePlatformHandler):
                 }
                 
                 const { jsonCurrent, jsonOriginal, jsonAvailability } = extractFromJsonLd();
+                const bodyText = document.body.innerText || '';
+                const pageUrl = window.location?.href || '';
+                const detectedCategory = detectCategory(`${result.title || ''} ${bodyText}`, pageUrl);
 
                 const currentSelectors = [
                     'div.Nx9bqj.CxhGGd',
@@ -778,18 +1121,17 @@ class FlipkartScraper(BasePlatformHandler):
                     'div[class*="_3I9_wc"]'
                 ];
 
-                const currentCandidates = collectPrices(currentSelectors);
-                const originalCandidates = collectPrices(originalSelectors);
+                const currentCandidates = collectPrices(currentSelectors).filter((price) => isValidPrice(price, detectedCategory));
+                const originalCandidates = collectPrices(originalSelectors).filter((price) => isValidPrice(price, detectedCategory));
 
-                const bodyText = document.body.innerText;
                 const allPriceCandidates = Array
-                    .from(bodyText.matchAll(/₹\s*([0-9,]+)(?!\s*\/?\s*month)/gi))
+                    .from(bodyText.matchAll(/₹\\s*([0-9,]+)(?!\\s*\\/?\\s*month)/gi))
                     .map((m) => parseAmount(m[1]))
                     .filter(Boolean);
 
                 let resolvedCurrent = jsonCurrent || null;
                 if (!resolvedCurrent) {
-                    resolvedCurrent = chooseCurrentCandidate(currentCandidates, allPriceCandidates);
+                    resolvedCurrent = chooseCurrentCandidate(currentCandidates, allPriceCandidates, detectedCategory);
                 }
                 if (resolvedCurrent) {
                     result.price = String(resolvedCurrent);
@@ -807,10 +1149,13 @@ class FlipkartScraper(BasePlatformHandler):
                 }
 
                 if (originalPool.length > 0) {
-                    result.originalPrice = String(Math.max(...originalPool));
+                    const validOriginalPool = originalPool.filter((price) => isValidPrice(price, detectedCategory));
+                    if (validOriginalPool.length > 0) {
+                        result.originalPrice = String(Math.max(...validOriginalPool));
+                    }
                 }
 
-                const discountMatch = bodyText.match(/(\d{1,2})\s*%\s*off/i);
+                const discountMatch = bodyText.match(/(\\d{1,2})\\s*%\\s*off/i);
                 if (discountMatch) {
                     result.discount = discountMatch[1];
                 }
@@ -845,18 +1190,28 @@ class FlipkartScraper(BasePlatformHandler):
                     result.inStock = true;
                 }
 
+                // ✅ FIXED: Ensure current is lower
                 if (result.price && result.originalPrice) {
                     const p = parseAmount(result.price);
                     const o = parseAmount(result.originalPrice);
-                    if (p && o && o <= p) {
-                        const low = Math.min(p, o);
-                        const high = Math.max(p, o);
-                        result.price = String(low);
-                        result.originalPrice = high > low ? String(high) : null;
-                    }
-                    if (p && o && o / p >= 8 && p < 100 && o >= 1000) {
+                    if (p && o && o < p) {
+                        const temp = p;
                         result.price = String(o);
+                        result.originalPrice = String(temp);
+                    }
+                    if (p && o && o <= p) {
                         result.originalPrice = null;
+                    }
+                    
+                    // Keep payable current price and avoid promoting inflated original as current.
+                    if (p && o) {
+                        const ratio = o / p;
+                        const discount = ((o - p) / o) * 100;
+                        
+                        if (ratio >= 10 && p < 200 && o >= 1500 && discount > 90) {
+                            console.log('Suspicious original detected, dropping original:', p, o);
+                            result.originalPrice = null;
+                        }
                     }
                 }
                 
@@ -872,10 +1227,21 @@ class FlipkartScraper(BasePlatformHandler):
                         product_data['title'] = match.group(1).strip()
             
             if not product_data.get('title') or not product_data.get('price'):
+                logger.warning("❌ No title or price found in product page")
                 return None
+
+            # ✅ Added detailed logging
+            logger.info(f"📊 Raw JS extraction for '{product_data.get('title', '')[:50]}':")
+            logger.info(f"   Price: {product_data.get('price')}")
+            logger.info(f"   Original: {product_data.get('originalPrice')}")
+            logger.info(f"   Discount: {product_data.get('discount')}")
 
             extracted_current = self._to_decimal_price(product_data.get('price'))
             extracted_original = self._to_decimal_price(product_data.get('originalPrice'))
+
+            logger.info(f"📊 After decimal conversion:")
+            logger.info(f"   Current: {extracted_current}")
+            logger.info(f"   Original: {extracted_original}")
 
             discount_hint = None
             if product_data.get('discount') is not None:
@@ -890,7 +1256,35 @@ class FlipkartScraper(BasePlatformHandler):
                 discount_hint=discount_hint,
             )
 
+            logger.info(f"📊 After normalization:")
+            logger.info(f"   Current: {current_price}")
+            logger.info(f"   Original: {original_price}")
+            logger.info(f"   Discount: {discount}")
+
+            current_price, original_price = self._apply_accessory_price_guard(
+                title=product_data.get('title'),
+                current_price=current_price,
+                original_price=original_price,
+                context_text=product_url,
+            )
+
+            logger.info(f"📊 After accessory guard:")
+            logger.info(f"   Current: {current_price}")
+            logger.info(f"   Original: {original_price}")
+
+            # Recalculate discount
+            if current_price and original_price and original_price > current_price:
+                discount = round(((float(original_price) - float(current_price)) / float(original_price)) * 100, 1)
+            elif current_price:
+                discount = None
+
+            logger.info(f"✅ FINAL PRICES:")
+            logger.info(f"   Current: ₹{current_price}")
+            logger.info(f"   Original: ₹{original_price if original_price else 'N/A'}")
+            logger.info(f"   Discount: {discount}%" if discount else "   Discount: None")
+
             if not current_price:
+                logger.warning("❌ No valid current price after processing")
                 return None
             
             rating = None
@@ -928,7 +1322,7 @@ class FlipkartScraper(BasePlatformHandler):
             )
         
         except Exception as e:
-            logger.error(f"JS product extraction error: {e}")
+            logger.error(f"❌ JS product extraction error: {e}", exc_info=True)
             return None
     
     # =========================================================================

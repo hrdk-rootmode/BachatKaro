@@ -24,7 +24,7 @@ from decimal import Decimal
 from app.core.database import get_db
 from app.core.redis_client import RedisClient, get_redis
 from app.core.config import settings
-from app.models import Product, ProductListing, User
+from app.models import Product, ProductListing, User, Transaction
 from app.models import Platform as PlatformModel
 from app.schemas import (
     SearchRequest,
@@ -186,6 +186,23 @@ SEARCH_INTENT_RULES: Dict[str, Dict[str, object]] = {
         "strict": False,
     },
 }
+
+
+def _safe_usage_stats(user: User) -> dict:
+    """Return a mutable usage stats dict that will be reassigned to trigger JSONB update."""
+    return dict(user.usage_stats or {})
+
+
+def _build_search_transaction(user_id, search_type: str, meta: dict | None = None) -> Transaction:
+    """Create a lightweight transaction row for search analytics."""
+    return Transaction(
+        user_id=user_id,
+        type=search_type,
+        status="success",
+        amount=0,
+        currency="INR",
+        meta_data=meta or {},
+    )
 
 
 def _normalize_text(value: Optional[str]) -> str:
@@ -942,12 +959,19 @@ async def search_products(
     
     search_time_ms = int((time.time() - start_time) * 1000)
     
-    # Update user stats
-    if user.usage_stats is None:
-        user.usage_stats = {}
-    user.usage_stats['daily_searches'] = user.usage_stats.get('daily_searches', 0) + 1
-    user.usage_stats['last_search_date'] = datetime.utcnow().isoformat()
-    user.usage_stats['last_search_query'] = request.query
+    # Update user stats and persist searchable audit event.
+    usage_stats = _safe_usage_stats(user)
+    usage_stats['daily_searches'] = int(usage_stats.get('daily_searches', 0) or 0) + 1
+    usage_stats['total_searches'] = int(usage_stats.get('total_searches', 0) or 0) + 1
+    usage_stats['last_search_date'] = datetime.utcnow().isoformat()
+    usage_stats['last_search_query'] = request.query
+    user.usage_stats = usage_stats
+
+    db.add(_build_search_transaction(
+        user.id,
+        search_type="search",
+        meta={"query": request.query, "origin": "text_search"}
+    ))
     await db.commit()
     
     logger.info(
@@ -1091,30 +1115,35 @@ async def search_by_url(
     search_queue = get_search_queue(redis)
     
     try:
+        logger.info(f"Starting URL scrape for: {url[:60]}...")
         alternatives = await search_queue.search_url(
             url=url,
             user=user,
             scrape_func=lambda u: scrape_and_match(u, url_analysis, db)
         )
+        logger.info(f"Scrape completed. Found {len(alternatives) if alternatives else 0} alternatives")
     except Exception as e:
-        logger.error(f"URL search scraping failed: {e}")
+        logger.error(f"URL search scraping failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": "scraping_failed",
                 "message": f"Failed to fetch product details: {str(e)}",
-                "platform": url_analysis.platform_name
+                "platform": url_analysis.platform_name,
+                "suggestion": "URL might be invalid or product might not exist on this platform"
             }
         )
     
     if not alternatives:
+        logger.warning(f"No alternatives found for URL: {url[:60]}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
                 "error": "product_not_found",
-                "message": "Could not extract product information from URL",
+                "message": "Could not extract product information from URL. The product might not exist or the URL might be invalid.",
                 "url": url,
-                "platform": url_analysis.platform_name
+                "platform": url_analysis.platform_name,
+                "suggestion": "Try with a direct product URL (e.g., amazon.in/dp/B0XXXXXX)"
             }
         )
     
@@ -1209,11 +1238,19 @@ async def search_by_url(
         "response_origin": "live_scrape"
     }
     
-    # Update user stats
-    if user.usage_stats is None:
-        user.usage_stats = {}
-    user.usage_stats['daily_searches'] = user.usage_stats.get('daily_searches', 0) + 1
-    user.usage_stats['last_url_search'] = url
+    # Update user stats and persist searchable audit event.
+    usage_stats = _safe_usage_stats(user)
+    usage_stats['daily_searches'] = int(usage_stats.get('daily_searches', 0) or 0) + 1
+    usage_stats['total_searches'] = int(usage_stats.get('total_searches', 0) or 0) + 1
+    usage_stats['last_search_date'] = datetime.utcnow().isoformat()
+    usage_stats['last_url_search'] = url
+    user.usage_stats = usage_stats
+
+    db.add(_build_search_transaction(
+        user.id,
+        search_type="ai_search",
+        meta={"url": url, "origin": "url_search"}
+    ))
     await db.commit()
     
     # Cache result

@@ -20,6 +20,7 @@ import firebase_admin
 from firebase_admin import auth as firebase_auth
 import json
 import base64
+import time
 import logging
 
 from app.core.database import get_db
@@ -27,6 +28,7 @@ from app.core.config import settings
 from app.models import User, AppConfig
 from app.schemas import UserPlan
 from app.core.security import initialize_firebase
+from app.services.user import user_service
 
 # Initialize Firebase Admin SDK
 initialize_firebase()
@@ -75,11 +77,16 @@ async def verify_firebase_token(
         HTTPException: If token invalid or expired
     """
     token = credentials.credentials
+    clock_skew_seconds = max(0, int(getattr(settings, "FIREBASE_CLOCK_SKEW_SECONDS", 5)))
     logger.info(f"🔐 Verifying token: {token[:20]}... (len: {len(token)})")
     
     try:
         # Standard Firebase verification
-        decoded_token = firebase_auth.verify_id_token(token, check_revoked=False)
+        decoded_token = firebase_auth.verify_id_token(
+            token,
+            check_revoked=False,
+            clock_skew_seconds=clock_skew_seconds,
+        )
         logger.info(f"✅ Token verified for: {decoded_token.get('email')}")
         
         return {
@@ -93,19 +100,27 @@ async def verify_firebase_token(
         
     except Exception as e:
         error_msg = str(e).lower()
-        
-        # Try decoding without verification (clock skew workaround)
-        decoded = _decode_token_without_verification(token)
-        if decoded.get("uid"):
-            logger.warning(f"⚠️ Token decoded without verification (clock skew): {e}")
-            return {
-                "uid": decoded.get("uid"),
-                "email": decoded.get("email"),
-                "email_verified": decoded.get("email_verified", False),
-                "name": decoded.get("name"),
-                "picture": decoded.get("picture"),
-                "admin": decoded.get("admin", False),
-            }
+
+        # Limited fallback only for small clock skew when SDK verification still fails.
+        if "token used too early" in error_msg or "iat" in error_msg or "before" in error_msg:
+            decoded = _decode_token_without_verification(token)
+            uid = decoded.get("uid") or decoded.get("sub") or decoded.get("user_id")
+            token_iat = int(decoded.get("iat", 0) or 0)
+            current_time = int(time.time())
+            skew = token_iat - current_time
+
+            if uid and abs(skew) <= clock_skew_seconds:
+                logger.warning(
+                    f"⚠️ Accepting token within {clock_skew_seconds}s clock skew (actual: {skew}s)"
+                )
+                return {
+                    "uid": uid,
+                    "email": decoded.get("email"),
+                    "email_verified": decoded.get("email_verified", False),
+                    "name": decoded.get("name"),
+                    "picture": decoded.get("picture"),
+                    "admin": decoded.get("admin", False),
+                }
         
         logger.error(f"❌ Token verification failed: {e}")
         raise HTTPException(
@@ -141,10 +156,34 @@ async def get_current_user(
     user = result.scalars().first()
     
     if not user:
-        logger.warning(f"User not found for UID: {uid}")
+        logger.warning(f"User not found for UID: {uid}. Attempting auto-create from token...")
+        try:
+            user = await user_service.create_from_firebase_token(
+                db=db,
+                token_data=token_data,
+                hardware_id="auto_created"
+            )
+        except Exception as e:
+            logger.error(f"Auto-create failed for UID {uid}: {e}")
+            user = None
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+    
+    # Check if user is blocked
+    if user.is_blocked:
+        logger.warning(f"Blocked user attempted access: {user.id} ({user.email})")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "account_blocked",
+                "message": "Your account has been blocked",
+                "reason": user.block_reason or "Violation of terms of service",
+                "blocked_at": user.blocked_at.isoformat() if user.blocked_at else None
+            }
         )
     
     logger.debug(f"✅ User loaded: {user.id} ({user.email})")

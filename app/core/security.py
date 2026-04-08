@@ -156,11 +156,16 @@ async def verify_firebase_token(
         )
     
     token = credentials.credentials
+    clock_skew_seconds = max(0, int(getattr(settings, "FIREBASE_CLOCK_SKEW_SECONDS", 5)))
     logger.info(f"🔐 Token verification starting - token length: {len(token)}")
     
     try:
         # Try standard verification first
-        decoded_token = auth.verify_id_token(token, check_revoked=False)
+        decoded_token = auth.verify_id_token(
+            token,
+            check_revoked=False,
+            clock_skew_seconds=clock_skew_seconds,
+        )
         logger.info(f"✅ Standard verification successful for user: {decoded_token.get('email')}")
         return {
             "uid": decoded_token["uid"],
@@ -190,8 +195,10 @@ async def verify_firebase_token(
                 
                 logger.info(f"⏱️  Clock skew: {skew} seconds (token iat: {token_iat}, server time: {current_time})")
                 
-                if abs(skew) <= 5:  # Allow 5 seconds of clock difference
-                    logger.info(f"✅ Accepting token with {skew}s clock skew for user: {unverified.get('email')}")
+                if abs(skew) <= clock_skew_seconds:
+                    logger.info(
+                        f"✅ Accepting token with {skew}s clock skew for user: {unverified.get('email')}"
+                    )
                     return {
                         "uid": unverified["sub"] if "sub" in unverified else unverified.get("user_id"),
                         "email": unverified.get("email"),
@@ -201,7 +208,9 @@ async def verify_firebase_token(
                         "admin": unverified.get("admin", False),
                     }
                 else:
-                    logger.error(f"❌ Clock skew too large: {skew} seconds (max allowed: 5s)")
+                    logger.error(
+                        f"❌ Clock skew too large: {skew} seconds (max allowed: {clock_skew_seconds}s)"
+                    )
         
         # For other errors or large clock skew
         logger.error(f"❌ Token verification failed: {type(e).__name__}: {str(e)}")

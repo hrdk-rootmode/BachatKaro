@@ -411,6 +411,281 @@
         "exam guide books",
         "competitive exam books"
       ]
+    },
+    "hot_mobiles": {
+      "Electronics": [
+        "iphone 16 128gb",
+        "iphone 15 128gb",
+        "samsung galaxy s24 ultra 256gb",
+        "samsung galaxy a55 5g 128gb",
+        "oneplus 12 256gb",
+        "oneplus nord 4 256gb",
+        "google pixel 9 128gb",
+        "xiaomi 14 256gb",
+        "redmi note 14 pro 256gb",
+        "poco f6 256gb",
+        "vivo v30 256gb",
+        "oppo reno 12 256gb",
+        "motorola edge 50 pro 256gb",
+        "5g smartphone under 15000",
+        "smartphone under 25000 8gb ram"
+      ]
+    },
+    "hot_laptops": {
+      "Electronics": [
+        "macbook air m3 8gb 256gb",
+        "macbook pro 14 m3 8gb 512gb",
+        "dell g15 rtx 4060 i7 16gb 512gb",
+        "hp victus 15 rtx 4050 i5 16gb 512gb",
+        "lenovo legion 5 rtx 4060 ryzen 7 16gb 512gb",
+        "lenovo loq 15 rtx 4050 i5 8gb 512gb",
+        "asus tuf gaming a15 rtx 4060 ryzen 7 16gb",
+        "asus rog strix g16 rtx 4060 i7 16gb 512gb",
+        "acer nitro v 15 rtx 4050 i5 8gb 512gb",
+        "msi katana 15 rtx 4060 i7 16gb 512gb",
+        "laptop under 50000 i5 16gb ssd",
+        "gaming laptop under 90000 rtx 4060",
+        "laptop for coding i5 16gb ssd"
+      ]
+    },
+    "hot_mobile_accessories": {
+      "Accessories": [
+        "iphone 16 pro max silicone case",
+        "iphone 15 pro max case spigen",
+        "samsung s24 ultra case spigen",
+        "samsung a55 back cover",
+        "oneplus 12 case sandstone",
+        "iphone 16 pro max tempered glass",
+        "samsung s24 ultra tempered glass uv",
+        "apple 20w usb c charger",
+        "samsung 25w charger type c",
+        "oneplus 100w supervooc charger",
+        "anker 65w gan charger 3 port",
+        "anker power bank 20000mah 65w pd",
+        "apple airpods pro 2 usb c",
+        "oneplus buds 3",
+        "boat airdopes 141"
+      ]
+    },
+    "hot_fashion": {
+      "Fashion": [
+        "us polo tshirt men cotton",
+        "allen solly men shirt",
+        "levis men jeans slim fit",
+        "women kurti cotton",
+        "women saree party wear",
+        "women jeans high waist",
+        "kids school uniform",
+        "nike shoes men",
+        "adidas shoes women",
+        "puma shoes men",
+        "skechers shoes women",
+        "women handbag"
+      ],
+      "Accessories": [
+        "fastrack watch men analog",
+        "titan watch women",
+        "smart watch men",
+        "smart watch women",
+        "wallet for men",
+        "belt for men",
+        "sunglasses men polarized"
+      ]
+    },
+    "hot_home_kitchen": {
+      "Home & Kitchen": [
+        "mixer grinder 750w",
+        "air fryer 6 litre",
+        "pressure cooker 5 litre",
+        "cookware set non stick",
+        "water purifier ro uv",
+        "induction cooktop 2000w",
+        "electric kettle 1.5 litre",
+        "gas stove 3 burner",
+        "ceiling fan 1200mm",
+        "vacuum cleaner",
+        "kitchen storage container set",
+        "bedsheet cotton king size"
+      ]
+    },
+    "hot_books": {
+      "Books": [
+        "atomic habits james clear",
+        "rich dad poor dad robert kiyosaki",
+        "psychology of money morgan housel",
+        "deep work cal newport",
+        "python crash course",
+        "system design interview alex xu",
+        "upsc preparation books",
+        "neet preparation books",
+        "jee preparation books",
+        "children story books"
+      ]
+    },
+    "deep_mobiles": {
+      "Electronics": [
+        "iphone 16 pro max 512gb",
+        "iphone 16 pro 256gb",
+        "iphone 15 pro 256gb",
+        "iphone se 2022 128gb",
+        "samsung galaxy s24 plus 256gb",
+        "samsung galaxy s23 fe 128gb",
+        "samsung galaxy z fold 6 512gb",
+        "samsung galaxy z flip 6 256gb",
+        "oneplus 12 512gb",
+        "oneplus 12r 256gb",
+        "google pixel 9 pro 256gb",
+        "google pixel 8a 128gb",
+        "xiaomi 14 ultra 512gb",
+        "redmi note 14 pro plus 256gb",
+        "poco x6 pro 512gb",
+        "realme gt 6 512gb",
+        "vivo x100 pro 256gb",
+        "oppo find x7 ultra 256gb",
+        "iqoo neo 9 pro 256gb",
+        "nothing phone 2a 256gb",
+        "motorola razr 50 ultra 256gb",
+        "infinix gt 20 pro 256gb",
+        "tecno camon 30 premier 512gb",
+        "camera phone under 25000 ois",
+        "gaming phone under 30000 snapdragon"
+      ]
+    },
+    "deep_laptops": {
+      "Electronics": [
+        "macbook air m3 16gb 512gb",
+        "macbook pro 16 m3 pro 18gb 512gb",
+        "dell xps 15 i7 16gb 512gb",
+        "dell inspiron 16 i7 16gb 1tb",
+        "hp omen 17 rtx 4080 i9 32gb 1tb",
+        "hp spectre x360 14 i7 16gb 1tb oled",
+        "lenovo thinkpad x1 carbon i7 16gb 512gb",
+        "lenovo yoga slim 7 i7 16gb 512gb oled",
+        "lenovo legion pro 7 rtx 4080 i9 32gb 1tb",
+        "asus zephyrus g14 rtx 4060 ryzen 9 16gb",
+        "asus zenbook pro 14 oled i7 16gb 1tb",
+        "acer predator helios 16 rtx 4070 i7 16gb",
+        "msi raider ge78 rtx 4080 i9 32gb 1tb",
+        "chromebook 14 8gb 64gb",
+        "2 in 1 laptop i5 16gb",
+        "touchscreen laptop i7 16gb",
+        "laptop under 70000 i7 16gb ssd",
+        "gaming laptop under 120000 rtx 4070"
+      ]
+    },
+    "deep_mobile_accessories": {
+      "Accessories": [
+        "iphone 16 pro max clear case magsafe",
+        "iphone 16 pro max leather case",
+        "iphone 16 pro camera lens protector",
+        "samsung s24 ultra camera lens glass",
+        "oneplus nord 4 case",
+        "google pixel 9 pro case spigen",
+        "apple 35w dual usb c charger",
+        "apple 140w usb c charger",
+        "samsung 45w super fast charger",
+        "xiaomi 120w hypercharge charger",
+        "anker 100w gan charger",
+        "apple magsafe charger 15w",
+        "belkin magsafe 3 in 1 charger",
+        "apple usb c to lightning cable 2m",
+        "anker usb c to usb c 100w 2m",
+        "samsung usb c cable 5a 1.8m",
+        "samsung power bank 20000mah 45w",
+        "mi power bank 20000mah 50w",
+        "sony wf 1000xm5",
+        "jbl tune flex",
+        "realme buds air 5 pro",
+        "boat rockerz 333 anc",
+        "sony wh 1000xm5 headphones",
+        "apple watch ultra 2 alpine loop",
+        "car mobile holder magnetic dashboard"
+      ]
+    },
+    "deep_fashion": {
+      "Fashion": [
+        "jack jones tshirt men printed",
+        "h and m tshirt men basic pack",
+        "roadster tshirt men oversized",
+        "manyavar kurta men wedding silk",
+        "biba kurti women cotton printed",
+        "sangria kurti women plus size",
+        "kanchipuram silk saree wedding",
+        "cotton saree handloom",
+        "co ord set women party wear",
+        "night suit women cotton",
+        "girls lehenga choli ethnic",
+        "campus men sports shoes",
+        "red tape men formal shoes",
+        "crocs women classic clog",
+        "monte carlo sweater men wool",
+        "nike hoodie men fleece"
+      ],
+      "Accessories": [
+        "casio g shock ga 2100",
+        "fossil watch men leather strap",
+        "apple watch series 9 45mm gps",
+        "samsung galaxy watch 6 classic 47mm",
+        "oneplus watch 2 black",
+        "amazfit gtr 4 smartwatch",
+        "noise colorfit pro 5 max",
+        "fire boltt phoenix ultra smartwatch",
+        "tommy hilfiger wallet men leather",
+        "hidesign wallet men tan",
+        "ray ban aviator sunglasses gold",
+        "american tourister backpack laptop 15.6",
+        "lavie bag women handbag",
+        "samsonite luggage 24 inch spinner",
+        "silver earrings women jhumka oxidized"
+      ]
+    },
+    "deep_home_kitchen": {
+      "Home & Kitchen": [
+        "preethi zodiac mixer grinder 750w",
+        "sujata mixer grinder 900w",
+        "philips air fryer hd9270 6.2l",
+        "agaro air fryer 6.5l",
+        "hawkins stainless steel cooker 5l",
+        "prestige induction cooktop 1600w",
+        "philips induction cooktop 2100w",
+        "kent ro uv water purifier",
+        "aquaguard ro uv purifier",
+        "dyson v12 detect slim vacuum",
+        "mi robot vacuum mop 2 pro",
+        "milton stainless steel container set",
+        "borosil glass container set",
+        "corelle dinner set 21 piece",
+        "victorinox chef knife 8 inch",
+        "vegetable chopper 900ml",
+        "atomberg bldc ceiling fan 1200mm",
+        "room heater 2000w",
+        "under sink organizer",
+        "laundry basket with lid"
+      ]
+    },
+    "deep_books": {
+      "Books": [
+        "atomic habits james clear paperback",
+        "the alchemist paulo coelho",
+        "sapiens yuval noah harari",
+        "the subtle art of not giving a f",
+        "how to win friends dale carnegie",
+        "rich dad poor dad robert kiyosaki paperback",
+        "python crash course eric matthes",
+        "automate the boring stuff python",
+        "clean code robert c martin",
+        "the pragmatic programmer",
+        "system design interview alex xu vol 1",
+        "system design interview alex xu vol 2",
+        "cracking the coding interview",
+        "indian polity laxmikant",
+        "spectrum modern india rajiv ahir",
+        "quantitative aptitude rs aggarwal",
+        "neet biology mtg",
+        "jee main physics dc pandey",
+        "diary of a wimpy kid set",
+        "amar chitra katha collection"
+      ]
     }
   }
 }

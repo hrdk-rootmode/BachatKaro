@@ -38,6 +38,56 @@ Safeguards included:
 PowerShell (Windows) encoding guard before long runs:
 $env:PYTHONIOENCODING='utf-8'; $env:PYTHONUTF8='1'
 
+
+
+
+
+### 4A) Dual Catalog Strategy (Recommended)
+Use two lanes:
+- HOT groups: frequent refresh for user-facing freshness
+- DEEP groups: slower background expansion for long-tail coverage
+
+HOT groups (run every 1-2 hours, low noise):
+python scripts/seed.py --catalog-group hot_mobiles --catalog-path scripts/master_catalog.json --limit 120 --catalog-per-query 1 --platform-timeout 55 --query-interval 9 --cooldown-buffer 14 --max-errors 8 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group hot_laptops --catalog-path scripts/master_catalog.json --limit 100 --catalog-per-query 1 --platform-timeout 55 --query-interval 10 --cooldown-buffer 16 --max-errors 8 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group hot_mobile_accessories --catalog-path scripts/master_catalog.json --limit 110 --catalog-per-query 1 --platform-timeout 50 --query-interval 10 --cooldown-buffer 16 --max-errors 8 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group hot_fashion --catalog-path scripts/master_catalog.json --limit 120 --catalog-per-query 1 --platform-timeout 55 --query-interval 10 --cooldown-buffer 16 --max-errors 8 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group hot_home_kitchen --catalog-path scripts/master_catalog.json --limit 100 --catalog-per-query 1 --platform-timeout 50 --query-interval 9 --cooldown-buffer 14 --max-errors 8 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group hot_books --catalog-path scripts/master_catalog.json --limit 80 --catalog-per-query 1 --platform-timeout 45 --query-interval 8 --cooldown-buffer 12 --max-errors 8 --max-rate-limit-strikes 2 --max-empty-queries 8 --no-ai --no-cross-match
+
+
+
+
+DEEP groups (run in free windows / night):
+python scripts/seed.py --catalog-group deep_mobiles --catalog-path scripts/master_catalog.json --limit 180 --catalog-per-query 1 --platform-timeout 60 --query-interval 12 --cooldown-buffer 20 --max-errors 9 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group deep_laptops --catalog-path scripts/master_catalog.json --limit 150 --catalog-per-query 1 --platform-timeout 60 --query-interval 12 --cooldown-buffer 20 --max-errors 9 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group deep_mobile_accessories --catalog-path scripts/master_catalog.json --limit 170 --catalog-per-query 1 --platform-timeout 55 --query-interval 12 --cooldown-buffer 20 --max-errors 9 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group deep_fashion --catalog-path scripts/master_catalog.json --limit 160 --catalog-per-query 1 --platform-timeout 60 --query-interval 12 --cooldown-buffer 20 --max-errors 9 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group deep_home_kitchen --catalog-path scripts/master_catalog.json --limit 140 --catalog-per-query 1 --platform-timeout 55 --query-interval 11 --cooldown-buffer 18 --max-errors 9 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
+
+python scripts/seed.py --catalog-group deep_books --catalog-path scripts/master_catalog.json --limit 100 --catalog-per-query 1 --platform-timeout 50 --query-interval 9 --cooldown-buffer 16 --max-errors 9 --max-rate-limit-strikes 2 --max-empty-queries 8 --no-ai --no-cross-match
+
+Suggested 24-hour rotation (simple):
+1. Hourly: run one HOT group (round robin)
+2. Every 4-6 hours: run cross-platform miner batch
+3. Continuous: run daily scrape for freshness
+4. Night slots: run one DEEP group per slot
+
+
+python scripts/seed.py --catalog-group hot_mobile_accessories --catalog-path scripts/master_catalog.json --limit 120 --catalog-per-query 1 --no-ai --no-cross-match
+
+
+
+
 Mobiles:
 python scripts/seed.py --catalog-group mobiles --catalog-path scripts/master_catalog.json --limit 180 --catalog-per-query 1 --platform-timeout 60 --query-interval 12 --cooldown-buffer 20 --max-errors 9 --max-rate-limit-strikes 3 --max-empty-queries 8 --no-ai --no-cross-match
 

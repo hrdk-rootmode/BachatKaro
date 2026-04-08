@@ -186,6 +186,16 @@ def _normalize_live_price_snapshot(
             current_price = original_price
             original_price = None
 
+    # Guard against decimal-strip inflation (e.g. 12900.00 -> 1290000).
+    # If original is wildly high and dividing by 100 yields a sane strike price,
+    # normalize it back instead of exposing noisy MRP to clients.
+    if original_price is not None and current_price > 0:
+        ratio = original_price / current_price
+        if ratio >= 20.0 and original_price >= 100000.0:
+            corrected_original = original_price / 100.0
+            if corrected_original > current_price and corrected_original / current_price <= 5.0:
+                original_price = corrected_original
+
     discount_percent: Optional[float] = None
     if original_price is not None and original_price > current_price:
         discount_percent = round(((original_price - current_price) / original_price) * 100, 1)

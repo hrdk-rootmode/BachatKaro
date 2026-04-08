@@ -58,9 +58,33 @@ from app.api.deps import (
     check_ip_signup_limit,
     get_app_config
 )
+from app.services.plan_catalog import get_plan_catalog, get_plan_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _safe_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalized_user_plan(value) -> str:
+    normalized = str(value or UserPlan.FREE.value).lower()
+    allowed = {UserPlan.FREE.value, UserPlan.PRO.value, UserPlan.PREMIUM.value}
+    return normalized if normalized in allowed else UserPlan.FREE.value
 
 
 # =============================================================================
@@ -370,6 +394,22 @@ async def signup(
     return new_user
 
 
+@router.get("/account-status", response_model=dict)
+async def get_account_status(
+    user: User = Depends(get_current_user)
+):
+    """Get current account status including ban information"""
+    return {
+        "status": "active" if not user.is_blocked else "blocked",
+        "is_blocked": user.is_blocked,
+        "block_reason": user.block_reason,
+        "blocked_at": user.blocked_at.isoformat() if user.blocked_at else None,
+        "email": user.email,
+        "plan": user.plan,
+        "plan_expires_at": user.plan_expires_at.isoformat() if user.plan_expires_at else None
+    }
+
+
 @router.post("/refresh-token")
 async def refresh_token(
     token_data: dict = Depends(verify_firebase_token),
@@ -536,7 +576,11 @@ async def debug_token_check(request: Request):
         from firebase_admin import auth as firebase_auth
         
         try:
-            decoded_token = firebase_auth.verify_id_token(token)
+            decoded_token = firebase_auth.verify_id_token(
+                token,
+                check_revoked=False,
+                clock_skew_seconds=max(0, int(getattr(settings, "FIREBASE_CLOCK_SKEW_SECONDS", 5))),
+            )
             return {
                 "status": "success",
                 "message": "Firebase token is valid",
@@ -575,26 +619,39 @@ async def get_current_user_profile(
     - Streak information
     """
     # Transform User object to UserResponse with computed fields
-    usage_stats = user.usage_stats or {}
-    streak_data = user.streak_data or {}
-    watchlist = user.watchlist or []
+    usage_stats = _safe_dict(user.usage_stats)
+    streak_data = _safe_dict(user.streak_data)
+    watchlist = _safe_list(user.watchlist)
+    normalized_plan = _normalized_user_plan(user.plan)
+
+    total_searches = _safe_int(usage_stats.get("total_searches"), 0)
+    searches_today = _safe_int(
+        usage_stats.get("searches_today", usage_stats.get("daily_searches")),
+        0,
+    )
+    current_streak = _safe_int(streak_data.get("current_streak"), 0)
+    longest_streak = _safe_int(
+        streak_data.get("max_streak", streak_data.get("longest_streak")),
+        0,
+    )
+    freeze_count = _safe_int(streak_data.get("freeze_count"), 0)
     
     return UserResponse(
         id=str(user.id),  # Convert UUID to string
         firebase_uid=user.firebase_uid,
         email=user.email,
         display_name=user.display_name,
-        plan=user.plan,
+        plan=normalized_plan,
         plan_expires_at=user.plan_expires_at,
-        referral_code=user.referral_code,
-        total_searches=usage_stats.get("total_searches", 0),
-        searches_today=usage_stats.get("searches_today", 0),
-        watchlist_count=len(watchlist) if watchlist else 0,
-        current_streak=streak_data.get("current_streak", 0),
-        max_streak=streak_data.get("max_streak", 0),
-        freeze_count=streak_data.get("freeze_count", 0),
+        referral_code=user.referral_code or "",
+        total_searches=total_searches,
+        searches_today=searches_today,
+        watchlist_count=len(watchlist),
+        current_streak=current_streak,
+        max_streak=longest_streak,
+        freeze_count=freeze_count,
         is_blocked=user.is_blocked,
-        created_at=user.created_at,
+        created_at=user.created_at or datetime.utcnow(),
         last_active=user.last_active
     )
 
@@ -602,6 +659,7 @@ async def get_current_user_profile(
 @router.get("/me/stats", response_model=UserUsageStats)
 async def get_user_stats(
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
     redis_client: RedisClient = Depends(get_redis)
 ):
     """
@@ -614,14 +672,13 @@ async def get_user_stats(
     - Plan details
     """
     
-    # Calculate searches remaining based on plan
-    plan_limits = {
-        UserPlan.FREE: 10,
-        UserPlan.PRO: 50,
-        UserPlan.PREMIUM: -1  # Unlimited
-    }
-    
-    daily_limit = plan_limits.get(user.plan, 10)
+    plan_catalog = await get_plan_catalog(db)
+    usage_stats = _safe_dict(user.usage_stats)
+    streak_data = _safe_dict(user.streak_data)
+    watchlist = _safe_list(user.watchlist)
+
+    current_plan = _normalized_user_plan(user.plan)
+    daily_limit = get_plan_limit(plan_catalog, current_plan, "searches_per_day", settings.PLAN_FREE_SEARCHES)
     
     # Get today's search count from Redis
     today = datetime.utcnow().date().isoformat()
@@ -630,36 +687,37 @@ async def get_user_stats(
     searches_today = int(searches_today) if searches_today else 0
     
     # Add bonus searches
-    bonus_searches = user.usage_stats.get('bonus_searches', 0) if user.usage_stats else 0
+    bonus_searches = _safe_int(usage_stats.get('bonus_searches'), 0)
     
-    if user.plan == UserPlan.PREMIUM:
+    if daily_limit == -1:
         searches_remaining = -1  # Unlimited
     else:
         searches_remaining = max(0, daily_limit + bonus_searches - searches_today)
-    
+
     # Calculate watchlist limit
-    watchlist_limits = {
-        UserPlan.FREE: 5,
-        UserPlan.PRO: 20,
-        UserPlan.PREMIUM: 50
-    }
-    watchlist_limit = watchlist_limits.get(user.plan, 5)
+    watchlist_limit = get_plan_limit(plan_catalog, current_plan, "watchlist_limit", settings.PLAN_FREE_WISHLIST)
     
     # Calculate days remaining for subscription
     days_remaining = None
     if user.plan_expires_at:
-        delta = user.plan_expires_at - datetime.utcnow()
+        now_dt = datetime.now(user.plan_expires_at.tzinfo) if user.plan_expires_at.tzinfo else datetime.utcnow()
+        delta = user.plan_expires_at - now_dt
         days_remaining = max(0, delta.days)
+
+    watchlist_count = _safe_int(usage_stats.get("watchlist_slots_used"), len(watchlist))
+    total_searches = _safe_int(usage_stats.get("total_searches"), 0)
+    current_streak = _safe_int(streak_data.get("current_streak"), 0)
+    freeze_count = _safe_int(streak_data.get("freeze_count"), 0)
     
     return UserUsageStats(
-        total_searches=user.total_searches,
+        total_searches=total_searches,
         searches_today=searches_today,
         searches_remaining=searches_remaining,
-        watchlist_count=user.watchlist_count,
+        watchlist_count=watchlist_count,
         watchlist_limit=watchlist_limit,
-        current_streak=user.current_streak,
-        freeze_count=user.freeze_count,
-        plan=user.plan,
+        current_streak=current_streak,
+        freeze_count=freeze_count,
+        plan=current_plan,
         plan_expires_at=user.plan_expires_at
     )
 

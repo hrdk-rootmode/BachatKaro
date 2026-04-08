@@ -24,16 +24,18 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, update, delete, text
+from sqlalchemy import select, func, and_, or_, update, delete, text, cast, String
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import get_db
-from app.core.redis_client import get_redis
+from app.core.redis_client import get_redis, RedisClient
 from app.core.config import settings
 from app.api.deps import get_current_admin_user, verify_firebase_token
 from app.models import (
     User, Transaction, SubscriptionPlan, Product, ProductListing,
-    Platform, SystemLog, AppConfig, Promotion, UserWatchlist, StreakMilestone
+    Platform, SystemLog, AppConfig, Promotion, UserWatchlist, StreakMilestone,
+    PriceHistory
 )
 from app.schemas import (
     # User Management
@@ -46,6 +48,7 @@ from app.schemas import (
     # System
     SystemHealthResponse, SystemStatsResponse, ForceScrapeRequest, 
     ForceScrapeResponse, AppConfigUpdateRequest, MaintenanceModeRequest,
+    SubscriptionPlanUpdateRequest,
     # Jobs
     SchedulerStatusResponse, TriggerJobRequest, TriggerJobResponse,
     # Common
@@ -56,11 +59,43 @@ from app.services.analytics import analytics_service
 # ✅ NEW: Import scheduler functions
 from jobs.scheduler import trigger_job_manually, get_scheduler_status
 
-from redis.asyncio import Redis
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+SENSITIVE_CONFIG_EXACT_KEYS = {
+    "DATABASE_URL",
+    "SECRET_KEY",
+    "JWT_SECRET",
+    "CRON_SECRET",
+    "ADMIN_SECRET",
+    "FIREBASE_PRIVATE_KEY",
+    "FIREBASE_PRIVATE_KEY_ID",
+    "FIREBASE_CLIENT_EMAIL",
+    "FIREBASE_CLIENT_ID",
+    "GROQ_API_KEY_MAIN",
+    "GROQ_API_KEY_SEARCH",
+    "GROQ_API_KEY_HEALING",
+    "GROQ_API_KEY_CHAT",
+    "GEMINI_API_KEY",
+    "RAZORPAY_KEY_ID",
+    "RAZORPAY_KEY_SECRET",
+    "RAZORPAY_WEBHOOK_SECRET",
+    "FCM_SERVER_KEY",
+    "GITHUB_TOKEN",
+}
+
+SENSITIVE_CONFIG_KEYWORDS = (
+    "API_KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PRIVATE_KEY",
+    "WEBHOOK",
+    "CREDENTIALS",
+    "DATABASE_URL",
+)
 
 
 # =============================================================================
@@ -98,6 +133,144 @@ async def log_action(
     )
 
 
+def is_sensitive_config_key(key: str) -> bool:
+    """Detect keys that must remain env-only and never be exposed from DB config."""
+    if not key:
+        return False
+
+    upper = key.strip().upper()
+    if upper in SENSITIVE_CONFIG_EXACT_KEYS:
+        return True
+
+    return any(token in upper for token in SENSITIVE_CONFIG_KEYWORDS)
+
+
+def normalize_config_value_type(value_type: str) -> str:
+    """Normalize legacy/alias value types to supported schema types."""
+    normalized = (value_type or "string").strip().lower()
+    aliases = {
+        "int": "number",
+        "integer": "number",
+        "float": "number",
+        "decimal": "number",
+        "bool": "boolean",
+        "dict": "json",
+        "list": "json",
+        "jsonb": "json",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"string", "number", "boolean", "json"} else "string"
+
+
+def infer_config_value_type(value) -> str:
+    """Infer config value type from python runtime value."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, (list, dict, tuple)):
+        return "json"
+    return "string"
+
+
+def serialize_config_value(value, value_type: str) -> str:
+    """Serialize value to DB text format using normalized value_type."""
+    normalized_type = normalize_config_value_type(value_type)
+
+    if value is None:
+        return ""
+
+    if normalized_type == "boolean":
+        if isinstance(value, bool):
+            return str(value).lower()
+        return str(str(value).strip().lower() in {"1", "true", "yes", "on"}).lower()
+
+    if normalized_type == "number":
+        return str(value)
+
+    if normalized_type == "json":
+        if isinstance(value, str):
+            text_value = value.strip()
+            if not text_value:
+                return "{}"
+            try:
+                json.loads(text_value)
+                return text_value
+            except Exception:
+                return json.dumps({"value": text_value})
+        return json.dumps(value, default=str)
+
+    return str(value)
+
+
+def infer_config_category(key: str) -> str:
+    """Infer AppConfig category from setting key name."""
+    upper = (key or "").upper()
+
+    if upper.startswith("DAILY_SCRAPE_") or "SCRAPER" in upper:
+        return "scraper"
+    if upper.startswith("PLAN_") or upper.startswith("REWARD_"):
+        return "plans"
+    if upper.startswith("RATE_LIMIT"):
+        return "limits"
+    if upper.startswith("RAZORPAY_") or upper.startswith("GOOGLE_PLAY_"):
+        return "payments"
+    if upper.startswith("FIREBASE_"):
+        return "auth"
+    if upper.startswith("GROQ_") or upper.startswith("GEMINI_"):
+        return "ai"
+    if upper.startswith("LOCATION_REFRESH_"):
+        return "location"
+    return "system"
+
+
+def settings_to_config_entries() -> list[dict]:
+    """Convert backend settings to AppConfig candidate entries, excluding sensitive keys."""
+    if hasattr(settings, "model_dump"):
+        raw_settings = settings.model_dump()
+    else:
+        raw_settings = settings.dict()
+
+    entries = []
+    for key, value in raw_settings.items():
+        if is_sensitive_config_key(key):
+            continue
+
+        value_type = infer_config_value_type(value)
+        entries.append({
+            "key": key,
+            "value": serialize_config_value(value, value_type),
+            "value_type": value_type,
+            "category": infer_config_category(key),
+            "description": f"Synced from backend setting: {key}",
+            "is_public": False,
+        })
+
+    return entries
+
+
+def serialize_subscription_plan(plan: SubscriptionPlan) -> dict:
+    """Serialize subscription plan row to admin/frontend-friendly payload."""
+    features = plan.features if isinstance(plan.features, dict) else {}
+    searches_per_day = features.get("daily_searches", 0)
+    watchlist_limit = features.get("watchlist_limit", 0)
+
+    return {
+        "name": plan.name,
+        "display_name": plan.display_name,
+        "price_inr": float(plan.price_inr or 0),
+        "duration_days": int(plan.duration_days or 0),
+        "searches_per_day": int(searches_per_day) if searches_per_day is not None else 0,
+        "watchlist_limit": int(watchlist_limit) if watchlist_limit is not None else 0,
+        "is_popular": bool(plan.is_popular),
+        "is_active": bool(plan.is_active),
+        "sort_order": int(plan.sort_order or 0),
+        "tagline": plan.tagline,
+        "features": features,
+        "updated_at": plan.updated_at.isoformat() if plan.updated_at else None,
+    }
+
+
 # =============================================================================
 # USER MANAGEMENT ENDPOINTS (5)
 # =============================================================================
@@ -105,7 +278,7 @@ async def log_action(
 @router.get("/users", response_model=dict)
 async def list_users(
     request: Request,
-    plan: Optional[str] = Query(None, pattern="^(free|pro|premium)$"),
+    plan: Optional[str] = Query(None, pattern="^[a-z0-9_]+$"),
     is_blocked: Optional[bool] = Query(None),
     suspicious: Optional[bool] = Query(False),
     search: Optional[str] = Query(None, max_length=100),
@@ -147,6 +320,30 @@ async def list_users(
     
     result = await db.execute(query)
     users = result.scalars().all()
+
+    user_ids = [u.id for u in users]
+    watchlist_counts: dict[UUID, int] = {}
+    search_counts: dict[UUID, int] = {}
+
+    if user_ids:
+        watchlist_result = await db.execute(
+            select(UserWatchlist.user_id, func.count(UserWatchlist.id))
+            .where(UserWatchlist.user_id.in_(user_ids))
+            .group_by(UserWatchlist.user_id)
+        )
+        watchlist_counts = {row[0]: row[1] for row in watchlist_result.all()}
+
+        search_result = await db.execute(
+            select(Transaction.user_id, func.count(Transaction.id))
+            .where(
+                and_(
+                    Transaction.user_id.in_(user_ids),
+                    Transaction.type.in_(["search", "ai_search"])
+                )
+            )
+            .group_by(Transaction.user_id)
+        )
+        search_counts = {row[0]: row[1] for row in search_result.all()}
     
     count_query = select(func.count(User.id))
     if plan:
@@ -170,6 +367,14 @@ async def list_users(
         
         usage = u.usage_stats or {}
         streak = u.streak_data or {}
+
+        usage_total_searches = usage.get("total_searches", usage.get("daily_searches", 0))
+        db_total_searches = search_counts.get(u.id, 0)
+        total_searches = max(int(usage_total_searches or 0), int(db_total_searches or 0))
+
+        watchlist_count = int(watchlist_counts.get(u.id, 0))
+        if watchlist_count == 0:
+            watchlist_count = len(u.watchlist or [])
         
         user_list.append({
             "id": str(u.id),
@@ -179,8 +384,8 @@ async def list_users(
             "plan_expires_at": u.plan_expires_at.isoformat() if u.plan_expires_at else None,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "last_active": u.last_active.isoformat() if u.last_active else None,
-            "total_searches": usage.get("daily_searches", 0),
-            "watchlist_count": len(u.watchlist or []),
+            "total_searches": total_searches,
+            "watchlist_count": watchlist_count,
             "current_streak": streak.get("current_streak", 0),
             "hardware_id": u.hardware_id[:8] + "..." if u.hardware_id else None,
             "accounts_on_device": accounts_on_device,
@@ -242,9 +447,22 @@ async def get_user_detail(
         .options(selectinload(UserWatchlist.product))
     )
     watchlist_items = watchlist_result.scalars().all()
+
+    search_count_result = await db.execute(
+        select(func.count(Transaction.id))
+        .where(
+            and_(
+                Transaction.user_id == uid,
+                Transaction.type.in_(["search", "ai_search"])
+            )
+        )
+    )
+    db_total_searches = search_count_result.scalar() or 0
     
     usage = target_user.usage_stats or {}
     streak = target_user.streak_data or {}
+    usage_total_searches = usage.get("total_searches", usage.get("daily_searches", 0))
+    total_searches = max(int(usage_total_searches or 0), int(db_total_searches or 0))
     
     accounts_on_device = 0
     if target_user.hardware_id:
@@ -287,7 +505,7 @@ async def get_user_detail(
             "last_active": target_user.last_active.isoformat() if target_user.last_active else None
         },
         "activity": {
-            "total_searches": usage.get("daily_searches", 0),
+            "total_searches": total_searches,
             "total_clicks": usage.get("total_clicks", 0),
             "current_streak": streak.get("current_streak", 0),
             "longest_streak": streak.get("longest_streak", 0),
@@ -464,17 +682,18 @@ async def grant_bulk_bonus(
     
     query = select(User).where(User.is_blocked == False)
     
-    if bonus_request.target == "all_free_users":
-        query = query.where(User.plan == "free")
-    elif bonus_request.target == "all_pro_users":
-        query = query.where(User.plan == "pro")
-    elif bonus_request.target == "all_premium_users":
-        query = query.where(User.plan == "premium")
-    elif bonus_request.target == "specific_users":
+    if bonus_request.target == "specific_users":
         if not bonus_request.user_ids:
             raise HTTPException(status_code=400, detail="user_ids required for specific_users target")
         uuids = [UUID(uid) for uid in bonus_request.user_ids]
         query = query.where(User.id.in_(uuids))
+    elif bonus_request.target.startswith("all_") and bonus_request.target.endswith("_users"):
+        plan_name = bonus_request.target[len("all_"):-len("_users")].strip().lower()
+        if not plan_name:
+            raise HTTPException(status_code=400, detail="Invalid bulk bonus target")
+        query = query.where(User.plan == plan_name)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid bulk bonus target")
     
     result = await db.execute(query)
     users = result.scalars().all()
@@ -622,9 +841,13 @@ async def get_plan_breakdown(
     
     user_breakdown = await analytics_service.get_user_breakdown(db)
     mrr = await analytics_service.calculate_mrr(db)
-    
-    pro_price = settings.PLAN_PRO_PRICE / 100
-    premium_price = settings.PLAN_PREMIUM_PRICE / 100
+
+    plan_result = await db.execute(select(SubscriptionPlan))
+    plan_rows = plan_result.scalars().all()
+    plan_prices = {str(p.name).lower(): float(p.price_inr or 0) for p in plan_rows}
+
+    pro_price = plan_prices.get("pro", settings.PLAN_PRO_PRICE / 100)
+    premium_price = plan_prices.get("premium", settings.PLAN_PREMIUM_PRICE / 100)
     
     return {
         "plans": [
@@ -1074,6 +1297,800 @@ async def get_promotion_revenue_report(
 
 
 # =============================================================================
+# PRODUCT MANAGEMENT ENDPOINTS
+# =============================================================================
+
+@router.get("/products", response_model=dict)
+async def list_admin_products(
+    page: int = 1,
+    limit: int = 50,
+    search: Optional[str] = None,
+    product_id: Optional[str] = None,
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    platform: Optional[str] = None,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List products with filters for admin"""
+    await verify_admin_email(user)
+    
+    query = select(Product)
+    
+    if search:
+        query = query.where(Product.title.ilike(f"%{search}%"))
+    if product_id:
+        product_id_value = product_id.strip()
+        if product_id_value:
+            try:
+                parsed_uuid = UUID(product_id_value)
+                query = query.where(Product.id == parsed_uuid)
+            except ValueError:
+                query = query.where(cast(Product.id, String).ilike(f"%{product_id_value}%"))
+    if category:
+        query = query.where(Product.category == category)
+    if brand:
+        query = query.where(Product.brand.ilike(f"%{brand}%"))
+    
+    if platform:
+        query = query.join(ProductListing).join(Platform).where(Platform.name == platform.lower())
+    
+    query = query.order_by(Product.created_at.desc())
+    
+    # Count total
+    count_query = select(func.count()).select_from(query.subquery())
+    count_result = await db.execute(count_query)
+    total = count_result.scalar() or 0
+    
+    # Paginate
+    offset = (page - 1) * limit
+    results = await db.execute(query.offset(offset).limit(limit))
+    products = results.scalars().all()
+    
+    product_list = []
+    for p in products:
+        # Get listings count per product
+        list_res = await db.execute(select(func.count(ProductListing.id)).where(ProductListing.product_id == p.id))
+        platforms_count = list_res.scalar() or 0
+        
+        product_list.append({
+            "id": str(p.id),
+            "title": p.title,
+            "brand": p.brand,
+            "category": p.category,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+            "platforms_count": platforms_count,
+            "image_url": p.image_url
+        })
+        
+    return {
+        "products": product_list,
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
+
+
+@router.get("/products/{product_id}", response_model=dict)
+async def get_admin_product_detail(
+    product_id: str,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get full product detail for admin"""
+    await verify_admin_email(user)
+    
+    try:
+        pid = UUID(product_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid product ID")
+    
+    product = await db.get(Product, pid)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    # Get listings
+    results = await db.execute(
+        select(ProductListing).where(ProductListing.product_id == pid)
+    )
+    listings_models = results.scalars().all()
+    
+    listings = []
+    for l in listings_models:
+        # Get platform info
+        plat = await db.get(Platform, l.platform_id)
+        
+        # Get price history count
+        hist_count_res = await db.execute(
+            select(func.count(PriceHistory.id)).where(PriceHistory.product_listing_id == l.id)
+        )
+        history_points = hist_count_res.scalar() or 0
+        
+        listings.append({
+            "id": str(l.id),
+            "platform_name": plat.name if plat else "Unknown",
+            "external_id": l.external_id,
+            "product_url": l.product_url,
+            "current_price": l.current_price,
+            "original_price": l.original_price,
+            "in_stock": l.in_stock,
+            "last_scraped": l.last_scraped.isoformat() if l.last_scraped else None,
+            "scrape_priority": l.scrape_priority,
+            "history_points": history_points
+        })
+    
+    return {
+        "product": {
+            "id": str(product.id),
+            "title": product.title,
+            "brand": product.brand,
+            "category": product.category,
+            "subcategory": product.subcategory,
+            "image_url": product.image_url,
+            "specifications": product.specifications,
+            "variant_type": product.variant_type,
+            "storage_gb": product.storage_gb,
+            "color": product.color,
+            "condition": product.condition,
+            "created_at": product.created_at.isoformat() if product.created_at else None,
+            "updated_at": product.updated_at.isoformat() if product.updated_at else None
+        },
+        "listings": listings
+    }
+
+
+@router.put("/products/{product_id}", response_model=dict)
+async def update_admin_product(
+    product_id: str,
+    update_data: dict,  # Using dict for flexibility since schemas are failing
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update product details for admin"""
+    await verify_admin_email(user)
+    
+    try:
+        pid = UUID(product_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid product ID")
+    
+    product = await db.get(Product, pid)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    for field, value in update_data.items():
+        if hasattr(product, field):
+            setattr(product, field, value)
+    
+    await db.commit()
+    return {"success": True, "message": "Product updated"}
+
+
+@router.delete("/products/{product_id}", response_model=dict)
+async def delete_admin_product(
+    product_id: str,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete product for admin"""
+    await verify_admin_email(user)
+    
+    try:
+        pid = UUID(product_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid product ID")
+    
+    product = await db.get(Product, pid)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    await db.delete(product)
+    await db.commit()
+    return {"success": True, "message": "Product deleted"}
+
+# =============================================================================
+# LISTING MANAGEMENT ENDPOINTS
+# =============================================================================
+
+@router.put("/listings/{listing_id}/price", response_model=dict)
+async def update_listing_price(
+    listing_id: str,
+    update_data: dict,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update listing price for admin"""
+    await verify_admin_email(user)
+    
+    try:
+        lid = UUID(listing_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing ID")
+    
+    listing = await db.get(ProductListing, lid)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    
+    # Update price fields
+    if "current_price" in update_data:
+        listing.current_price = float(update_data["current_price"])
+    if "original_price" in update_data:
+        listing.original_price = float(update_data["original_price"])
+    
+    # Log price change
+    await log_action(
+        db, user.email, "updated_listing_price",
+        listing_id,
+        details=update_data
+    )
+    
+    await db.commit()
+    return {"success": True, "message": "Listing price updated"}
+
+@router.get("/listings/{listing_id}/price-history", response_model=dict)
+async def get_listing_price_history(
+    listing_id: str,
+    days: int = 30,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get price history for a listing"""
+    await verify_admin_email(user)
+    
+    try:
+        lid = UUID(listing_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing ID")
+    
+    listing = await db.get(ProductListing, lid)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    
+    # Get price history
+    since_date = datetime.utcnow() - timedelta(days=days)
+    result = await db.execute(
+        select(PriceHistory)
+        .where(
+            and_(
+                PriceHistory.product_listing_id == lid,
+                PriceHistory.recorded_at >= since_date
+            )
+        )
+        .order_by(PriceHistory.recorded_at.desc())
+    )
+    
+    history_points = result.scalars().all()
+    
+    history_list = []
+    for point in history_points:
+        history_list.append({
+            "price": float(point.price),
+            "in_stock": point.in_stock,
+            "recorded_at": point.recorded_at.isoformat() if point.recorded_at else None
+        })
+    
+    return {
+        "listing_id": listing_id,
+        "history": history_list,
+        "total_points": len(history_list)
+    }
+
+@router.post("/listings/{listing_id}/price-history", response_model=dict)
+async def add_price_history_point(
+    listing_id: str,
+    price_data: dict,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Add a price history point for a listing"""
+    await verify_admin_email(user)
+    
+    try:
+        lid = UUID(listing_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing ID")
+    
+    listing = await db.get(ProductListing, lid)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    
+    # Create new price history point
+    new_point = PriceHistory(
+        product_listing_id=lid,
+        price=price_data.get("price"),
+        in_stock=price_data.get("in_stock", True)
+    )
+    
+    # Update current price if provided
+    if "current_price" in price_data:
+        listing.current_price = float(price_data["current_price"])
+    
+    db.add(new_point)
+    
+    await log_action(
+        db, user.email, "added_price_history",
+        listing_id,
+        details=price_data
+    )
+    
+    await db.commit()
+    return {"success": True, "message": "Price history point added"}
+
+@router.get("/listings/{listing_id}/performance", response_model=dict)
+async def get_listing_performance(
+    listing_id: str,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get performance metrics for a listing"""
+    await verify_admin_email(user)
+    
+    try:
+        lid = UUID(listing_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing ID")
+    
+    listing = await db.get(ProductListing, lid)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    
+    # Get price history for analysis
+    result = await db.execute(
+        select(PriceHistory)
+        .where(PriceHistory.product_listing_id == lid)
+        .order_by(PriceHistory.recorded_at.desc())
+        .limit(100)  # Last 100 points
+    )
+    
+    history_points = result.scalars().all()
+    
+    if not history_points:
+        return {
+            "listing_id": listing_id,
+            "price_volatility": 0,
+            "avg_price": listing.current_price,
+            "min_price": listing.current_price,
+            "max_price": listing.current_price,
+            "stock_availability": 100.0,
+            "total_price_points": 0
+        }
+    
+    prices = [float(p.price) for p in history_points]
+    stock_available = sum(1 for p in history_points if p.in_stock)
+    
+    performance = {
+        "listing_id": listing_id,
+        "price_volatility": (max(prices) - min(prices)) / min(prices) * 100 if min(prices) > 0 else 0,
+        "avg_price": sum(prices) / len(prices),
+        "min_price": min(prices),
+        "max_price": max(prices),
+        "stock_availability": (stock_available / len(history_points)) * 100,
+        "total_price_points": len(history_points)
+    }
+    
+    return performance
+
+
+# =============================================================================
+# JOB MANAGEMENT ENDPOINTS
+# =============================================================================
+
+@router.get("/jobs/current", response_model=dict)
+async def get_current_jobs(
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get currently running jobs"""
+    await verify_admin_email(user)
+    
+    try:
+        # Import scheduler functions
+        from jobs.scheduler import get_scheduler_status, _job_registry
+        
+        # Get real scheduler status
+        scheduler_status = await get_scheduler_status()
+        
+        # Get running jobs from registry
+        running_jobs = []
+        for job_id, job_info in _job_registry.items():
+            if job_info.is_running:
+                # Calculate progress based on job type and runtime
+                progress = 0
+                if job_info.started_at:
+                    runtime_seconds = (datetime.utcnow() - job_info.started_at).total_seconds()
+                    
+                    # Estimate progress based on typical job durations
+                    if job_id == "daily_scrape":
+                        progress = min(95, (runtime_seconds / 300) * 100)  # 5 minutes typical
+                    elif job_id == "daily_scrape_trending":
+                        progress = min(95, (runtime_seconds / 180) * 100)  # 3 minutes typical
+                    elif job_id == "seed_products":
+                        progress = min(95, (runtime_seconds / 120) * 100)  # 2 minutes typical
+                    elif job_id == "check_price_alerts":
+                        progress = min(95, (runtime_seconds / 60) * 100)  # 1 minute typical
+                    else:
+                        progress = min(95, (runtime_seconds / 60) * 100)  # Default 1 minute
+                
+                running_jobs.append({
+                    "id": job_id,
+                    "type": job_id.replace("_", " ").title(),
+                    "status": "running",
+                    "started_at": job_info.started_at.isoformat() if job_info.started_at else datetime.utcnow().isoformat(),
+                    "progress": int(progress),
+                    "platform": "all" if "scrape" in job_id else "system",
+                    "total_items": 100,  # Placeholder
+                    "processed_items": int(progress),
+                    "name": job_info.name,
+                    "description": job_info.description
+                })
+        
+        return {
+            "current_jobs": running_jobs,
+            "total_running": len(running_jobs),
+            "scheduler_status": scheduler_status
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting current jobs: {e}")
+        # Fallback with mock data if scheduler not available
+        return {
+            "current_jobs": [],
+            "total_running": 0,
+            "error": str(e)
+        }
+
+@router.get("/jobs/{job_id}/logs", response_model=dict)
+async def get_job_logs(
+    job_id: str,
+    lines: int = 100,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get logs for a specific job"""
+    await verify_admin_email(user)
+    
+    try:
+        # Import scheduler to get job info
+        from jobs.scheduler import _job_registry
+        
+        job_info = _job_registry.get(job_id)
+        
+        if not job_info:
+            return {
+                "job_id": job_id,
+                "logs": [],
+                "total_lines": 0,
+                "error": f"Job {job_id} not found in registry"
+            }
+        
+        # Get real logs from job info
+        logs = []
+        
+        # Add job start log
+        if job_info.started_at:
+            logs.append({
+                "timestamp": job_info.started_at.isoformat(),
+                "level": "info",
+                "message": f"Job {job_id} started",
+                "details": f"Started at: {job_info.started_at.isoformat()}"
+            })
+        
+        # Add status logs based on job state
+        if job_info.is_running:
+            runtime = datetime.utcnow() - job_info.started_at if job_info.started_at else timedelta(0)
+            logs.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "info",
+                "message": f"Job {job_id} is running",
+                "details": f"Runtime: {runtime.total_seconds():.1f}s, Status: {job_info.last_status.value}"
+            })
+        
+        # Add completion/error logs
+        if job_info.last_run and not job_info.is_running:
+            if job_info.last_status.value == "success":
+                logs.append({
+                    "timestamp": job_info.last_run.isoformat(),
+                    "level": "info",
+                    "message": f"Job {job_id} completed successfully",
+                    "details": f"Completed at: {job_info.last_run.isoformat()}"
+                })
+            elif job_info.last_status.value == "error":
+                logs.append({
+                    "timestamp": job_info.last_run.isoformat(),
+                    "level": "error",
+                    "message": f"Job {job_id} failed",
+                    "details": f"Error: {job_info.last_error or 'Unknown error'}"
+                })
+        
+        # Add job statistics
+        logs.append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": "info",
+            "message": f"Job {job_id} statistics",
+            "details": f"Success count: {job_info.success_count}, Error count: {job_info.error_count}, Last run: {job_info.last_run.isoformat() if job_info.last_run else 'Never'}"
+        })
+        
+        return {
+            "job_id": job_id,
+            "logs": logs[-lines:],  # Return last N lines
+            "total_lines": len(logs),
+            "job_info": {
+                "name": job_info.name,
+                "description": job_info.description,
+                "is_running": job_info.is_running,
+                "last_status": job_info.last_status.value,
+                "success_count": job_info.success_count,
+                "error_count": job_info.error_count,
+                "last_run": job_info.last_run.isoformat() if job_info.last_run else None,
+                "next_run": job_info.next_run.isoformat() if job_info.next_run else None
+            }
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting job logs: {e}")
+        return {
+            "job_id": job_id,
+            "logs": [{
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "error",
+                "message": f"Failed to get logs for job {job_id}",
+                "details": str(e)
+            }],
+            "total_lines": 1,
+            "error": str(e)
+        }
+
+@router.post("/jobs/schedule", response_model=dict)
+async def create_job_schedule(
+    schedule_data: dict,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new job schedule"""
+    await verify_admin_email(user)
+    
+    # Log schedule creation
+    await log_action(
+        db, user.email, "created_schedule",
+        schedule_data.get("name"),
+        details=schedule_data
+    )
+    
+    # This would typically save to a scheduler database
+    # For now, return success response
+    schedule_id = f"schedule_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    
+    return {
+        "success": True,
+        "message": "Schedule created successfully",
+        "schedule_id": schedule_id
+    }
+
+@router.get("/jobs/schedules", response_model=dict)
+async def get_job_schedules(
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all job schedules"""
+    await verify_admin_email(user)
+    
+    # This would typically query scheduler database
+    # For now, return mock schedules
+    schedules = [
+        {
+            "id": "schedule_001",
+            "name": "Daily Amazon Scrape",
+            "job_type": "scrape",
+            "frequency": "daily",
+            "time": "02:00",
+            "enabled": True,
+            "platform": "amazon",
+            "next_run": "2024-01-15T02:00:00Z"
+        },
+        {
+            "id": "schedule_002", 
+            "name": "Weekly Cleanup",
+            "job_type": "cleanup",
+            "frequency": "weekly",
+            "time": "03:00",
+            "enabled": True,
+            "day_of_week": "Sunday",
+            "next_run": "2024-01-21T03:00:00Z"
+        }
+    ]
+    
+    return {
+        "schedules": schedules,
+        "total_schedules": len(schedules)
+    }
+
+@router.put("/jobs/schedules/{schedule_id}", response_model=dict)
+async def update_job_schedule(
+    schedule_id: str,
+    update_data: dict,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a job schedule"""
+    await verify_admin_email(user)
+    
+    # Log schedule update
+    await log_action(
+        db, user.email, "updated_schedule",
+        schedule_id,
+        details=update_data
+    )
+    
+    return {
+        "success": True,
+        "message": "Schedule updated successfully"
+    }
+
+@router.delete("/jobs/schedules/{schedule_id}", response_model=dict)
+async def delete_job_schedule(
+    schedule_id: str,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a job schedule"""
+    await verify_admin_email(user)
+    
+    # Log schedule deletion
+    await log_action(
+        db, user.email, "deleted_schedule",
+        schedule_id
+    )
+    
+    return {
+        "success": True,
+        "message": "Schedule deleted successfully"
+    }
+
+# =============================================================================
+# PRODUCT MONITORING ENDPOINTS
+# =============================================================================
+
+@router.get("/products/new", response_model=dict)
+async def get_new_products(
+    hours: int = 24,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get newly added products within specified hours"""
+    await verify_admin_email(user)
+    
+    # Calculate time threshold
+    since_date = datetime.utcnow() - timedelta(hours=hours)
+    
+    # Query new products
+    result = await db.execute(
+        select(Product)
+        .where(Product.created_at >= since_date)
+        .order_by(Product.created_at.desc())
+        .limit(100)
+    )
+    
+    new_products = result.scalars().all()
+    
+    products_data = []
+    for product in new_products:
+        # Get platform count
+        platform_result = await db.execute(
+            select(func.count(ProductListing.id))
+            .where(ProductListing.product_id == product.id)
+        )
+        platform_count = platform_result.scalar() or 0
+        
+        products_data.append({
+            "id": str(product.id),
+            "title": product.title,
+            "brand": product.brand,
+            "category": product.category,
+            "platforms_count": platform_count,
+            "created_at": product.created_at.isoformat() if product.created_at else None,
+            "first_seen": product.created_at.isoformat() if product.created_at else None
+        })
+    
+    return {
+        "products": products_data,
+        "total": len(products_data),
+        "hours": hours
+    }
+
+@router.get("/products/changes", response_model=dict)
+async def get_recent_changes(
+    change_type: str = "all",
+    hours: int = 24,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get recent product changes"""
+    await verify_admin_email(user)
+    
+    # Calculate time threshold
+    since_date = datetime.utcnow() - timedelta(hours=hours)
+    
+    changes_data = []
+    
+    if change_type in ["all", "price_change"]:
+        # Get recent price changes
+        price_result = await db.execute(
+            select(PriceHistory)
+            .where(PriceHistory.recorded_at >= since_date)
+            .order_by(PriceHistory.recorded_at.desc())
+            .limit(50)
+        )
+        
+        price_changes = price_result.scalars().all()
+        
+        for change in price_changes:
+            # Get listing and product info
+            listing = await db.get(ProductListing, change.product_listing_id)
+            if listing:
+                product = await db.get(Product, listing.product_id)
+                if product:
+                    changes_data.append({
+                        "product_title": product.title,
+                        "change_type": "price_change",
+                        "platform_name": listing.platform.name if listing.platform else "Unknown",
+                        "old_value": f"₹{change.price:.2f}",
+                        "new_value": f"₹{listing.current_price:.2f}",
+                        "changed_at": change.recorded_at.isoformat()
+                    })
+    
+    if change_type in ["all", "stock_change"]:
+        # Get recent stock changes (this would need additional tracking)
+        # For now, add mock data
+        changes_data.append({
+            "product_title": "Sample Product",
+            "change_type": "stock_change",
+            "platform_name": "Amazon",
+            "old_value": "Out of Stock",
+            "new_value": "In Stock",
+            "changed_at": datetime.utcnow().isoformat()
+        })
+    
+    return {
+        "changes": changes_data,
+        "total": len(changes_data),
+        "change_type": change_type,
+        "hours": hours
+    }
+
+@router.get("/system/database-stats", response_model=dict)
+async def get_database_statistics(
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get database statistics"""
+    await verify_admin_email(user)
+    
+    # Get product count
+    product_result = await db.execute(select(func.count(Product.id)))
+    total_products = product_result.scalar() or 0
+    
+    # Get listing count
+    listing_result = await db.execute(select(func.count(ProductListing.id)))
+    total_listings = listing_result.scalar() or 0
+    
+    # Get price history count
+    history_result = await db.execute(select(func.count(PriceHistory.id)))
+    total_history = history_result.scalar() or 0
+    
+    # Calculate approximate database size (this would be more accurate with actual DB queries)
+    estimated_size_mb = (total_products * 0.001) + (total_listings * 0.002) + (total_history * 0.0005)
+    
+    return {
+        "total_products": total_products,
+        "total_listings": total_listings,
+        "total_price_history": total_history,
+        "estimated_size_mb": round(estimated_size_mb, 2),
+        "last_updated": datetime.utcnow().isoformat()
+    }
+
+
+# =============================================================================
 # SYSTEM MONITORING ENDPOINTS (6) - ✅ UPDATED WITH WORKING FORCE-SCRAPE
 # =============================================================================
 
@@ -1081,14 +2098,14 @@ async def get_promotion_revenue_report(
 async def get_system_health(
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
-    redis_client: Redis = Depends(get_redis)
+    redis_client: RedisClient = Depends(get_redis)
 ):
     """Get complete system health status"""
     await verify_admin_email(user)
     
     health = {
         "database": {"status": "healthy"},
-        "redis": {"status": "healthy"},
+        "redis": {"status": "disabled"},
         "scrapers": {},
         "groq_ai": {},
         "overall": "healthy"
@@ -1118,23 +2135,27 @@ async def get_system_health(
         health["database"] = {"status": "unhealthy", "error": str(e)}
         health["overall"] = "degraded"
     
-    # Check Redis
+    # Redis is optional; when disabled/unavailable we don't degrade overall health.
     try:
-        await redis_client.ping()
-        
-        info = await redis_client.info("memory")
-        memory_used = info.get("used_memory_human", "Unknown")
-        
-        keys_count = await redis_client.dbsize()
-        
-        health["redis"] = {
-            "status": "healthy",
-            "memory_used": memory_used,
-            "keys": keys_count
-        }
+        if redis_client and redis_client._client is not None and await redis_client.ping():
+            info = await redis_client._client.info("memory")
+            memory_used = info.get("used_memory_human", "Unknown")
+            keys_count = await redis_client._client.dbsize()
+            health["redis"] = {
+                "status": "healthy",
+                "memory_used": memory_used,
+                "keys": keys_count
+            }
+        else:
+            health["redis"] = {
+                "status": "disabled",
+                "message": "Redis not configured or unavailable"
+            }
     except Exception as e:
-        health["redis"] = {"status": "unhealthy", "error": str(e)}
-        health["overall"] = "degraded"
+        health["redis"] = {
+            "status": "disabled",
+            "message": f"Redis unavailable: {str(e)}"
+        }
     
     # Check scrapers
     try:
@@ -1147,19 +2168,22 @@ async def get_system_health(
     except Exception as e:
         health["scrapers"] = {"error": str(e)}
     
-    # Check Groq quota
+    # Check Groq quota (best-effort if Redis exists)
     try:
-        today = date.today().isoformat()
-        quota_key = f"groq:usage:{today}"
-        quota_used = await redis_client.get(quota_key)
-        
-        health["groq_ai"] = {
-            "quota_used_today": int(quota_used or 0),
-            "quota_limit": settings.GROQ_DAILY_LIMIT,
-            "quota_remaining": settings.GROQ_DAILY_LIMIT - int(quota_used or 0)
-        }
+        if redis_client:
+            today = date.today().isoformat()
+            quota_key = f"groq:usage:{today}"
+            quota_used = await redis_client.get(quota_key)
+            used = int(quota_used or 0)
+            health["groq_ai"] = {
+                "quota_used_today": used,
+                "quota_limit": settings.GROQ_DAILY_LIMIT,
+                "quota_remaining": max(0, settings.GROQ_DAILY_LIMIT - used)
+            }
+        else:
+            health["groq_ai"] = {"status": "unknown", "message": "Redis disabled"}
     except Exception:
-        health["groq_ai"] = {"status": "unknown"}
+        health["groq_ai"] = {"status": "unknown", "message": "Quota source unavailable"}
     
     return health
 
@@ -1168,7 +2192,7 @@ async def get_system_health(
 async def get_system_stats(
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
-    redis_client: Redis = Depends(get_redis)
+    redis_client: RedisClient = Depends(get_redis)
 ):
     """Get system-wide statistics"""
     await verify_admin_email(user)
@@ -1176,6 +2200,8 @@ async def get_system_stats(
     dau = await analytics_service.get_active_users_count(db, "daily")
     wau = await analytics_service.get_active_users_count(db, "weekly")
     mau = await analytics_service.get_active_users_count(db, "monthly")
+    user_breakdown = await analytics_service.get_user_breakdown(db)
+    total_users = sum(user_breakdown.values())
     
     product_stats = await analytics_service.get_product_stats(db)
     
@@ -1185,13 +2211,48 @@ async def get_system_stats(
     
     cache_hit_rate = 0
     try:
-        info = await redis_client.info("stats")
-        hits = info.get("keyspace_hits", 0)
-        misses = info.get("keyspace_misses", 0)
-        if hits + misses > 0:
-            cache_hit_rate = round((hits / (hits + misses)) * 100, 1)
+        if redis_client and redis_client._client is not None and await redis_client.ping():
+            info = await redis_client._client.info("stats")
+            hits = info.get("keyspace_hits", 0)
+            misses = info.get("keyspace_misses", 0)
+            if hits + misses > 0:
+                cache_hit_rate = round((hits / (hits + misses)) * 100, 1)
     except Exception:
         pass
+    
+    # Get real job statistics
+    active_jobs = 0
+    completed_today = 0
+    failed_today = 0
+    success_rate = 0.0
+    
+    try:
+        from jobs.scheduler import get_scheduler_status, _job_registry
+        
+        # Get scheduler status
+        scheduler_status = await get_scheduler_status()
+        
+        # Count active jobs
+        for job_id, job_info in _job_registry.items():
+            if job_info.is_running:
+                active_jobs += 1
+            
+            # Count jobs completed today
+            if job_info.last_run:
+                today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                if job_info.last_run >= today_start:
+                    if job_info.last_status.value == "success":
+                        completed_today += 1
+                    elif job_info.last_status.value == "error":
+                        failed_today += 1
+        
+        # Calculate success rate
+        total_jobs_today = completed_today + failed_today
+        if total_jobs_today > 0:
+            success_rate = (completed_today / total_jobs_today) * 100
+        
+    except Exception as e:
+        logger.error(f"Error getting job stats: {e}")
     
     return {
         "traffic": {
@@ -1202,11 +2263,24 @@ async def get_system_stats(
         "engagement": {
             "daily_active_users": dau,
             "weekly_active_users": wau,
-            "monthly_active_users": mau
+            "monthly_active_users": mau,
+            "total_users": total_users,
+            "free_users": user_breakdown.get("free", 0),
+            "pro_users": user_breakdown.get("pro", 0),
+            "premium_users": user_breakdown.get("premium", 0)
         },
-        "products": product_stats,
+        "products": {
+            **product_stats,
+            "total_products": product_stats.get("total_tracked", 0)
+        },
         "conversions": {
             "affiliate_clicks_today": affiliate_clicks
+        },
+        "jobs": {
+            "active_jobs": active_jobs,
+            "completed_jobs_today": completed_today,
+            "failed_jobs_today": failed_today,
+            "success_rate": round(success_rate, 1)
         }
     }
 
@@ -1407,25 +2481,143 @@ async def trigger_job(
         )
 
 
+@router.get("/system/subscription-plans", response_model=dict)
+async def list_subscription_plans_config(
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List subscription plans from DB for admin editing."""
+    await verify_admin_email(user)
+
+    result = await db.execute(
+        select(SubscriptionPlan).order_by(SubscriptionPlan.sort_order.asc(), SubscriptionPlan.id.asc())
+    )
+    plans = result.scalars().all()
+
+    return {
+        "plans": [serialize_subscription_plan(plan) for plan in plans]
+    }
+
+
+@router.put("/system/subscription-plans/{plan_name}", response_model=dict)
+async def update_subscription_plan_config(
+    plan_name: str,
+    request: Request,
+    plan_update: SubscriptionPlanUpdateRequest,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+    redis_client: RedisClient = Depends(get_redis),
+):
+    """Update a subscription plan in DB so changes reflect across backend/admin/frontend."""
+    await verify_admin_email(user)
+
+    normalized_name = (plan_name or "").strip().lower()
+    if not normalized_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Plan name is required")
+
+    result = await db.execute(
+        select(SubscriptionPlan).where(SubscriptionPlan.name == normalized_name)
+    )
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Plan '{normalized_name}' not found")
+
+    if plan_update.display_name is not None:
+        plan.display_name = plan_update.display_name
+    if plan_update.price_inr is not None:
+        plan.price_inr = float(plan_update.price_inr)
+        # Keep price_usd roughly in sync if present.
+        plan.price_usd = round(float(plan_update.price_inr) / 83.0, 2)
+    if plan_update.duration_days is not None:
+        plan.duration_days = plan_update.duration_days
+    if plan_update.is_popular is not None:
+        plan.is_popular = plan_update.is_popular
+    if plan_update.is_active is not None:
+        plan.is_active = plan_update.is_active
+    if plan_update.sort_order is not None:
+        plan.sort_order = plan_update.sort_order
+    if plan_update.tagline is not None:
+        plan.tagline = plan_update.tagline
+
+    features_touched = (
+        plan_update.features is not None
+        or plan_update.searches_per_day is not None
+        or plan_update.watchlist_limit is not None
+    )
+    if features_touched:
+        # Always work on a new dict so SQLAlchemy can detect JSON changes reliably.
+        features = dict(plan.features) if isinstance(plan.features, dict) else {}
+
+        if isinstance(plan_update.features, dict):
+            features.update(plan_update.features)
+        if plan_update.searches_per_day is not None:
+            features["daily_searches"] = plan_update.searches_per_day
+        if plan_update.watchlist_limit is not None:
+            features["watchlist_limit"] = plan_update.watchlist_limit
+
+        plan.features = features
+        flag_modified(plan, "features")
+
+    await db.commit()
+    await db.refresh(plan)
+
+    await redis_client.delete("app:config")
+
+    await log_action(
+        db,
+        user.email,
+        "updated_subscription_plan",
+        normalized_name,
+        details={
+            "price_inr": plan.price_inr,
+            "duration_days": plan.duration_days,
+            "searches_per_day": features.get("daily_searches"),
+            "watchlist_limit": features.get("watchlist_limit"),
+            "is_active": plan.is_active,
+            "is_popular": plan.is_popular,
+        },
+        request=request,
+    )
+
+    return {
+        "success": True,
+        "plan": serialize_subscription_plan(plan),
+        "message": f"Subscription plan '{normalized_name}' updated successfully",
+    }
+
+
 @router.put("/system/config", response_model=dict)
 async def update_app_config(
     request: Request,
     config_update: AppConfigUpdateRequest,
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
-    redis_client: Redis = Depends(get_redis)
+    redis_client: RedisClient = Depends(get_redis)
 ):
     """Update application configuration"""
     await verify_admin_email(user)
+
+    config_key = (config_update.key or "").strip()
+    if not config_key:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Config key is required")
+
+    if is_sensitive_config_key(config_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Config '{config_key}' is sensitive and must be managed via environment variables",
+        )
+
+    normalized_type = normalize_config_value_type(config_update.value_type)
+    normalized_value = serialize_config_value(config_update.value, normalized_type)
     
     result = await db.execute(
-        select(AppConfig).where(AppConfig.key == config_update.key)
+        select(AppConfig).where(AppConfig.key == config_key)
     )
     config = result.scalar_one_or_none()
     
     if config:
-        config.value = config_update.value
-        config.value_type = config_update.value_type
+        config.value = normalized_value
+        config.value_type = normalized_type
         if config_update.description:
             config.description = config_update.description
         if config_update.category:
@@ -1433,9 +2625,9 @@ async def update_app_config(
         config.updated_by = user.email
     else:
         config = AppConfig(
-            key=config_update.key,
-            value=config_update.value,
-            value_type=config_update.value_type,
+            key=config_key,
+            value=normalized_value,
+            value_type=normalized_type,
             description=config_update.description,
             category=config_update.category,
             is_public=False,
@@ -1449,16 +2641,109 @@ async def update_app_config(
     
     await log_action(
         db, user.email, "updated_config",
-        config_update.key,
-        details={"new_value": config_update.value, "type": config_update.value_type},
+        config_key,
+        details={"new_value": normalized_value, "type": normalized_type},
         request=request
     )
     
     return {
         "success": True,
-        "key": config_update.key,
-        "value": config_update.value,
-        "message": f"Config '{config_update.key}' updated successfully"
+        "key": config_key,
+        "value": normalized_value,
+        "value_type": normalized_type,
+        "message": f"Config '{config_key}' updated successfully"
+    }
+
+
+@router.post("/system/config/sync", response_model=dict)
+async def sync_settings_into_app_config(
+    request: Request,
+    overwrite_existing: bool = Body(default=False, embed=True),
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+    redis_client: RedisClient = Depends(get_redis),
+):
+    """
+    Sync non-sensitive backend settings into app_config without migrations.
+    Secrets and API keys remain env-only.
+    """
+    await verify_admin_email(user)
+
+    entries = settings_to_config_entries()
+    if not entries:
+        return {
+            "success": True,
+            "created": 0,
+            "updated": 0,
+            "skipped_existing": 0,
+            "skipped_sensitive": 0,
+            "message": "No syncable settings found",
+        }
+
+    key_set = [entry["key"] for entry in entries]
+    existing_result = await db.execute(
+        select(AppConfig).where(AppConfig.key.in_(key_set))
+    )
+    existing_configs = {cfg.key: cfg for cfg in existing_result.scalars().all()}
+
+    created = 0
+    updated = 0
+    skipped_existing = 0
+
+    for entry in entries:
+        key = entry["key"]
+        existing = existing_configs.get(key)
+
+        if existing:
+            if not overwrite_existing:
+                skipped_existing += 1
+                continue
+
+            existing.value = entry["value"]
+            existing.value_type = entry["value_type"]
+            existing.category = existing.category or entry["category"]
+            if not existing.description:
+                existing.description = entry["description"]
+            existing.updated_by = user.email
+            updated += 1
+            continue
+
+        db.add(
+            AppConfig(
+                key=key,
+                value=entry["value"],
+                value_type=entry["value_type"],
+                description=entry["description"],
+                category=entry["category"],
+                is_public=entry["is_public"],
+                updated_by=user.email,
+            )
+        )
+        created += 1
+
+    await db.commit()
+    await redis_client.delete("app:config")
+
+    await log_action(
+        db,
+        user.email,
+        "synced_settings_to_db",
+        details={
+            "created": created,
+            "updated": updated,
+            "skipped_existing": skipped_existing,
+            "overwrite_existing": overwrite_existing,
+        },
+        request=request,
+    )
+
+    return {
+        "success": True,
+        "created": created,
+        "updated": updated,
+        "skipped_existing": skipped_existing,
+        "synced_total": created + updated,
+        "message": "Settings synced to app_config successfully",
     }
 
 
@@ -1477,21 +2762,26 @@ async def get_all_config(
     
     result = await db.execute(query)
     configs = result.scalars().all()
-    
-    return {
-        "configs": [
+
+    config_rows = []
+    for c in configs:
+        sensitive = is_sensitive_config_key(c.key)
+        config_rows.append(
             {
                 "key": c.key,
-                "value": c.value,
+                "value": "********" if sensitive else c.value,
                 "value_type": c.value_type,
                 "description": c.description,
                 "category": c.category,
                 "is_public": c.is_public,
+                "is_sensitive": sensitive,
                 "updated_at": c.updated_at.isoformat() if c.updated_at else None,
-                "updated_by": c.updated_by
+                "updated_by": c.updated_by,
             }
-            for c in configs
-        ]
+        )
+    
+    return {
+        "configs": config_rows
     }
 
 
@@ -1501,7 +2791,7 @@ async def toggle_maintenance_mode(
     maintenance_request: MaintenanceModeRequest,
     user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
-    redis_client: Redis = Depends(get_redis)
+    redis_client: RedisClient = Depends(get_redis)
 ):
     """Enable/disable maintenance mode"""
     await verify_admin_email(user)

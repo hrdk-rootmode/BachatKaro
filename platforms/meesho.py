@@ -693,43 +693,67 @@ class MeeshoScraper(BasePlatformHandler):
         try:
             products_data = await page_obj.evaluate('''() => {
                 const products = [];
-                const links = document.querySelectorAll('a[href*="/p/"]');
-                const seen = new Set();
                 
-                links.forEach(link => {
-                    const href = link.getAttribute('href');
-                    if (seen.has(href) || !href) return;
-                    seen.add(href);
-                    
-                    const container = link.closest('div') || link;
-                    const text = container.innerText || '';
-                    
-                    // Find price
-                    const priceMatch = text.match(/₹\\s*([0-9,]+)/);
-                    if (!priceMatch) return;
-                    
-                    // Find title
-                    const lines = text.split('\\n').filter(l => l.trim().length > 5);
-                    let title = null;
-                    for (const line of lines) {
-                        if (!line.includes('₹') && line.length > 10 && line.length < 150) {
-                            title = line.trim();
-                            break;
-                        }
-                    }
-                    
-                    if (!title) return;
-                    
-                    const img = container.querySelector('img');
-                    const imgSrc = img ? (img.currentSrc || img.src || '') : '';
-                    
-                    products.push({
-                        title: title,
-                        price: priceMatch[1].replace(/,/g, ''),
-                        url: href,
-                        image: imgSrc || null
+                // Multiple selector patterns
+                const selectors = [
+                    'a[href*="/p/"]',
+                    'div[data-testid="productCard"]',
+                    'div[class*="ProductCard"]'
+                ];
+                
+                let containers = new Map();
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => {
+                        const href = el.href || el.querySelector('a')?.href;
+                        if (href && href.includes('/p/')) containers.set(href, el);
                     });
-                });
+                }
+                
+                for (const [href, container] of containers) {
+                    try {
+                        const text = (container.innerText || container.textContent || '').trim();
+                        if (!text) continue;
+                        
+                        // Try multiple price patterns
+                        let price = null;
+                        const patterns = [/₹\\s*([0-9,]+)/, /Rs\\.?\\s*([0-9,]+)/i];
+                        for (const p of patterns) {
+                            const m = text.match(p);
+                            if (m) {
+                                const val = parseInt(m[1].replace(/,/g, ''));
+                                if (val > 50 && val < 10000000) {
+                                    price = val;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!price) continue;
+                        
+                        // Extract title from longest line without price/numbers
+                        const lines = text.split('\\n')
+                            .map(l => l.trim())
+                            .filter(l => l.length > 8 && l.length < 200);
+                        
+                        let title = null;
+                        for (const line of lines) {
+                            if (!line.includes('₹') && !/\\d{2,}/.test(line) && !line.includes('Add')) {
+                                title = line;
+                                break;
+                            }
+                        }
+                        if (!title) continue;
+                        
+                        const img = container.querySelector('img');
+                        products.push({
+                            title: title,
+                            price: String(price),
+                            url: href,
+                            image: img ? (img.src || img.getAttribute('data-src')) : null
+                        });
+                    } catch (e) {
+                        console.log('Parse error:', e.message);
+                    }
+                }
                 
                 return products.slice(0, 20);
             }''')

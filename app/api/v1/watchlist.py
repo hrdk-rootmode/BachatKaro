@@ -22,29 +22,15 @@ from app.schemas import (
     UserPlan
 )
 from app.api.deps import get_current_user
+from app.services.plan_catalog import get_plan_catalog, get_plan_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 # =============================================================================
-# CONSTANTS
-# =============================================================================
-
-WATCHLIST_LIMITS = {
-    "free": 5,
-    "pro": 20,
-    "premium": 50
-}
-
-
-# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
-
-def get_watchlist_limit(plan: str) -> int:
-    """Get watchlist limit based on user plan"""
-    return WATCHLIST_LIMITS.get(plan, 5)
 
 
 async def get_product_with_best_listing(
@@ -143,7 +129,8 @@ async def get_watchlist(
             items.append(format_watchlist_item(item, product, listing))
     
     # Get limit based on plan
-    limit = get_watchlist_limit(user.plan)
+    plan_catalog = await get_plan_catalog(db)
+    limit = get_plan_limit(plan_catalog, str(user.plan).lower(), "watchlist_limit", 5)
     
     response = WatchlistResponse(
         items=items,
@@ -185,7 +172,8 @@ async def add_to_watchlist(
         .where(UserWatchlist.user_id == user.id)
     )
     current_count = len(result.scalars().all())
-    limit = get_watchlist_limit(user.plan)
+    plan_catalog = await get_plan_catalog(db)
+    limit = get_plan_limit(plan_catalog, str(user.plan).lower(), "watchlist_limit", 5)
     
     if current_count >= limit:
         raise HTTPException(

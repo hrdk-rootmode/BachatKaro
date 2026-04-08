@@ -236,10 +236,11 @@ class RateLimiter:
             requests_per_minute=10,
             requests_per_hour=150,
             requests_per_day=1500,
-            min_delay_seconds=4.0,
-            max_delay_seconds=10.0,
+            min_delay_seconds=5.0,
+            max_delay_seconds=12.0,
             failure_threshold=2,
-            burst_size=2
+            burst_size=max(8, int(getattr(settings, "DAILY_SCRAPE_AMAZON_BURST_SIZE", 8))),
+            burst_cooldown=max(75, int(getattr(settings, "DAILY_SCRAPE_AMAZON_BURST_COOLDOWN_SECONDS", 90)))
         ),
         "flipkart": RateLimitConfig(
             requests_per_minute=12,

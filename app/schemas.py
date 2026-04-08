@@ -129,9 +129,9 @@ class SearchRequest(BaseModel):
     @classmethod
     def sanitize_query(cls, v: str) -> str:
         """✅ NEW: Sanitize query to prevent injection attacks"""
-        # Remove potential SQL injection patterns
+        # Block explicit injection signatures while allowing normal shopping terms.
         dangerous_patterns = [
-            r'(\bDROP\b|\bDELETE\b|\bUPDATE\b|\bINSERT\b)',  # SQL keywords
+            r'\b(?:DROP\s+TABLE|DELETE\s+FROM|UPDATE\s+\w+\s+SET|INSERT\s+INTO)\b',
             r'(<script|javascript:|onerror=)',  # XSS patterns
             r'(union\s+select|;\s*--)',  # SQL injection
         ]
@@ -721,7 +721,7 @@ class BanUserRequest(BaseModel):
 
 class BulkUserBonus(BaseModel):
     """Grant bonuses to multiple users"""
-    target: str = Field(..., pattern="^(all_free_users|all_pro_users|all_premium_users|specific_users)$")
+    target: str = Field(..., pattern="^(all_[a-z0-9_]+_users|specific_users)$")
     user_ids: Optional[List[str]] = None
     reason: str = Field(..., max_length=200)
     bonuses: Dict[str, int] = {
@@ -1029,6 +1029,21 @@ class AppConfigUpdateRequest(BaseModel):
     value_type: str = Field(..., pattern="^(string|number|boolean|json)$")
     description: Optional[str] = Field(None, max_length=500)  # ✅ Added max
     category: Optional[str] = Field(None, max_length=50)  # ✅ Added max
+
+
+class SubscriptionPlanUpdateRequest(BaseModel):
+    """Admin request to update subscription plan configuration in DB."""
+
+    display_name: Optional[str] = Field(None, max_length=50)
+    price_inr: Optional[float] = Field(None, ge=0)
+    duration_days: Optional[int] = Field(None, ge=1, le=36500)
+    searches_per_day: Optional[int] = None
+    watchlist_limit: Optional[int] = None
+    is_popular: Optional[bool] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+    tagline: Optional[str] = Field(None, max_length=100)
+    features: Optional[Dict[str, Any]] = None
 
 
 class MaintenanceModeRequest(BaseModel):

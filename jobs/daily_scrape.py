@@ -55,10 +55,18 @@ logger = logging.getLogger(__name__)
 
 MAX_PRODUCTS_PER_RUN = max(1, int(getattr(settings, "DAILY_SCRAPE_MAX_PRODUCTS_PER_RUN", 500)))
 SCRAPE_INTERVAL_HOURS = 6  # Scrape products not updated in 24h
-DELAY_BETWEEN_PRODUCTS = max(0, int(getattr(settings, "DAILY_SCRAPE_DELAY_SECONDS", 2)))
+# Slightly slower default spacing helps continuous runs avoid burst warnings.
+DELAY_BETWEEN_PRODUCTS = max(0, int(getattr(settings, "DAILY_SCRAPE_DELAY_SECONDS", 4)))
 MAX_ERRORS_BEFORE_SKIP = max(3, int(getattr(settings, "DAILY_SCRAPE_MAX_ERRORS_BEFORE_SKIP", 8)))
 BATCH_SIZE = 60  # Commit after each batch
 RATE_LIMIT_COOLDOWN_SECONDS = max(30, int(getattr(settings, "DAILY_SCRAPE_RATE_LIMIT_COOLDOWN_SECONDS", 120)))
+
+# Price spike guard: reject newly scraped price if it deviates by more than
+# this factor from the previous known price.  Set to 0 to disable.
+PRICE_SPIKE_MAX_RATIO = float(getattr(settings, "DAILY_SCRAPE_PRICE_SPIKE_MAX_RATIO", 5.0))
+
+# Per-product scrape timeout so a single hung page cannot stall the loop.
+PER_PRODUCT_SCRAPE_TIMEOUT_SECONDS = int(getattr(settings, "DAILY_SCRAPE_PER_PRODUCT_TIMEOUT", 60))
 
 DEFAULT_INTERVAL_MINUTES = max(5, int(getattr(settings, "DAILY_SCRAPE_DEFAULT_INTERVAL_MINUTES", 720)))
 WATCHLIST_INTERVAL_MINUTES = max(5, int(getattr(settings, "DAILY_SCRAPE_WATCHLIST_INTERVAL_MINUTES", 30)))
@@ -227,6 +235,9 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
         "products_failed": 0,
         "price_changes": 0,
         "history_records": 0,
+        "total_listings_considered": 0,
+        "spike_rejections": 0,
+        "rate_limit_incidents": 0,
         "platforms": {},
         "errors": [],
         "duration_seconds": 0
@@ -250,6 +261,9 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
                     max_products=max_products,
                 )
                 stats["products_found"] = len(listings)
+                
+                total_query = select(func.count()).select_from(ProductListing).join(Platform, ProductListing.platform_id == Platform.id).where(Platform.is_active == True)
+                stats["total_listings_considered"] = await db.scalar(total_query) or 0
 
                 if not listings:
                     logger.info("✅ No products need scraping")
@@ -280,6 +294,8 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
                     stats["products_failed"] += platform_stats["failed"]
                     stats["price_changes"] += platform_stats["price_changes"]
                     stats["history_records"] += platform_stats.get("history_records", 0)
+                    stats["spike_rejections"] += platform_stats.get("spike_rejections", 0)
+                    stats["rate_limit_incidents"] += platform_stats.get("rate_limits", 0)
 
                     if platform_stats.get("errors"):
                         stats["errors"].extend(platform_stats["errors"][:5])
@@ -446,8 +462,10 @@ async def _scrape_platform(
         "history_records": 0,
         "marked_out_of_stock": 0,
         "skipped_low_confidence": 0,
-        "skipped_products": 0,  # NEW: Track skipped products
+        "skipped_products": 0,
         "price_changes": 0,
+        "spike_rejections": 0,  # Fix S1: count price-spike guard triggers
+        "rate_limits": 0,
         "errors": []
     }
     
@@ -487,7 +505,8 @@ async def _scrape_platform(
         try:
             # Scrape product price
             previous_in_stock = listing.in_stock
-            new_price, scraped_in_stock = await _scrape_product_price(db, platform_name, listing)
+            scrape_signal = {}
+            new_price, scraped_in_stock = await _scrape_product_price(db, platform_name, listing, signal=scrape_signal)
             
             if scraped_in_stock is not None:
                 listing.in_stock = scraped_in_stock
@@ -568,8 +587,13 @@ async def _scrape_platform(
                 # No price extracted (soft failure)
                 stats["failed"] += 1
                 stats["skipped_products"] += 1
+                # Fix S1: track spike guard triggers via local signal dict
+                if scrape_signal.get("spike_rejected"):
+                    stats["spike_rejections"] += 1
+                    listing.last_error = "Price spike rejected"
+                else:
+                    listing.last_error = "No price extracted"
                 listing.scrape_error_count = (listing.scrape_error_count or 0) + 1
-                listing.last_error = "No price extracted"
                 listing.next_scrape_at = _compute_next_scrape_at(
                     platform_name,
                     is_watchlisted=is_watchlisted,
@@ -595,6 +619,7 @@ async def _scrape_platform(
             listing.last_error = str(e)[:500]
             
             if is_rate_limited:
+                stats["rate_limits"] += 1
                 # ✅ NEW: Track rate limits separately
                 consecutive_rate_limits += 1
                 # Don't increment general errors for rate limits
@@ -700,7 +725,8 @@ async def _scrape_platform(
         f"   ✅ {platform_name}: Scraped={stats['scraped']}, "
         f"Updated={stats['updated']}, Failed={stats['failed']}, "
         f"History={stats['history_records']}, "
-        f"Skipped={stats['skipped_products']}, RateLimits={consecutive_rate_limits}"
+        f"Skipped={stats['skipped_products']}, RateLimits={consecutive_rate_limits}, "
+        f"SpikeRejections={stats['spike_rejections']}"
     )
     
     return stats
@@ -708,7 +734,8 @@ async def _scrape_platform(
 async def _scrape_product_price(
     db: AsyncSession,
     platform_name: str,
-    listing: ProductListing
+    listing: ProductListing,
+    signal: Optional[Dict] = None
 ) -> tuple[Optional[float], Optional[bool]]:
     """
     Scrape current price for a product
@@ -737,7 +764,11 @@ async def _scrape_product_price(
         if not handler:
             return None, None
         
-        product_data = await handler.get_product(listing.product_url)
+        # Fix S3: wrap in timeout so a single hung page cannot stall the loop
+        product_data = await asyncio.wait_for(
+            handler.get_product(listing.product_url),
+            timeout=PER_PRODUCT_SCRAPE_TIMEOUT_SECONDS,
+        )
 
         if not product_data:
             state = {}
@@ -760,7 +791,24 @@ async def _scrape_product_price(
             return None, False
         
         if product_data and product_data.current_price:
-            return float(product_data.current_price), getattr(product_data, "in_stock", True)
+            new_price = float(product_data.current_price)
+
+            # Fix S1: price spike guard — reject if new price deviates wildly
+            # from the previous known price.  First-ever scrape (None) is exempt.
+            if PRICE_SPIKE_MAX_RATIO > 0 and listing.current_price is not None:
+                old_price = float(listing.current_price)
+                if old_price > 0:
+                    ratio = new_price / old_price
+                    if ratio > PRICE_SPIKE_MAX_RATIO or ratio < (1.0 / PRICE_SPIKE_MAX_RATIO):
+                        if signal is not None:
+                            signal["spike_rejected"] = True
+                        logger.warning(
+                            f"🚫 Price spike rejected for {platform_name}/{listing.external_id}: "
+                            f"₹{old_price:.0f} → ₹{new_price:.0f} (ratio={ratio:.2f})"
+                        )
+                        return None, None  # treat as extraction failure
+
+            return new_price, getattr(product_data, "in_stock", True)
         
         return None, getattr(product_data, "in_stock", None)
         
@@ -803,7 +851,8 @@ async def _record_price_history(
         db.add(history_entry)
         return True
     except Exception as e:
-        logger.debug(f"Failed to record price history: {e}")
+        # Fix S5: upgraded from debug to warning so price-history gaps are visible
+        logger.warning(f"Failed to record price history for listing {listing.id}: {e}")
         return False
 
 
@@ -895,11 +944,14 @@ if __name__ == "__main__":
                     result = await run_daily_scrape(force_all=args.force_all, max_products=max_products)
 
                     print("\n📊 Cycle Results:")
-                    print(f"   Products Found: {result.get('products_found', 0)}")
+                    print(f"   Total Considered: {result.get('total_listings_considered', 0)}")
+                    print(f"   Due Listings: {result.get('products_found', 0)}")
                     print(f"   Products Scraped: {result.get('products_scraped', 0)}")
                     print(f"   Products Updated: {result.get('products_updated', 0)}")
                     print(f"   Price Changes: {result.get('price_changes', 0)}")
+                    print(f"   Spike Rejections: {result.get('spike_rejections', 0)}")
                     print(f"   History Records: {result.get('history_records', 0)}")
+                    print(f"   Rate Limit Incidents: {result.get('rate_limit_incidents', 0)}")
                     print(f"   Failed: {result.get('products_failed', 0)}")
                     print(f"   Duration: {result.get('duration_seconds', 0)}s")
 
@@ -921,11 +973,14 @@ if __name__ == "__main__":
             result = await run_daily_scrape(force_all=args.force_all, max_products=max_products)
             
             print("\n📊 Results:")
-            print(f"   Products Found: {result.get('products_found', 0)}")
+            print(f"   Total Considered: {result.get('total_listings_considered', 0)}")
+            print(f"   Due Listings: {result.get('products_found', 0)}")
             print(f"   Products Scraped: {result.get('products_scraped', 0)}")
             print(f"   Products Updated: {result.get('products_updated', 0)}")
             print(f"   Price Changes: {result.get('price_changes', 0)}")
+            print(f"   Spike Rejections: {result.get('spike_rejections', 0)}")
             print(f"   History Records: {result.get('history_records', 0)}")
+            print(f"   Rate Limit Incidents: {result.get('rate_limit_incidents', 0)}")
             print(f"   Failed: {result.get('products_failed', 0)}")
             print(f"   Duration: {result.get('duration_seconds', 0)}s")
             

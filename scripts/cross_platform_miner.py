@@ -304,6 +304,7 @@ class MiningStats:
     stored: int = 0
     errors: int = 0
     api_calls_saved: int = 0
+    sanity_blocks_without_ai: int = 0  # Fix S2: count spec-sanity rejections when AI was skipped
     platforms_scraped: Dict[str, int] = field(default_factory=dict)
     platforms_matched: Dict[str, int] = field(default_factory=dict)
     skipped_products: List[Dict[str, str]] = field(default_factory=list)
@@ -328,6 +329,7 @@ class MiningStats:
         print(f"  Successfully Stored:   {self.stored} 💾")
         print(f"  Errors:                {self.errors}")
         print(f"  API Calls Saved:       {self.api_calls_saved} 💰")
+        print(f"  Sanity Blocks (no AI): {self.sanity_blocks_without_ai} 🛡️")
         
         if self.platforms_scraped:
             print(f"\n  📡 Platform Stats:")
@@ -2667,6 +2669,24 @@ async def scrape_platform(
                 stats.ai_verified += 1
                 final_score = ai_score
                 ai_verified = True
+            else:
+                # Fix S2: Even when AI is skipped, run spec-level sanity checks
+                # (product-line, model, screen-size) to catch near-miss variants.
+                # Synthetic ai_result passes AI-specific checks automatically.
+                synthetic_ai_result = {
+                    "is_exact_match": True,
+                    "match_score": score,
+                    "confidence": "high",
+                    "reason": "AI skipped (high fuzzy score)",
+                }
+                sanity_passed, sanity_reason = post_ai_sanity_check(
+                    synthetic_ai_result, source_specs, target_specs
+                )
+                if not sanity_passed:
+                    stats.sanity_blocks_without_ai += 1
+                    if verbose:
+                        print(f"       🛡️ Spec sanity BLOCKED (no AI): {sanity_reason}")
+                    continue
             
             # Save match if score is good enough
             if final_score >= min_score:
