@@ -25,6 +25,8 @@ token = auth_state.get("token", "")
 st.title("⚙️ Settings")
 st.caption("Application settings and configuration")
 
+st.info("Sensitive keys (API keys, tokens, secrets) are env-only and will not be stored/exposed via DB config.")
+
 # Sidebar info
 st.sidebar.success(f"Logged in as: {auth_state.get('email', '')}")
 
@@ -38,6 +40,21 @@ except ApiError as e:
 
 # Settings sections
 tab1, tab2, tab3 = st.tabs(["General", "System", "Maintenance"])
+
+with st.expander("Sync Backend Settings Into DB (Non-sensitive only)"):
+    overwrite_existing = st.checkbox("Overwrite existing DB values", value=False)
+    if st.button("Sync Now", use_container_width=True):
+        try:
+            sync_result = api.sync_config_from_settings(token, overwrite_existing=overwrite_existing)
+            st.success(
+                "Sync completed | "
+                f"Created: {sync_result.get('created', 0)}, "
+                f"Updated: {sync_result.get('updated', 0)}, "
+                f"Skipped existing: {sync_result.get('skipped_existing', 0)}"
+            )
+            st.rerun()
+        except ApiError as e:
+            st.error(f"Failed to sync settings: {e}")
 
 with tab1:
     st.subheader("General Settings")
@@ -67,9 +84,9 @@ with tab2:
         
         if st.form_submit_button("Save System Settings"):
             try:
-                api.update_config(token, "max_retries", str(max_retries), "integer", "Max API retries", "system")
-                api.update_config(token, "timeout_seconds", str(timeout_seconds), "integer", "Request timeout", "system")
-                api.update_config(token, "rate_limit_per_minute", str(rate_limit_per_minute), "integer", "Rate limit", "system")
+                api.update_config(token, "max_retries", str(max_retries), "number", "Max API retries", "system")
+                api.update_config(token, "timeout_seconds", str(timeout_seconds), "number", "Request timeout", "system")
+                api.update_config(token, "rate_limit_per_minute", str(rate_limit_per_minute), "number", "Rate limit", "system")
                 st.success("System settings saved!")
                 st.rerun()
             except ApiError as e:
@@ -108,6 +125,10 @@ if configs:
         key = cfg.get("key", "")
         value = cfg.get("value", "")
         category = cfg.get("category", "other")
+        is_sensitive = cfg.get("is_sensitive", False)
+
+        if is_sensitive:
+            value = "********"
         
         if category not in config_dict:
             config_dict[category] = []

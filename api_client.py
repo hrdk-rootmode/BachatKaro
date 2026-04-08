@@ -119,6 +119,24 @@ class AdminApiClient:
     def revenue_overview(self, token: str) -> Any:
         return self._data(self._request("GET", "/admin/revenue/overview", token=token))
 
+    def revenue_transactions(
+        self,
+        token: str,
+        page: int = 1,
+        limit: int = 100,
+        tx_type: str | None = "payment",
+        status: str | None = "success",
+    ) -> Any:
+        params: dict[str, Any] = {
+            "page": page,
+            "limit": limit,
+        }
+        if tx_type:
+            params["type"] = tx_type
+        if status:
+            params["status"] = status
+        return self._data(self._request("GET", "/admin/revenue/transactions", token=token, params=params))
+
     def admin_health(self, token: str) -> Any:
         return self._data(self._request("GET", "/admin/system/health", token=token))
 
@@ -210,6 +228,23 @@ class AdminApiClient:
         payload = {"enabled": enabled, "message": message}
         return self._data(self._request("POST", "/admin/system/maintenance", token=token, json=payload))
 
+    def sync_config_from_settings(self, token: str, overwrite_existing: bool = False) -> Any:
+        payload = {"overwrite_existing": overwrite_existing}
+        return self._data(self._request("POST", "/admin/system/config/sync", token=token, json=payload))
+
+    def get_subscription_plans_config(self, token: str) -> Any:
+        return self._data(self._request("GET", "/admin/system/subscription-plans", token=token))
+
+    def update_subscription_plan(self, token: str, plan_name: str, update_data: dict) -> Any:
+        return self._data(
+            self._request(
+                "PUT",
+                f"/admin/system/subscription-plans/{plan_name}",
+                token=token,
+                json=update_data,
+            )
+        )
+
     # Jobs
     def trigger_job(self, token: str, job_id: str) -> Any:
         payload = {"job_id": job_id}
@@ -222,12 +257,14 @@ class AdminApiClient:
         page: int = 1,
         limit: int = 50,
         search: str | None = None,
+        product_id: str | None = None,
         category: str | None = None,
         brand: str | None = None,
         platform: str | None = None,
     ) -> Any:
         params: dict[str, Any] = {"page": page, "limit": limit}
         if search: params["search"] = search
+        if product_id: params["product_id"] = product_id
         if category: params["category"] = category
         if brand: params["brand"] = brand
         if platform: params["platform"] = platform
@@ -299,3 +336,34 @@ class AdminApiClient:
         listing_id: str
     ) -> Any:
         return self._data(self._request("GET", f"/admin/listings/{listing_id}/performance", token=token))
+
+    # Job Management Endpoints
+    def get_current_jobs(self, token: str) -> Any:
+        return self._data(self._request("GET", "/admin/jobs/current", token=token))
+
+    def get_job_logs(self, token: str, job_id: str, lines: int = 100) -> Any:
+        params = {"lines": lines}
+        return self._data(self._request("GET", f"/admin/jobs/{job_id}/logs", token=token, params=params))
+
+    def create_schedule(self, token: str, schedule_data: dict) -> Any:
+        return self._data(self._request("POST", "/admin/jobs/schedule", token=token, json=schedule_data))
+
+    def get_schedules(self, token: str) -> Any:
+        return self._data(self._request("GET", "/admin/jobs/schedules", token=token))
+
+    def update_schedule(self, token: str, schedule_id: str, schedule_data: dict) -> Any:
+        return self._data(self._request("PUT", f"/admin/jobs/schedules/{schedule_id}", token=token, json=schedule_data))
+
+    def delete_schedule(self, token: str, schedule_id: str) -> Any:
+        return self._data(self._request("DELETE", f"/admin/jobs/schedules/{schedule_id}", token=token))
+
+    def get_new_products(self, token: str, hours: int = 24) -> Any:
+        params = {"hours": hours}
+        return self._data(self._request("GET", "/admin/products/new", token=token, params=params))
+
+    def get_recent_changes(self, token: str, change_type: str = "all", hours: int = 24) -> Any:
+        params = {"change_type": change_type, "hours": hours}
+        return self._data(self._request("GET", "/admin/products/changes", token=token, params=params))
+
+    def get_database_stats(self, token: str) -> Any:
+        return self._data(self._request("GET", "/admin/system/database-stats", token=token))

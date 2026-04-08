@@ -3,8 +3,64 @@ from auth import get_auth_state, enforce_session_timeout
 from config import load_settings
 from api_client import AdminApiClient, ApiError
 import pandas as pd
-import numpy as np
-import datetime
+
+
+def _normalize_logs_dataframe(logs_list: list[dict]) -> pd.DataFrame:
+    """Convert raw system logs payload to a numeric daily dataframe."""
+    if not logs_list:
+        empty_df = pd.DataFrame(columns=["DAU", "Revenue", "Searches", "Scraped"])
+        empty_df.index.name = "Date"
+        return empty_df
+
+    rows = []
+    for log_item in logs_list:
+        analytics = log_item.get("analytics", {}) if isinstance(log_item, dict) else {}
+        scraping = log_item.get("scraping_summary", {}) if isinstance(log_item, dict) else {}
+
+        rows.append(
+            {
+                "Date": pd.to_datetime(log_item.get("date"), errors="coerce"),
+                "DAU": pd.to_numeric(analytics.get("active_users", 0), errors="coerce"),
+                "Revenue": pd.to_numeric(analytics.get("revenue_inr", 0), errors="coerce"),
+                "Searches": pd.to_numeric(analytics.get("searches_performed", 0), errors="coerce"),
+                "Scraped": pd.to_numeric(scraping.get("products_scraped", 0), errors="coerce"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.dropna(subset=["Date"]).copy()
+    if df.empty:
+        empty_df = pd.DataFrame(columns=["DAU", "Revenue", "Searches", "Scraped"])
+        empty_df.index.name = "Date"
+        return empty_df
+
+    for col in ["DAU", "Revenue", "Searches", "Scraped"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    parsed_dates = pd.to_datetime(df["Date"], errors="coerce", utc=True)
+    df = df.loc[~parsed_dates.isna()].copy()
+    df["Date"] = parsed_dates.loc[~parsed_dates.isna()].dt.tz_convert(None).dt.normalize()
+    df = df.groupby("Date", as_index=True)[["DAU", "Revenue", "Searches", "Scraped"]].sum().sort_index()
+    df.index.name = "Date"
+    return df
+
+
+def _build_recent_trend(df_logs: pd.DataFrame, searches_today: int, revenue_today: float) -> pd.DataFrame:
+    """Always return a 7-day trend frame for Searches and Revenue."""
+    today = pd.Timestamp.now().normalize()
+    last_7_days = pd.date_range(end=today, periods=7, freq="D")
+    trend_df = pd.DataFrame(index=last_7_days, data={"Searches": 0.0, "Revenue": 0.0})
+
+    if not df_logs.empty:
+        available = df_logs.reindex(columns=["Searches", "Revenue"]).copy()
+        available = available.fillna(0)
+        overlap = available.index.intersection(trend_df.index)
+        if len(overlap) > 0:
+            trend_df.loc[overlap, ["Searches", "Revenue"]] = available.loc[overlap, ["Searches", "Revenue"]]
+
+    trend_df.loc[today, "Searches"] = max(float(trend_df.loc[today, "Searches"]), float(searches_today or 0))
+    trend_df.loc[today, "Revenue"] = max(float(trend_df.loc[today, "Revenue"]), float(revenue_today or 0))
+    return trend_df
 
 st.set_page_config(
     page_title="Dashboard",
@@ -66,6 +122,14 @@ try:
 except ApiError as e:
     logs_error = str(e)
 
+revenue_tx_payload = {}
+revenue_tx_error = None
+try:
+    # Live transaction feed for reactive revenue charts.
+    revenue_tx_payload = api.revenue_transactions(token=token, page=1, limit=100, tx_type="payment", status="success")
+except ApiError as e:
+    revenue_tx_error = str(e)
+
 if stats_error:
     st.warning(f"Stats endpoint issue: {stats_error}")
 if revenue_error:
@@ -74,22 +138,43 @@ if health_error:
     st.warning(f"Health endpoint issue: {health_error}")
 if logs_error:
     st.warning(f"Logs endpoint issue: {logs_error}")
+if revenue_tx_error:
+    st.warning(f"Revenue transactions endpoint issue: {revenue_tx_error}")
 
 logs_list = logs_data.get("logs", [])
-if logs_list:
-    df_logs = pd.DataFrame([
+df_logs = _normalize_logs_dataframe(logs_list)
+
+revenue_tx_rows = []
+tx_items = revenue_tx_payload.get("transactions", []) if isinstance(revenue_tx_payload, dict) else []
+for tx in tx_items:
+    tx_created = pd.to_datetime(tx.get("created_at"), errors="coerce", utc=True)
+    tx_amount = pd.to_numeric(tx.get("amount", 0), errors="coerce")
+
+    if pd.isna(tx_created) or pd.isna(tx_amount):
+        continue
+
+    revenue_tx_rows.append(
         {
-            "Date": pd.to_datetime(L["date"]),
-            "DAU": L.get("analytics", {}).get("active_users", 0),
-            "Revenue": L.get("analytics", {}).get("revenue_inr", 0),
-            "Searches": L.get("analytics", {}).get("searches_performed", 0),
-            "Scraped": L.get("scraping_summary", {}).get("products_scraped", 0)
+            "created_at": tx_created.tz_convert(None),
+            "amount": float(tx_amount),
         }
-        for L in logs_list
-    ]).set_index("Date").sort_index()
+    )
+
+if revenue_tx_rows:
+    df_revenue_tx = pd.DataFrame(revenue_tx_rows).sort_values("created_at")
+    df_revenue_tx = df_revenue_tx.set_index("created_at")
+    df_revenue_tx.index.name = "Date"
+    df_revenue_tx["cumulative_revenue"] = df_revenue_tx["amount"].cumsum()
+
+    revenue_daily_series = df_revenue_tx["amount"].resample("D").sum()
+    revenue_weekly_series = df_revenue_tx["amount"].resample("W").sum()
+    revenue_monthly_series = df_revenue_tx["amount"].resample("ME").sum()
 else:
-    df_logs = pd.DataFrame(columns=["DAU", "Revenue", "Searches", "Scraped"])
-    df_logs.index.name = "Date"
+    df_revenue_tx = pd.DataFrame(columns=["amount", "cumulative_revenue"])
+    df_revenue_tx.index.name = "Date"
+    revenue_daily_series = pd.Series(dtype=float)
+    revenue_weekly_series = pd.Series(dtype=float)
+    revenue_monthly_series = pd.Series(dtype=float)
 
 traffic = stats.get("traffic", {})
 engagement = stats.get("engagement", {})
@@ -114,6 +199,8 @@ conversion = float(revenue.get("conversion_rate", 0) or 0)
 mrr = float(revenue.get("monthly_recurring_revenue", 0) or 0)
 today_total = float(revenue.get("today", {}).get("total", 0) or 0)
 affiliate_clicks = int(stats.get("conversions", {}).get("affiliate_clicks_today", 0) or 0)
+
+recent_trend_df = _build_recent_trend(df_logs, searches_today=searches, revenue_today=today_total)
 
 if "dashboard_focus" not in st.session_state:
     st.session_state["dashboard_focus"] = None
@@ -182,10 +269,12 @@ if focus == "today":
         st.write(f"Cache hit rate: {cache_hit_rate:.1f}%")
 
         st.markdown("#### Recent 7 Days Trend")
-        if not df_logs.empty and len(df_logs) >= 1:
-            st.line_chart(df_logs.tail(7)[["Searches", "Revenue"]])
+        if not recent_trend_df.empty:
+            st.line_chart(recent_trend_df[["Searches", "Revenue"]])
+            if recent_trend_df[["Searches", "Revenue"]].sum().sum() <= 0:
+                st.caption("No activity in last 7 days yet. Showing baseline trend.")
         else:
-            st.info("Not enough historical log data for a trend chart.")
+            st.info("Trend data is not available yet.")
 
 elif focus == "users":
     st.markdown("### Users Analysis")
@@ -280,14 +369,33 @@ elif focus == "revenue":
         st.markdown("#### Revenue Trends")
         tabs = st.tabs(["Daily", "Weekly", "Monthly"])
         with tabs[0]:
-            if not df_logs.empty:
+            if not revenue_daily_series.empty:
+                st.caption("Live payment revenue from successful transactions")
+                st.bar_chart(revenue_daily_series)
+                if not df_revenue_tx.empty:
+                    st.caption("Intra-day payment activity")
+                    st.line_chart(df_revenue_tx[["amount", "cumulative_revenue"]])
+            elif not df_logs.empty:
+                st.caption("Fallback to daily system logs")
                 st.bar_chart(df_logs["Revenue"])
+            else:
+                st.info("No revenue trend data available yet.")
         with tabs[1]:
-            if not df_logs.empty:
+            if not revenue_weekly_series.empty:
+                st.line_chart(revenue_weekly_series)
+            elif not df_logs.empty:
+                st.caption("Fallback to daily system logs")
                 st.line_chart(df_logs["Revenue"].resample('W').sum())
+            else:
+                st.info("No weekly revenue data available yet.")
         with tabs[2]:
-            if not df_logs.empty:
+            if not revenue_monthly_series.empty:
+                st.line_chart(revenue_monthly_series)
+            elif not df_logs.empty:
+                st.caption("Fallback to daily system logs")
                 st.line_chart(df_logs["Revenue"].resample('ME').sum())
+            else:
+                st.info("No monthly revenue data available yet.")
 
         this_month = revenue.get("this_month", {})
         rev_df = pd.DataFrame([
@@ -340,8 +448,40 @@ st.subheader("💳 Recent Transactions")
 
 transactions = revenue.get("recent_transactions", [])
 if transactions:
-    df = pd.DataFrame(transactions)
-    st.dataframe(df, use_container_width=True)
+    tx_df = pd.DataFrame(transactions)
+    tx_df["amount"] = pd.to_numeric(tx_df.get("amount", 0), errors="coerce").fillna(0)
+    tx_df["created_at"] = pd.to_datetime(tx_df.get("created_at"), errors="coerce")
+
+    total_tx_amount = float(tx_df["amount"].sum()) if not tx_df.empty else 0.0
+    avg_tx_amount = float(tx_df["amount"].mean()) if not tx_df.empty else 0.0
+    latest_tx_time = tx_df["created_at"].max() if "created_at" in tx_df else None
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Transactions", f"{len(tx_df):,}")
+    with c2:
+        st.metric("Total Amount", f"₹{total_tx_amount:,.2f}")
+    with c3:
+        st.metric("Average Amount", f"₹{avg_tx_amount:,.2f}")
+
+    display_df = tx_df.copy()
+    display_df["created_at"] = display_df["created_at"].dt.strftime("%Y-%m-%d %H:%M")
+    display_df["status"] = display_df.get("status", "").astype(str).str.title()
+    display_df["type"] = display_df.get("type", "").astype(str).str.replace("_", " ").str.title()
+    display_df = display_df.rename(
+        columns={
+            "id": "Transaction ID",
+            "type": "Type",
+            "amount": "Amount (INR)",
+            "status": "Status",
+            "created_at": "Created At",
+        }
+    )
+
+    if latest_tx_time is not None and not pd.isna(latest_tx_time):
+        st.caption(f"Latest transaction: {latest_tx_time.strftime('%Y-%m-%d %H:%M')}")
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 else:
     st.info("No transactions found")
 

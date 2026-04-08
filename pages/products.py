@@ -5,6 +5,8 @@ from config import load_settings
 from api_client import AdminApiClient, ApiError
 from datetime import datetime, timedelta
 import random
+import re
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 st.set_page_config(
     page_title="Product Management",
@@ -42,13 +44,89 @@ if "view_mode" not in st.session_state:
 if "sort_order" not in st.session_state:
     st.session_state["sort_order"] = "default"
 
+PM_FILTER_PERSIST_KEY = "pm_filter_state"
+DISCOUNT_FILTER_OPTIONS = ["All", "Has Discount", "No Discount", "Low to High", "High to Low"]
+LEGACY_DISCOUNT_FILTER_MAP = {
+    "lowest": "Low to High",
+    "highest": "High to Low",
+    "higest": "High to Low",
+}
+PM_FILTER_DEFAULTS = {
+    "pm_search": "",
+    "pm_product_id": "",
+    "pm_category": "",
+    "pm_brand": "",
+    "pm_platform": "All",
+    "pm_page": 1,
+    "pm_sort": "Newest First",
+    "pm_stock": "All",
+    "pm_discount": "All",
+    "pm_min_price": 0.0,
+    "pm_max_price": 200000.0,
+    "pm_expand_all": True,
+    "pm_collapsible": False,
+    "pm_table_preview": False,
+}
+
+
+def _ensure_persisted_filter_state() -> None:
+    persisted = st.session_state.get(PM_FILTER_PERSIST_KEY)
+    if not isinstance(persisted, dict):
+        st.session_state[PM_FILTER_PERSIST_KEY] = PM_FILTER_DEFAULTS.copy()
+        return
+
+    for state_key, default_value in PM_FILTER_DEFAULTS.items():
+        persisted.setdefault(state_key, default_value)
+
+
+def _normalize_discount_filter_state() -> None:
+    _ensure_persisted_filter_state()
+    persisted = st.session_state[PM_FILTER_PERSIST_KEY]
+
+    persisted_discount = str(persisted.get("pm_discount", "All"))
+    persisted_discount = LEGACY_DISCOUNT_FILTER_MAP.get(persisted_discount, persisted_discount)
+    if persisted_discount not in DISCOUNT_FILTER_OPTIONS:
+        persisted_discount = "All"
+    persisted["pm_discount"] = persisted_discount
+
+    widget_discount = str(st.session_state.get("pm_discount", persisted_discount))
+    widget_discount = LEGACY_DISCOUNT_FILTER_MAP.get(widget_discount, widget_discount)
+    if widget_discount not in DISCOUNT_FILTER_OPTIONS:
+        widget_discount = persisted_discount
+    st.session_state["pm_discount"] = widget_discount
+
+
+def _hydrate_product_filter_widgets() -> None:
+    _ensure_persisted_filter_state()
+    persisted = st.session_state[PM_FILTER_PERSIST_KEY]
+    for state_key, default_value in PM_FILTER_DEFAULTS.items():
+        if state_key not in st.session_state:
+            st.session_state[state_key] = persisted.get(state_key, default_value)
+    _normalize_discount_filter_state()
+
+
+def _persist_product_filter_widgets() -> None:
+    _ensure_persisted_filter_state()
+    persisted = st.session_state[PM_FILTER_PERSIST_KEY]
+    for state_key in PM_FILTER_DEFAULTS.keys():
+        if state_key in st.session_state:
+            persisted[state_key] = st.session_state[state_key]
+
+
+def _reset_product_filter_widgets() -> None:
+    st.session_state[PM_FILTER_PERSIST_KEY] = PM_FILTER_DEFAULTS.copy()
+    for state_key, default_value in PM_FILTER_DEFAULTS.items():
+        st.session_state[state_key] = default_value
+
 def clear_selection():
+    _persist_product_filter_widgets()
     st.session_state["selected_product_id"] = None
     st.session_state["selected_listing_id"] = None
     st.session_state["show_product_sidebar"] = False
     st.rerun()
 
 def open_product_sidebar(product_id, listing_id=None):
+    _persist_product_filter_widgets()
     st.session_state["selected_product_id"] = product_id
     st.session_state["selected_listing_id"] = listing_id
     st.session_state["show_product_sidebar"] = True
@@ -64,11 +142,110 @@ def randomize_products():
     st.rerun()
 
 
-def _get_listing_snapshot(product_id: str) -> dict:
-    """Fetch and cache first listing details for fast UI filters/sorting."""
+TRACKING_QUERY_KEYS = {
+    "tag",
+    "affid",
+    "affextparam1",
+    "affextparam2",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "ref",
+    "ref_",
+    "linkcode",
+    "camp",
+    "creative",
+    "creativeasin",
+    "ascsubtag",
+    "psc",
+}
+
+
+def _strip_tracking_params(url: str) -> str:
+    if not url:
+        return ""
+
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            return url
+
+        kept_params = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            key_lower = str(key).lower()
+            if key_lower in TRACKING_QUERY_KEYS or key_lower.startswith("utm_"):
+                continue
+            kept_params.append((key, value))
+
+        cleaned = parsed._replace(query=urlencode(kept_params, doseq=True), fragment="")
+        return urlunparse(cleaned)
+    except Exception:
+        return url
+
+
+def _extract_amazon_asin(url: str) -> str | None:
+    if not url:
+        return None
+
+    patterns = [
+        r"/dp/([A-Z0-9]{10})",
+        r"/gp/product/([A-Z0-9]{10})",
+        r"/gp/aw/d/([A-Z0-9]{10})",
+        r"[?&]asin=([A-Z0-9]{10})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).upper()
+    return None
+
+
+def _admin_preview_url(url: str, platform_name: str | None = None) -> str:
+    cleaned = _strip_tracking_params(url)
+
+    host = ""
+    try:
+        host = (urlparse(cleaned).netloc or "").lower()
+    except Exception:
+        host = ""
+
+    platform_lower = str(platform_name or "").lower()
+    is_amazon = "amazon" in platform_lower or "amazon." in host or "amzn." in host
+
+    if is_amazon:
+        asin = _extract_amazon_asin(cleaned)
+        if asin:
+            return f"https://www.amazon.in/dp/{asin}"
+
+    return cleaned
+
+
+def _clear_product_cache(product_id: str | None = None) -> None:
+    """Clear listing snapshot cache globally or for one product."""
     cache = st.session_state.setdefault("product_listing_cache", {})
-    if product_id in cache:
-        return cache[product_id]
+    if not product_id:
+        st.session_state["product_listing_cache"] = {}
+        return
+
+    product_id_str = str(product_id)
+    keys_to_remove = [
+        key for key in cache.keys()
+        if key == product_id_str or str(key).startswith(f"{product_id_str}::")
+    ]
+    for key in keys_to_remove:
+        cache.pop(key, None)
+
+
+def _get_listing_snapshot(product_id: str, platform_filter: str = "All") -> dict:
+    """Fetch and cache listing details for fast UI filters/sorting."""
+    cache = st.session_state.setdefault("product_listing_cache", {})
+    normalized_platform = str(platform_filter or "All").strip().lower()
+    cache_key = f"{product_id}::{normalized_platform}"
+    if cache_key in cache:
+        return cache[cache_key]
 
     snapshot = {
         "platform_name": "No Listings",
@@ -76,27 +253,124 @@ def _get_listing_snapshot(product_id: str) -> dict:
         "original_price": 0.0,
         "in_stock": None,
         "has_discount": False,
+        "listing_id": None,
     }
 
     try:
         detail = api.product_detail(token, product_id)
         listings = detail.get("listings", [])
-        first_listing = listings[0] if listings else None
-        if first_listing:
-            current_price = float(first_listing.get("current_price") or 0)
-            original_price = float(first_listing.get("original_price") or 0)
+
+        selected_listing = None
+        if listings:
+            if normalized_platform and normalized_platform != "all":
+                matching = [
+                    l for l in listings
+                    if str(l.get("platform_name", "")).strip().lower() == normalized_platform
+                ]
+                if matching:
+                    selected_listing = matching[0]
+
+            if selected_listing is None:
+                # Default to the best visible offer instead of arbitrary first row.
+                def _rank(listing: dict) -> tuple:
+                    price = float(listing.get("current_price") or 0)
+                    has_valid_price = price > 0
+                    in_stock = listing.get("in_stock") is True
+                    return (
+                        0 if in_stock else 1,
+                        0 if has_valid_price else 1,
+                        price if has_valid_price else float("inf"),
+                    )
+
+                selected_listing = min(listings, key=_rank)
+
+        if selected_listing:
+            current_price = float(selected_listing.get("current_price") or 0)
+            original_price = float(selected_listing.get("original_price") or 0)
             snapshot = {
-                "platform_name": first_listing.get("platform_name", "Unknown"),
+                "platform_name": selected_listing.get("platform_name", "Unknown"),
                 "current_price": current_price,
                 "original_price": original_price,
-                "in_stock": first_listing.get("in_stock"),
+                "in_stock": selected_listing.get("in_stock"),
                 "has_discount": original_price > current_price > 0,
+                "listing_id": selected_listing.get("id"),
             }
     except Exception:
         snapshot["platform_name"] = "Error"
 
-    cache[product_id] = snapshot
+    cache[cache_key] = snapshot
     return snapshot
+
+
+def _prepare_history_dataframe(history_rows: list[dict]) -> pd.DataFrame:
+    """Normalize price history rows into a chart-ready dataframe."""
+    if not history_rows:
+        return pd.DataFrame(columns=["price", "in_stock", "in_stock_numeric"])
+
+    df_hist = pd.DataFrame(history_rows).copy()
+    if "recorded_at" not in df_hist.columns:
+        return pd.DataFrame(columns=["price", "in_stock", "in_stock_numeric"])
+
+    df_hist["recorded_at"] = pd.to_datetime(df_hist["recorded_at"], errors="coerce", utc=True)
+    df_hist = df_hist.dropna(subset=["recorded_at"])
+    if df_hist.empty:
+        return pd.DataFrame(columns=["price", "in_stock", "in_stock_numeric"])
+
+    df_hist["recorded_at"] = df_hist["recorded_at"].dt.tz_convert(None)
+
+    if "price" not in df_hist.columns:
+        return pd.DataFrame(columns=["price", "in_stock", "in_stock_numeric"])
+    df_hist["price"] = pd.to_numeric(df_hist["price"], errors="coerce")
+    df_hist = df_hist.dropna(subset=["price"])
+    if df_hist.empty:
+        return pd.DataFrame(columns=["price", "in_stock", "in_stock_numeric"])
+
+    if "in_stock" not in df_hist.columns:
+        df_hist["in_stock"] = True
+    df_hist["in_stock"] = df_hist["in_stock"].fillna(True).astype(bool)
+
+    # Ensure proper temporal order and avoid duplicate timestamp points.
+    df_hist = df_hist.sort_values("recorded_at")
+    df_hist = df_hist.drop_duplicates(subset=["recorded_at"], keep="last")
+    df_hist = df_hist.set_index("recorded_at")
+    df_hist["in_stock_numeric"] = df_hist["in_stock"].astype(int)
+
+    return df_hist
+
+
+def _render_history_charts(df_hist: pd.DataFrame) -> None:
+    """Render price and stock charts from normalized history dataframe."""
+    if df_hist.empty:
+        st.info("No valid price history points available yet.")
+        return
+
+    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    with metrics_col1:
+        st.metric("Current", f"₹{float(df_hist['price'].iloc[-1]):,.2f}")
+    with metrics_col2:
+        st.metric("Min", f"₹{float(df_hist['price'].min()):,.2f}")
+    with metrics_col3:
+        st.metric("Max", f"₹{float(df_hist['price'].max()):,.2f}")
+
+    st.markdown("#### 📈 Price Trend")
+    st.line_chart(df_hist["price"], use_container_width=True)
+
+    st.markdown("#### 📦 Stock Availability")
+    st.line_chart(df_hist["in_stock_numeric"], use_container_width=True)
+    st.caption("Stock timeline: 1 = In Stock, 0 = Out of Stock")
+
+
+def _display_table_value(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.hex()
+    if isinstance(value, (dict, list, tuple, set)):
+        return str(value)
+    return str(value)
 
 # -----------------------------------------------------------------------------
 # MAIN LIST VIEW
@@ -104,24 +378,7 @@ def _get_listing_snapshot(product_id: str) -> dict:
 if st.session_state["selected_product_id"] is None:
     st.markdown("### Product Catalog")
 
-    default_widget_state = {
-        "pm_search": "",
-        "pm_category": "",
-        "pm_brand": "",
-        "pm_platform": "All",
-        "pm_page": 1,
-        "pm_sort": "Newest First",
-        "pm_stock": "All",
-        "pm_discount": "All",
-        "pm_min_price": 0.0,
-        "pm_max_price": 200000.0,
-        "pm_collapsible": True,
-        "pm_expand_all": False,
-        "pm_table_preview": False,
-    }
-    for state_key, default_value in default_widget_state.items():
-        if state_key not in st.session_state:
-            st.session_state[state_key] = default_value
+    _hydrate_product_filter_widgets()
 
     with st.container(border=True):
         header_col1, header_col2, header_col3, header_col4 = st.columns([1.1, 1.1, 1, 1])
@@ -140,7 +397,7 @@ if st.session_state["selected_product_id"] is None:
         with header_col2:
             st.markdown("#### Data")
             if st.button("Refresh Data", use_container_width=True):
-                st.session_state["product_listing_cache"] = {}
+                _clear_product_cache()
                 st.rerun()
 
         with header_col3:
@@ -152,65 +409,75 @@ if st.session_state["selected_product_id"] is None:
         with header_col4:
             st.markdown("#### Reset")
             if st.button("Reset All Controls", use_container_width=True):
-                for state_key, default_value in default_widget_state.items():
-                    st.session_state[state_key] = default_value
-                st.session_state["product_listing_cache"] = {}
+                _reset_product_filter_widgets()
+                _clear_product_cache()
                 st.rerun()
 
         st.divider()
-        st.markdown("#### Filters")
-        base_col1, base_col2, base_col3, base_col4, base_col5 = st.columns([2, 1.2, 1.2, 1.1, 0.9])
-        with base_col1:
-            search_query = st.text_input("Search title", placeholder="Example: iPhone 15", key="pm_search")
-        with base_col2:
-            category_filter = st.text_input("Category", placeholder="Electronics", key="pm_category")
-        with base_col3:
-            brand_filter = st.text_input("Brand", placeholder="Apple", key="pm_brand")
-        with base_col4:
-            platform_filter = st.selectbox(
-                "Platform",
-                ["All", "Amazon", "Flipkart", "Meesho", "Myntra", "Nykaa", "Croma"],
-                key="pm_platform",
-            )
-        with base_col5:
-            page = st.number_input("Page", min_value=1, step=1, key="pm_page")
+        with st.expander("Filters And Sorting", expanded=False):
+            st.markdown("#### Basic Filters")
+            base_col1, base_col2, base_col3, base_col4, base_col5, base_col6 = st.columns([2, 1.4, 1.2, 1.2, 1.1, 0.8])
+            with base_col1:
+                search_query = st.text_input("Search title", placeholder="Example: iPhone 15", key="pm_search")
+            with base_col2:
+                product_id_filter = st.text_input("Product ID", placeholder="UUID or partial", key="pm_product_id")
+            with base_col3:
+                category_filter = st.text_input("Category", placeholder="Electronics", key="pm_category")
+            with base_col4:
+                brand_filter = st.text_input("Brand", placeholder="Apple", key="pm_brand")
+            with base_col5:
+                platform_filter = st.selectbox(
+                    "Platform",
+                    ["All", "Amazon", "Flipkart", "Meesho", "Myntra", "Nykaa", "Croma"],
+                    key="pm_platform",
+                )
+            with base_col6:
+                page = st.number_input("Page", min_value=1, step=1, key="pm_page")
 
-        st.markdown("#### Sort And Advanced Filters")
-        adv_col1, adv_col2, adv_col3, adv_col4, adv_col5 = st.columns([2, 1.2, 1.2, 1, 1])
+            st.markdown("#### Sort And Advanced Filters")
+            adv_col1, adv_col2, adv_col3, adv_col4, adv_col5 = st.columns([2, 1.2, 1.2, 1, 1])
 
-        sort_options = [
-            "Newest First",
-            "Oldest First",
-            "Price: Low to High",
-            "Price: High to Low",
-            "Biggest Discount",
-            "Title A-Z",
-            "Title Z-A",
-            "Brand A-Z",
-            "Brand Z-A",
-            "Most Platforms",
-            "Fewest Platforms",
-            "Random",
-        ]
+            sort_options = [
+                "Newest First",
+                "Oldest First",
+                "Price: Low to High",
+                "Price: High to Low",
+                "Biggest Discount",
+                "Discount %: High to Low",
+                "Discount %: Low to High",
+                "Title A-Z",
+                "Title Z-A",
+                "Brand A-Z",
+                "Brand Z-A",
+                "Most Platforms",
+                "Fewest Platforms",
+                "Random",
+            ]
 
-        with adv_col1:
-            current_sort = st.selectbox("Sort by", sort_options, key="pm_sort")
-        with adv_col2:
-            stock_filter = st.selectbox("Stock", ["All", "In Stock", "Out of Stock"], key="pm_stock")
-        with adv_col3:
-            discount_filter = st.selectbox("Discount", ["All", "Has Discount", "No Discount"], key="pm_discount")
-        with adv_col4:
-            min_price = st.number_input("Min Price", min_value=0.0, step=100.0, key="pm_min_price")
-        with adv_col5:
-            max_price = st.number_input("Max Price", min_value=0.0, step=100.0, key="pm_max_price")
+            with adv_col1:
+                current_sort = st.selectbox("Sort by", sort_options, key="pm_sort")
+            with adv_col2:
+                stock_filter = st.selectbox("Stock", ["All", "In Stock", "Out of Stock"], key="pm_stock")
+            with adv_col3:
+                discount_filter = st.selectbox(
+                    "Discount",
+                    DISCOUNT_FILTER_OPTIONS,
+                    key="pm_discount",
+                )
+            with adv_col4:
+                min_price = st.number_input("Min Price", min_value=0.0, step=100.0, key="pm_min_price")
+            with adv_col5:
+                max_price = st.number_input("Max Price", min_value=0.0, step=100.0, key="pm_max_price")
 
-        ui_col1, ui_col2, ui_col3 = st.columns(3)
-        with ui_col1:
-            use_collapsible_cards = st.checkbox("Collapsible product cards", key="pm_collapsible")
-        with ui_col2:
-            expand_all_cards = st.checkbox("Expand all cards", key="pm_expand_all")
-        with ui_col3:
-            show_table_preview = st.checkbox("Show table preview", key="pm_table_preview")
+            ui_col1, ui_col2, ui_col3 = st.columns(3)
+            with ui_col1:
+                use_collapsible_cards = st.checkbox("Collapsible product cards", key="pm_collapsible")
+            with ui_col2:
+                expand_all_cards = st.checkbox("Expand all cards", key="pm_expand_all")
+            with ui_col3:
+                show_table_preview = st.checkbox("Show table preview", key="pm_table_preview")
+
+    _persist_product_filter_widgets()
 
     # Load products
     try:
@@ -218,6 +485,7 @@ if st.session_state["selected_product_id"] is None:
             token=token,
             page=page,
             search=search_query if search_query else None,
+            product_id=product_id_filter.strip() if product_id_filter and product_id_filter.strip() else None,
             category=category_filter if category_filter else None,
             brand=brand_filter if brand_filter else None,
             platform=platform_filter if platform_filter != "All" else None
@@ -234,16 +502,26 @@ if st.session_state["selected_product_id"] is None:
     # Enrich products once so sorting/filtering does not refetch repeatedly.
     enriched_products = []
     for product in products:
-        snapshot = _get_listing_snapshot(product.get("id"))
+        snapshot = _get_listing_snapshot(product.get("id"), platform_filter=platform_filter)
+        current_price = float(snapshot.get("current_price") or 0)
+        original_price = float(snapshot.get("original_price") or 0)
+        has_discount = bool(snapshot.get("has_discount"))
+        if original_price > 0 and current_price >= 0 and original_price > current_price:
+            discount_percent = ((original_price - current_price) / original_price) * 100
+        else:
+            discount_percent = 0.0
+
         product["_platform_name"] = snapshot.get("platform_name", "Unknown")
-        product["_current_price"] = float(snapshot.get("current_price") or 0)
-        product["_original_price"] = float(snapshot.get("original_price") or 0)
+        product["_current_price"] = current_price
+        product["_original_price"] = original_price
         product["_in_stock"] = snapshot.get("in_stock")
-        product["_has_discount"] = bool(snapshot.get("has_discount"))
+        product["_has_discount"] = has_discount
+        product["_discount_percent"] = discount_percent
         enriched_products.append(product)
 
     # Apply advanced filters
     filtered_products = enriched_products
+    discount_order = None
     if stock_filter == "In Stock":
         filtered_products = [p for p in filtered_products if p.get("_in_stock") is True]
     elif stock_filter == "Out of Stock":
@@ -253,6 +531,10 @@ if st.session_state["selected_product_id"] is None:
         filtered_products = [p for p in filtered_products if p.get("_has_discount")]
     elif discount_filter == "No Discount":
         filtered_products = [p for p in filtered_products if not p.get("_has_discount")]
+    elif discount_filter == "Low to High":
+        discount_order = "asc"
+    elif discount_filter == "High to Low":
+        discount_order = "desc"
 
     if max_price > 0 and max_price >= min_price:
         filtered_products = [
@@ -274,6 +556,10 @@ if st.session_state["selected_product_id"] is None:
             key=lambda x: ((x.get("_original_price") or 0) - (x.get("_current_price") or 0)),
             reverse=True,
         )
+    elif current_sort == "Discount %: High to Low":
+        filtered_products.sort(key=lambda x: float(x.get("_discount_percent") or 0), reverse=True)
+    elif current_sort == "Discount %: Low to High":
+        filtered_products.sort(key=lambda x: float(x.get("_discount_percent") or 0))
     elif current_sort == "Title A-Z":
         filtered_products.sort(key=lambda x: str(x.get("title", "")).lower())
     elif current_sort == "Title Z-A":
@@ -288,6 +574,12 @@ if st.session_state["selected_product_id"] is None:
         filtered_products.sort(key=lambda x: int(x.get("platforms_count") or 0))
     elif current_sort == "Random":
         random.shuffle(filtered_products)
+
+    # Apply discount-based order at the end so it is not overwritten by current_sort.
+    if discount_order == "asc":
+        filtered_products.sort(key=lambda x: float(x.get("_discount_percent") or 0))
+    elif discount_order == "desc":
+        filtered_products.sort(key=lambda x: float(x.get("_discount_percent") or 0), reverse=True)
 
     in_stock_count = sum(1 for p in filtered_products if p.get("_in_stock") is True)
     discount_count = sum(1 for p in filtered_products if p.get("_has_discount"))
@@ -311,6 +603,7 @@ if st.session_state["selected_product_id"] is None:
                 "Platform": p.get("_platform_name", "Unknown"),
                 "Current Price": p.get("_current_price", 0),
                 "Original Price": p.get("_original_price", 0),
+                "Discount %": round(float(p.get("_discount_percent") or 0), 2),
                 "In Stock": p.get("_in_stock"),
                 "Platforms Count": p.get("platforms_count", 0),
             })
@@ -340,7 +633,7 @@ if st.session_state["selected_product_id"] is None:
                         with st.container(border=True, height=300):
                             # Product image
                             if product.get("image_url"):
-                                st.image(product.get("image_url"), width=120, use_column_width="always")
+                                st.image(product.get("image_url"), use_container_width=True)
                             else:
                                 st.write("🖼️ No Image")
                             
@@ -359,6 +652,7 @@ if st.session_state["selected_product_id"] is None:
                             
                             # Edit button
                             if st.button("📋 Edit", key=f"grid_edit_{product.get('id')}", use_container_width=True):
+                                _persist_product_filter_widgets()
                                 st.session_state["selected_product_id"] = product.get("id")
                                 st.session_state["selected_listing_id"] = None
                                 st.session_state["show_product_sidebar"] = False
@@ -419,6 +713,7 @@ if st.session_state["selected_product_id"] is None:
 
                     with c5:
                         if st.button("📋 Details / Edit", key=f"list_edit_{product.get('id')}", use_container_width=True, type="primary"):
+                            _persist_product_filter_widgets()
                             st.session_state["selected_product_id"] = product.get("id")
                             st.session_state["selected_listing_id"] = None
                             st.session_state["show_product_sidebar"] = False
@@ -478,7 +773,10 @@ else:
                     specs = product.get("specifications", {})
                     if specs:
                         st.write("**Current Specifications:**")
-                        st.json(specs)
+                        specs_df = pd.DataFrame(
+                            [{"Specification": str(k), "Value": str(v)} for k, v in specs.items()]
+                        )
+                        st.dataframe(specs_df, use_container_width=True, hide_index=True)
                     
                     new_spec_key = st.text_input("New Spec Key (optional)")
                     new_spec_value = st.text_input("New Spec Value (optional)")
@@ -602,8 +900,9 @@ else:
                             st.caption(f"Updated: {last_scraped}")
                         
                         with row_cols[5]:
-                            if product_url:
-                                st.link_button("🔗", product_url, use_container_width=True)
+                            preview_url = _admin_preview_url(product_url, platform_name)
+                            if preview_url:
+                                st.link_button("🔗", preview_url, use_container_width=True)
                         
                         st.divider()
                 
@@ -658,16 +957,36 @@ else:
                     st.markdown("#### 🌐 Row 2: Live Website Data")
                     with st.container(border=True):
                         product_url = selected_listing.get('product_url', '')
+                        preview_url = _admin_preview_url(product_url, selected_listing.get('platform_name'))
+                        selected_platform = str(selected_listing.get('platform_name', '')).strip().lower()
                         
-                        if product_url:
-                            # Embed website preview
-                            st.components.v1.iframe(
-                                src=product_url,
-                                height=500,
-                                scrolling=True
-                            )
-                            
-                            st.caption(f"Source: {product_url}")
+                        if preview_url:
+                            if selected_platform == "amazon":
+                                # Use the same iframe style as other platforms first.
+                                st.components.v1.iframe(
+                                    src=preview_url,
+                                    height=500,
+                                    scrolling=True
+                                )
+                                st.caption(f"Source: {preview_url}")
+
+                                open_col1, open_col2 = st.columns(2)
+                                with open_col1:
+                                    st.link_button("Open Amazon Product", preview_url, use_container_width=True)
+                                with open_col2:
+                                    st.link_button("Open Canonical URL", _strip_tracking_params(product_url), use_container_width=True)
+
+                                st.caption(
+                                    "If the frame is blank, Amazon is blocking embed for this page (X-Frame-Options: SAMEORIGIN)."
+                                )
+                            else:
+                                # Embed website preview
+                                st.components.v1.iframe(
+                                    src=preview_url,
+                                    height=500,
+                                    scrolling=True
+                                )
+                                st.caption(f"Source: {preview_url}")
                             
                             # Quick update form inline
                             st.markdown("**Quick Price Actions**")
@@ -728,6 +1047,7 @@ else:
                                             original_price=updated_original_price,
                                         )
                                         if result.get("success"):
+                                            _clear_product_cache(product_id)
                                             if updated_original_price is None:
                                                 st.success("✅ Current price updated and MRP removed")
                                             else:
@@ -759,6 +1079,7 @@ else:
                                             original_price=updated_original_price,
                                         )
                                         if result.get("success"):
+                                            _clear_product_cache(product_id)
                                             if updated_original_price is None:
                                                 st.success(
                                                     f"✅ History saved (₹{current_price:,.2f}); current updated to ₹{new_price:,.2f} and MRP removed"
@@ -773,9 +1094,8 @@ else:
                                     except ApiError as e:
                                         st.error(f"❌ Error: {e}")
                             
-                            # Open in new tab button (outside form)
-                            if st.button("🔗 Open Website in New Tab", use_container_width=True):
-                                st.link_button("Open Website", product_url, use_container_width=True)
+                            # Open website action (outside form)
+                            st.link_button("🔗 Open Website in New Tab", preview_url, use_container_width=True)
                         else:
                             st.error("❌ No product URL available")
                     
@@ -857,21 +1177,10 @@ else:
                         history = api.get_price_history(token, selected_history_listing.get('id'))
                         
                         if history and history.get("history"):
-                            st.markdown("#### 📈 Price History Chart")
                             hist_data = history.get("history", [])
                             if hist_data:
-                                df_hist = pd.DataFrame(hist_data)
-                                df_hist['recorded_at'] = pd.to_datetime(df_hist['recorded_at'])
-                                df_hist = df_hist.set_index('recorded_at')
-                                
-                                # Price chart
-                                st.line_chart(df_hist['price'], use_container_width=True)
-                                
-                                # Stock availability
-                                st.markdown("#### 📦 Stock Availability Timeline")
-                                stock_data = df_hist.copy()
-                                stock_data['in_stock_numeric'] = stock_data['in_stock'].astype(int)
-                                st.line_chart(stock_data['in_stock_numeric'], use_container_width=True)
+                                df_hist = _prepare_history_dataframe(hist_data)
+                                _render_history_charts(df_hist)
                                 
                                 # Add new price point
                                 st.markdown("#### ➕ Add Manual Price Point")
@@ -911,7 +1220,69 @@ else:
         
         with tab4:
             st.markdown("### 📋 Raw Product Data")
-            st.json(detail)
+            product_rows = [
+                {"Field": "ID", "Value": _display_table_value(product.get("id", "-"))},
+                {"Field": "Title", "Value": _display_table_value(product.get("title", "-"))},
+                {"Field": "Brand", "Value": _display_table_value(product.get("brand", "-"))},
+                {"Field": "Category", "Value": _display_table_value(product.get("category", "-"))},
+                {"Field": "Subcategory", "Value": _display_table_value(product.get("subcategory", "-"))},
+                {"Field": "Condition", "Value": _display_table_value(product.get("condition", "-"))},
+                {"Field": "Variant Type", "Value": _display_table_value(product.get("variant_type", "-"))},
+                {"Field": "Storage (GB)", "Value": _display_table_value(product.get("storage_gb", "-"))},
+                {"Field": "Color", "Value": _display_table_value(product.get("color", "-"))},
+                {"Field": "Image URL", "Value": _display_table_value(product.get("image_url", "-"))},
+            ]
+            st.dataframe(pd.DataFrame(product_rows), use_container_width=True, hide_index=True)
+
+            specs = product.get("specifications", {}) if isinstance(product, dict) else {}
+            if isinstance(specs, dict) and specs:
+                st.markdown("#### Specifications")
+                specs_df = pd.DataFrame(
+                    [{"Specification": str(k), "Value": str(v)} for k, v in specs.items()]
+                )
+                st.dataframe(specs_df, use_container_width=True, hide_index=True)
+
+            if listings:
+                st.markdown("#### Listings")
+                listings_df = pd.DataFrame(listings)
+                if "current_price" in listings_df.columns:
+                    listings_df["current_price"] = pd.to_numeric(
+                        listings_df["current_price"], errors="coerce"
+                    ).fillna(0)
+                if "actual_price" in listings_df.columns:
+                    listings_df["actual_price"] = pd.to_numeric(
+                        listings_df["actual_price"], errors="coerce"
+                    ).fillna(0)
+
+                preferred_cols = [
+                    "platform",
+                    "title",
+                    "current_price",
+                    "actual_price",
+                    "discount_percentage",
+                    "in_stock",
+                    "url",
+                    "last_scraped",
+                ]
+                available_cols = [c for c in preferred_cols if c in listings_df.columns]
+                if available_cols:
+                    display_df = listings_df[available_cols].copy()
+                else:
+                    display_df = listings_df
+
+                display_df = display_df.rename(
+                    columns={
+                        "platform": "Platform",
+                        "title": "Listing Title",
+                        "current_price": "Current Price (INR)",
+                        "actual_price": "Actual Price (INR)",
+                        "discount_percentage": "Discount %",
+                        "in_stock": "In Stock",
+                        "url": "URL",
+                        "last_scraped": "Last Scraped",
+                    }
+                )
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     except ApiError as e:
         st.error(f"❌ Failed to load product details: {e}")
@@ -973,7 +1344,11 @@ if st.session_state.get("show_product_sidebar"):
                         
                         with lcol3:
                             if st.button("🔗 Open", key=f"sidebar_url_{listing.get('id')}", use_container_width=True):
-                                st.link_button("Visit Product", listing.get('product_url', '#'), use_container_width=True)
+                                sidebar_preview_url = _admin_preview_url(
+                                    listing.get('product_url', '#'),
+                                    listing.get('platform_name')
+                                )
+                                st.link_button("Visit Product", sidebar_preview_url, use_container_width=True)
                             
                             if st.button("💰 Update Price", key=f"sidebar_price_{listing.get('id')}", use_container_width=True):
                                 st.session_state["selected_listing_id"] = listing.get('id')
@@ -1044,6 +1419,7 @@ if st.session_state.get("selected_listing_id"):
                                         original_price=original_price if original_price != float(current_listing.get('original_price', 0)) else None
                                     )
                                     if result.get("success"):
+                                        _clear_product_cache(st.session_state.get("selected_product_id"))
                                         st.success("Price updated successfully!")
                                         st.rerun()
                                     else:
@@ -1097,21 +1473,10 @@ if st.session_state.get("selected_listing_id"):
                         history = api.get_price_history(token, listing_id)
                         
                         if history and history.get("history"):
-                            # Create price history chart
                             hist_data = history.get("history", [])
                             if hist_data:
-                                df_hist = pd.DataFrame(hist_data)
-                                df_hist['recorded_at'] = pd.to_datetime(df_hist['recorded_at'])
-                                df_hist = df_hist.set_index('recorded_at')
-                                
-                                # Price chart
-                                st.line_chart(df_hist['price'], use_container_width=True)
-                                
-                                # Stock availability over time
-                                st.subheader("📦 Stock Availability")
-                                stock_data = df_hist.copy()
-                                stock_data['in_stock_numeric'] = stock_data['in_stock'].astype(int)
-                                st.line_chart(stock_data['in_stock_numeric'], use_container_width=True)
+                                df_hist = _prepare_history_dataframe(hist_data)
+                                _render_history_charts(df_hist)
                     
                     except ApiError as e:
                         st.error(f"Failed to load price history: {e}")
