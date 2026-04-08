@@ -738,7 +738,7 @@ else:
         st.subheader(f"📦 Product Management: {product.get('title')}")
         
         # Main tabs for different views
-        tab1, tab2, tab3, tab4 = st.tabs(["📝 Edit Product", "🔗 Compare with Website", "📊 Price History", "📋 Raw Data"])
+        tab2, tab1, tab3, tab4 = st.tabs(["🔗 Compare with Website","📝 Edit Product", "📊 Price History", "📋 Raw Data"])
         
         with tab1:
             st.markdown("### 📝 Product Information Editor")
