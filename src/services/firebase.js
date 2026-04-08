@@ -12,6 +12,9 @@ import {
   createUserWithEmailAndPassword,
   signOut,
   sendPasswordResetEmail,
+  updatePassword,
+  reauthenticateWithCredential,
+  EmailAuthProvider,
   onAuthStateChanged,
   getIdToken
 } from 'firebase/auth';
@@ -191,6 +194,128 @@ export const signUpWithEmail = async (email, password) => {
 };
 
 // --------------------------------------------
+// UPDATE PASSWORD
+// --------------------------------------------
+
+export const changePassword = async (currentPassword, newPassword) => {
+  try {
+    const user = getCurrentUser();
+    if (!user) {
+      return {
+        success: false,
+        error: 'No user logged in. Please sign in again.',
+      };
+    }
+
+    const authInstance = getAuthInstance();
+    
+    // Reauthenticate user first (required for password change)
+    const credential = EmailAuthProvider.credential(user.email, currentPassword);
+    
+    try {
+      await reauthenticateWithCredential(user, credential);
+      console.log('Firebase: Reauthentication successful');
+    } catch (reauthError) {
+      console.error('Firebase: Reauthentication failed:', reauthError.code, reauthError.message);
+      
+      let errorMessage = 'Failed to verify current password.';
+      switch (reauthError.code) {
+        case 'auth/invalid-email':
+          errorMessage = 'Invalid email address.';
+          break;
+        case 'auth/invalid-credential':
+        case 'auth/wrong-password':
+          errorMessage = 'Current password is incorrect.';
+          break;
+        case 'auth/user-disabled':
+          errorMessage = 'This account has been disabled.';
+          break;
+        case 'auth/too-many-requests':
+          errorMessage = 'Too many failed attempts. Please try again later.';
+          break;
+        case 'auth/user-not-found':
+          errorMessage = 'User account not found.';
+          break;
+        default:
+          errorMessage = reauthError.message || 'Failed to verify current password.';
+      }
+      
+      return {
+        success: false,
+        error: errorMessage,
+        code: reauthError.code,
+      };
+    }
+    
+    // Update password after successful reauthentication
+    try {
+      await updatePassword(user, newPassword);
+      console.log('Firebase: Password updated successfully');
+      return {
+        success: true,
+        message: 'Password updated successfully.',
+      };
+    } catch (updateError) {
+      console.error('Firebase: Password update failed:', updateError.code, updateError.message);
+      
+      let errorMessage = 'Failed to update password.';
+      switch (updateError.code) {
+        case 'auth/weak-password':
+          errorMessage = 'New password is too weak. Please use a stronger password.';
+          break;
+        case 'auth/invalid-password':
+          errorMessage = 'Invalid new password format.';
+          break;
+        case 'auth/requires-recent-login':
+          errorMessage = 'Please sign in again to change your password.';
+          break;
+        default:
+          errorMessage = updateError.message || 'Failed to update password.';
+      }
+      
+      return {
+        success: false,
+        error: errorMessage,
+        code: updateError.code,
+      };
+    }
+  } catch (error) {
+    console.error('Firebase: Password change error:', error.code, error.message);
+
+    let errorMessage = 'Failed to update password.';
+    switch (error.code) {
+      case 'auth/wrong-password':
+      case 'auth/invalid-credential':
+        errorMessage = 'Current password is incorrect.';
+        break;
+      case 'auth/weak-password':
+        errorMessage = 'New password is too weak. Please use a stronger password.';
+        break;
+      case 'auth/requires-recent-login':
+        errorMessage = 'Please sign in again to change your password.';
+        break;
+      case 'auth/too-many-requests':
+        errorMessage = 'Too many attempts. Please try again later.';
+        break;
+      case 'auth/invalid-email':
+        errorMessage = 'Invalid email address.';
+        break;
+      case 'auth/user-disabled':
+        errorMessage = 'This account has been disabled.';
+        break;
+      default:
+        errorMessage = error.message || 'Failed to update password.';
+    }
+
+    return {
+      success: false,
+      error: errorMessage,
+      code: error.code,
+    };
+  }
+};
+
+// --------------------------------------------
 // SIGN OUT
 // --------------------------------------------
 
@@ -330,6 +455,7 @@ export default {
   signUpWithEmail,
   firebaseSignOut,
   sendResetEmail,
+  changePassword,
   getCurrentUser,
   getFreshIdToken,
   subscribeToAuthChanges,

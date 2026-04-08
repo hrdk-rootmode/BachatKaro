@@ -21,6 +21,7 @@ import ProfileScreen from '../screens/ProfileScreen';
 // Redux - Watchlist count
 import { selectWatchlistCount } from '../store/watchlistSlice';
 import { selectCurrentStreak } from '../store/streakSlice';
+import { selectThemePalette } from '../store/themeSlice';
 
 // Constants
 import { COLORS } from '../utils/constants';
@@ -64,6 +65,7 @@ const MainTabs = () => {
   // Get watchlist count from Redux
   const watchlistCount = useSelector(selectWatchlistCount);
   const currentStreak = useSelector(selectCurrentStreak);
+  const themePalette = useSelector(selectThemePalette);
   const shouldShowStreakTab = currentStreak >= 5;
   
   return (
@@ -103,8 +105,8 @@ const MainTabs = () => {
 
           return <Ionicons name={iconName} size={size} color={color} />;
         },
-        tabBarActiveTintColor: COLORS.primary,
-        tabBarInactiveTintColor: COLORS.gray500,
+        tabBarActiveTintColor: themePalette.tabActive,
+        tabBarInactiveTintColor: themePalette.tabInactive,
         tabBarLabelStyle: {
           fontSize: 12,
           marginBottom: 4,
@@ -114,8 +116,8 @@ const MainTabs = () => {
           paddingTop: 8,
           paddingBottom: 8,
           borderTopWidth: 1,
-          borderTopColor: COLORS.gray200,
-          backgroundColor: COLORS.white,
+          borderTopColor: themePalette.border || COLORS.gray200,
+          backgroundColor: themePalette.surface || COLORS.white,
         },
       })}
     >

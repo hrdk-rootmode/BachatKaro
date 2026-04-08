@@ -1,6 +1,6 @@
 // ============================================
 // DEALHUNT APP - WATCHLIST SCREEN
-// Part 3: Watchlist & Price Alerts
+// Part 5 Update: Added Upgrade Navigation
 // ============================================
 
 import React, { useCallback, useEffect, useState, useMemo } from 'react';
@@ -17,12 +17,14 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
-import { useSelector } from 'react-redux';
+import { useSelector, useDispatch } from 'react-redux';
 
 import { useWatchlist } from '../hooks/useWatchlist';
 import WatchlistCard from '../components/WatchlistCard';
-import { COLORS } from '../utils/constants';
+import { COLORS, SUBSCRIPTION } from '../utils/constants';
 import { selectIsAuthenticated } from '../store/authSlice';
+import { setSelectedPlan } from '../store/subscriptionSlice'; // ✅ Part 5
+import { selectThemePalette } from '../store/themeSlice';
 
 // --------------------------------------------
 // SORT OPTIONS
@@ -133,7 +135,7 @@ const LoginPrompt = ({ onLogin }) => (
 // SORT MODAL
 // --------------------------------------------
 
-const SortModal = ({ visible, currentSort, onSelect, onClose }) => {
+const SortModal = ({ visible, currentSort, onSelect, onClose, themePalette }) => {
   if (!visible) return null;
   
   return (
@@ -142,7 +144,7 @@ const SortModal = ({ visible, currentSort, onSelect, onClose }) => {
       activeOpacity={1} 
       onPress={onClose}
     >
-      <View style={styles.sortModal}>
+      <View style={[styles.sortModal, { backgroundColor: themePalette.surface || COLORS.white, borderColor: themePalette.border || COLORS.gray200 }]}>
         <View style={styles.sortModalHeader}>
           <Text style={styles.sortModalTitle}>Sort By</Text>
           <TouchableOpacity onPress={onClose}>
@@ -190,7 +192,9 @@ const SortModal = ({ visible, currentSort, onSelect, onClose }) => {
 
 const WatchlistScreen = () => {
   const navigation = useNavigation();
+  const dispatch = useDispatch(); // ✅ Part 5
   const isAuthenticated = useSelector(selectIsAuthenticated);
+  const themePalette = useSelector(selectThemePalette);
   
   // Watchlist hook
   const {
@@ -210,10 +214,11 @@ const WatchlistScreen = () => {
   const [showSortModal, setShowSortModal] = useState(false);
   
   // Fetch watchlist on mount and when focused
+  // Always force refresh to ensure limit is updated after subscription changes
   useFocusEffect(
     useCallback(() => {
       if (isAuthenticated) {
-        fetch();
+        fetch(true); // forceRefresh = true to ensure latest limit
       }
     }, [isAuthenticated, fetch])
   );
@@ -282,7 +287,6 @@ const WatchlistScreen = () => {
         return itemsCopy.sort((a, b) => {
           const dropA = resolveDrop(a);
           const dropB = resolveDrop(b);
-          // More negative = bigger drop
           return dropA - dropB;
         });
       
@@ -307,9 +311,17 @@ const WatchlistScreen = () => {
     navigation.navigate('Auth');
   }, [navigation]);
   
+  // ✅ Part 5: Handle upgrade navigation
+  const handleUpgrade = useCallback(() => {
+    dispatch(setSelectedPlan('pro'));
+    navigation.navigate('Plans', { 
+      highlightedPlan: 'pro',
+      reason: SUBSCRIPTION.UPGRADE_REASONS.WATCHLIST_LIMIT,
+    });
+  }, [navigation, dispatch]);
+  
   // Handle item removal callback
   const handleItemRemoved = useCallback((productId) => {
-    // Optional: Show toast or feedback
     console.log('Removed from watchlist:', productId);
   }, []);
   
@@ -335,7 +347,7 @@ const WatchlistScreen = () => {
   // Not authenticated
   if (!isAuthenticated) {
     return (
-      <SafeAreaView style={styles.container} edges={['top']}>
+      <SafeAreaView style={[styles.container, { backgroundColor: themePalette.background || '#F3F6FA' }]} edges={['top']}>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Watchlist</Text>
         </View>
@@ -347,7 +359,7 @@ const WatchlistScreen = () => {
   // Loading state (initial load)
   if (isLoading && items.length === 0) {
     return (
-      <SafeAreaView style={styles.container} edges={['top']}>
+      <SafeAreaView style={[styles.container, { backgroundColor: themePalette.background || '#F3F6FA' }]} edges={['top']}>
         <View style={styles.header}>
           <View style={styles.headerLeft}>
             <Text style={styles.headerTitle}>Watchlist</Text>
@@ -364,7 +376,7 @@ const WatchlistScreen = () => {
   // Error state
   if (error && items.length === 0) {
     return (
-      <SafeAreaView style={styles.container} edges={['top']}>
+      <SafeAreaView style={[styles.container, { backgroundColor: themePalette.background || '#F3F6FA' }]} edges={['top']}>
         <View style={styles.header}>
           <View style={styles.headerLeft}>
             <Text style={styles.headerTitle}>Watchlist</Text>
@@ -387,7 +399,7 @@ const WatchlistScreen = () => {
   }
   
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+    <SafeAreaView style={[styles.container, { backgroundColor: themePalette.background || '#F3F6FA' }]} edges={['top']}>
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
@@ -402,13 +414,13 @@ const WatchlistScreen = () => {
             style={styles.sortButton}
             onPress={() => setShowSortModal(true)}
           >
-            <Ionicons name="swap-vertical-outline" size={18} color={COLORS.primary} />
-            <Text style={styles.sortButtonText}>{currentSortLabel}</Text>
+            <Ionicons name="swap-vertical-outline" size={18} color={themePalette.primary || COLORS.primary} />
+            <Text style={[styles.sortButtonText, { color: themePalette.primary || COLORS.primary }]}>{currentSortLabel}</Text>
           </TouchableOpacity>
         )}
       </View>
       
-      {/* Limit Warning */}
+      {/* ✅ Part 5: Limit Warning with Working Upgrade Button */}
       {totalCount >= limit && (
         <View style={styles.limitWarning}>
           <Ionicons name="warning-outline" size={16} color={COLORS.warning} />
@@ -417,10 +429,8 @@ const WatchlistScreen = () => {
           </Text>
           <TouchableOpacity 
             style={styles.upgradeLink}
-            onPress={() => {
-              // TODO: Navigate to subscription (Part 5)
-              console.log('Navigate to upgrade');
-            }}
+            onPress={handleUpgrade}
+            activeOpacity={0.8}
           >
             <Text style={styles.upgradeLinkText}>Upgrade</Text>
           </TouchableOpacity>
@@ -443,8 +453,8 @@ const WatchlistScreen = () => {
             <RefreshControl
               refreshing={isRefreshing}
               onRefresh={refresh}
-              colors={[COLORS.primary]}
-              tintColor={COLORS.primary}
+              colors={[themePalette.primary || COLORS.primary]}
+              tintColor={themePalette.primary || COLORS.primary}
             />
           }
           ListFooterComponent={
@@ -463,6 +473,7 @@ const WatchlistScreen = () => {
         currentSort={sortBy}
         onSelect={setSortBy}
         onClose={() => setShowSortModal(false)}
+        themePalette={themePalette}
       />
     </SafeAreaView>
   );

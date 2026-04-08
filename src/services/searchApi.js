@@ -103,9 +103,18 @@ export const searchAPI = {
 
       const response = await post(API.ENDPOINTS.SEARCH_BY_URL, payload);
 
+      console.log('URL Search API: Full response:', response);
+
       if (!response.success) {
+        console.error('URL Search failed:', response.error);
         return response;
       }
+
+      console.log('URL Search Success:', {
+        source_platform: response.data?.source?.platform,
+        alternatives: response.data?.alternatives?.length || 0,
+        origin: response.data?.response_origin
+      });
 
       return {
         success: true,
@@ -113,9 +122,14 @@ export const searchAPI = {
       };
     } catch (error) {
       console.error('URL Search API Error:', error);
+      console.error('Error details:', {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status
+      });
       return {
         success: false,
-        error: error.error || 'URL search failed',
+        error: error.error || error.response?.data?.detail || 'URL search failed',
       };
     }
   },

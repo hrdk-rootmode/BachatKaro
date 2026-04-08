@@ -25,7 +25,6 @@ import { Ionicons } from '@expo/vector-icons';
 import {
   fetchProductDetails,
   fetchPriceHistory,
-  refreshProductPrice,
   clearProductDetails,
   clearPriceHistory,
   selectSelectedProduct,
@@ -41,6 +40,8 @@ import {
   getPlatformBadge,
   getProductDisplayData,
   getVariantBadge,
+  parseApiDate,
+  toEpochMs,
 } from '../../utils/formatters';
 import PriceAccuracyDisclaimer from '../../components/PriceAccuracyDisclaimer';
 import FreshnessIndicator from '../../components/FreshnessIndicator';
@@ -130,13 +131,17 @@ const ProductDetailScreen = ({ navigation, route }) => {
 
   // Local state
   const [selectedPlatform, setSelectedPlatform] = useState(null);
-  const [isLiveRefreshing, setIsLiveRefreshing] = useState(false);
   const [similarProducts, setSimilarProducts] = useState([]);
   const [similarLoading, setSimilarLoading] = useState(false);
   const [crossPlatformListings, setCrossPlatformListings] = useState([]);
   const [crossPlatformLoading, setCrossPlatformLoading] = useState(false);
+  const [showPriceHistoryInfo, setShowPriceHistoryInfo] = useState(false);
   const lastHistoryRequestKeyRef = useRef(null);
   const productRequestInFlightRef = useRef(null);
+
+  // Animation values
+  const cardScaleAnim = useRef(new Animated.Value(1)).current;
+  const priceScaleAnim = useRef(new Animated.Value(1)).current;
 
   const isValidDisplayImage = (url) => {
     if (!url || typeof url !== 'string') return false;
@@ -404,7 +409,9 @@ const ProductDetailScreen = ({ navigation, route }) => {
 
   const getFreshnessStatus = (updatedAt) => {
     if (!updatedAt) return 'very_stale';
-    const ageMs = Date.now() - new Date(updatedAt).getTime();
+    const updatedEpoch = toEpochMs(updatedAt);
+    if (!updatedEpoch) return 'very_stale';
+    const ageMs = Date.now() - updatedEpoch;
     const ageHours = ageMs / (1000 * 60 * 60);
     if (ageHours <= 2) return 'fresh';
     if (ageHours <= 12) return 'stale';
@@ -470,110 +477,53 @@ const ProductDetailScreen = ({ navigation, route }) => {
     );
   };
 
-   const handleLiveRefresh = async () => {
-    if (!product?.id || isLiveRefreshing) return;
-
-    try {
-      setIsLiveRefreshing(true);
-      
-      // ✅ FIX 1: Call refresh API
-      const refreshResult = await dispatch(
-        refreshProductPrice({ productId: product.id, platform: selectedPlatform || undefined })
-      ).unwrap();
-
-      const liveRefreshMeta = refreshResult?.stats?.live_refresh || null;
-      const liveUsed = Boolean(liveRefreshMeta?.live_used);
-      const changedCount = Number(liveRefreshMeta?.changed_count || 0);
-      const refreshedCount = Number(liveRefreshMeta?.refreshed_count || 0);
-      const failedPlatforms = Array.isArray(liveRefreshMeta?.failed_platforms)
-        ? liveRefreshMeta.failed_platforms
-        : [];
-      
-      // ✅ FIX 2: Use returned data directly - NO redundant fetchProductDetails
-      // The refresh endpoint already returns full ProductResponse
-      
-      // ✅ FIX 3: Only fetch price history (not full product again)
-      if (selectedPlatform) {
-        lastHistoryRequestKeyRef.current = null;
-        dispatch(clearPriceHistory());
-        dispatch(
-          fetchPriceHistory({
-            productId: refreshResult.id || product.id,
-            platform: selectedPlatform,
-            days: 120,
-          })
-        );
-      }
-      
-      if (liveRefreshMeta && !liveUsed) {
-        const platformHint = failedPlatforms.length > 0
-          ? ` (${failedPlatforms.join(', ')})`
-          : '';
-
-        Alert.alert(
-          'Live Refresh Unavailable',
-          `Could not fetch fresh live prices right now${platformHint}. Showing latest saved prices from database.`,
-          [{ text: 'OK', style: 'default' }]
-        );
-      } else {
-        const summaryText = changedCount > 0
-          ? `Live scraping updated ${refreshedCount || 1} platform(s) and detected ${changedCount} price change(s).`
-          : `Live scraping completed for ${refreshedCount || 1} platform(s). No price change detected.`;
-
-        Alert.alert(
-          'Live Prices Updated',
-          summaryText,
-          [{ text: 'OK', style: 'default' }]
-        );
-      }
-      
-    } catch (err) {
-      const errText = String(err || '');
-      
-      // ✅ FIX 5: Simplified error handling - single path, no nested fallbacks
-      console.error('Live Refresh Error:', errText);
-      
-      // Sync DB snapshot (silently - already done by backend fallback)
-      try {
-        await dispatch(fetchProductDetails({ productId: product.id })).unwrap();
-        
-        // Reload price history
-        if (selectedPlatform) {
-          lastHistoryRequestKeyRef.current = null;
-          dispatch(clearPriceHistory());
-          dispatch(
-            fetchPriceHistory({
-              productId: product.id,
-              platform: selectedPlatform,
-              days: 120,
-            })
-          );
-        }
-      } catch (syncErr) {
-        // Silent - DB sync already happened in backend
-      }
-      
-      // Show user-friendly message
-      Alert.alert(
-        'Refresh Info',
-        'Showing latest database prices. Live scraping may be temporarily unavailable.',
-        [{ text: 'OK', style: 'default' }]
-      );
-      
-    } finally {
-      setIsLiveRefreshing(false);
-    }
+  // Animation functions
+  const animateCard = (callback) => {
+    Animated.sequence([
+      Animated.timing(cardScaleAnim, {
+        toValue: 0.98,
+        duration: 100,
+        useNativeDriver: true,
+      }),
+      Animated.timing(cardScaleAnim, {
+        toValue: 1,
+        duration: 100,
+        useNativeDriver: true,
+      }),
+    ]).start();
+    if (callback) callback();
   };
 
-  const latestListingForSelectedPlatform = Array.isArray(product?.listings)
+  const animatePrice = () => {
+    Animated.sequence([
+      Animated.timing(priceScaleAnim, {
+        toValue: 1.05,
+        duration: 150,
+        useNativeDriver: true,
+      }),
+      Animated.timing(priceScaleAnim, {
+        toValue: 1,
+        duration: 150,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
+   const latestListingForSelectedPlatform = Array.isArray(product?.listings)
     ? product.listings
         .filter((l) => String(l?.platform || '').toLowerCase() === String(selectedPlatform || '').toLowerCase())
-        .sort((a, b) => new Date(b?.last_scraped_at || 0) - new Date(a?.last_scraped_at || 0))[0]
+        .sort((a, b) => toEpochMs(b?.last_scraped_at) - toEpochMs(a?.last_scraped_at))[0]
     : null;
 
   const sanitizedHistory = Array.isArray(priceHistory?.history)
     ? priceHistory.history.filter((p) => Number(p?.price || 0) > 0)
     : [];
+
+  const sortedHistoryAsc = sanitizedHistory
+    .slice()
+    .sort((a, b) => toEpochMs(a?.date) - toEpochMs(b?.date));
+
+  const sortedHistoryDesc = sortedHistoryAsc.slice().reverse();
 
   const fallbackImageFromListings = Array.isArray(product?.listings)
     ? product.listings
@@ -585,8 +535,12 @@ const ProductDetailScreen = ({ navigation, route }) => {
     ? displayData.imageUrl
     : fallbackImageFromListings;
 
-  const latestHistoryPoint = sanitizedHistory.length > 0
-    ? sanitizedHistory[sanitizedHistory.length - 1]
+  const latestHistoryPoint = sortedHistoryAsc.length > 0
+    ? sortedHistoryAsc[sortedHistoryAsc.length - 1]
+    : null;
+
+  const oldestHistoryPoint = sortedHistoryAsc.length > 0
+    ? sortedHistoryAsc[0]
     : null;
 
   const historyRecommendation = String(priceHistory?.recommendation || '').toLowerCase();
@@ -659,7 +613,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
     // Prefer the most recently scraped listing for that platform
     const latestListing = platformListings
       .slice()
-      .sort((a, b) => new Date(b.last_scraped_at || 0) - new Date(a.last_scraped_at || 0))[0];
+      .sort((a, b) => toEpochMs(b?.last_scraped_at) - toEpochMs(a?.last_scraped_at))[0];
 
     return latestListing?.current_price ?? null;
   };
@@ -775,19 +729,24 @@ const ProductDetailScreen = ({ navigation, route }) => {
   };
 
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+    <SafeAreaView style={[styles.container, { backgroundColor: '#F8F9FA' }]}>
+      <ScrollView 
+        showsVerticalScrollIndicator={false} 
+        contentContainerStyle={styles.scrollContent}
+        style={styles.scrollView}
+      >
         {/* Header */}
-        <View style={styles.header}>
+        <View style={styles.proHeader}>
           <TouchableOpacity
-            style={styles.backButton}
+            style={styles.proBackButton}
             onPress={() => navigation.goBack()}
+            activeOpacity={0.8}
           >
             <Ionicons name="arrow-back" size={24} color={COLORS.primary} />
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Product Details</Text>
+          <Text style={styles.proHeaderTitle}>Product Details</Text>
           
-          {/* ✅ NEW: Wishlist Button in Header */}
+          {/* Wishlist Button */}
           {product && productId && (
             <WishlistHeaderButton 
               productId={productId} 
@@ -802,121 +761,208 @@ const ProductDetailScreen = ({ navigation, route }) => {
         </View>
 
         {/* Product Image */}
-        <View style={styles.imageContainer}>
+        <Animated.View style={[styles.proImageContainer, { transform: [{ scale: cardScaleAnim }] }]}>
           {resolvedDisplayImage ? (
             <Image
               source={{ uri: resolvedDisplayImage }}
-              style={styles.productImage}
+              style={styles.proProductImage}
               resizeMode="contain"
             />
           ) : (
-            <View style={styles.imagePlaceholder}>
+            <View style={styles.proImagePlaceholder}>
               <Ionicons name="image-outline" size={64} color={COLORS.gray400} />
             </View>
           )}
+        </Animated.View>
+
+        {/* Product Title */}
+        <View style={styles.proTitleContainer}>
+          <Text style={styles.proProductTitle}>{displayData.title}</Text>
         </View>
 
-        {/* Product Title & Price */}
-        <View style={styles.productSection}>
-          <Text style={styles.productTitle}>{displayData.title}</Text>
-
-        <TouchableOpacity
-          style={[styles.liveRefreshButton, isLiveRefreshing && styles.liveRefreshButtonDisabled]}
-          onPress={handleLiveRefresh}
-          activeOpacity={0.8}
-          disabled={isLiveRefreshing}
-        >
-          {isLiveRefreshing ? (
-            <ActivityIndicator size="small" color={COLORS.white} />
-          ) : (
-            <Ionicons name="refresh" size={16} color={COLORS.white} />
-          )}
-          <Text style={styles.liveRefreshButtonText}>
-            {isLiveRefreshing ? 'Refreshing Live Price...' : 'Refresh Live Price'}
-          </Text>
-        </TouchableOpacity>
-
-        {/* Price Display */}
-        <View style={styles.priceSection}>
-          {(() => {
-            const livePlatformPrice = getSelectedPlatformLivePrice();
-            const historyLatestPrice =
-              sanitizedHistory.length > 0
-                ? sanitizedHistory[sanitizedHistory.length - 1].price
-                : null;
-            const resolvedPrice = livePlatformPrice ?? historyLatestPrice ?? product?.best_price ?? 0;
-            const selectedListingOriginal = Number(latestListingForSelectedPlatform?.original_price || 0) > Number(resolvedPrice || 0)
-              ? latestListingForSelectedPlatform?.original_price
-              : null;
-            const selectedListingDiscount = selectedListingOriginal
-              ? Math.round(((selectedListingOriginal - resolvedPrice) / selectedListingOriginal) * 100)
-              : 0;
-
-            return (
-              <>
-                <Text style={styles.bestPrice}>
-                  {formatPrice(resolvedPrice)}
+        {/* Professional Price Section */}
+        <View style={styles.proPriceContainer}>
+          {/* Price Header */}
+          <View style={styles.priceHeaderRow}>
+            <View style={styles.priceInfo}>
+              <Text style={styles.priceLabel}>Current Price</Text>
+              <View style={styles.priceRow}>
+                <Text style={styles.currentPrice}>
+                  {(() => {
+                    const livePlatformPrice = getSelectedPlatformLivePrice();
+                    const historyLatestPrice = latestHistoryPoint ? latestHistoryPoint.price : null;
+                    const resolvedPrice = livePlatformPrice ?? historyLatestPrice ?? product?.best_price ?? 0;
+                    return formatPrice(resolvedPrice);
+                  })()}
                 </Text>
-                {selectedListingOriginal && (
-                  <Text style={styles.originalPrice}>
-                    {formatPrice(selectedListingOriginal)}
-                  </Text>
-                )}
-                {selectedListingDiscount > 0 && (
-                  <View style={styles.discountBadgeLarge}>
-                    <Text style={styles.discountBadgeText}>
-                      {selectedListingDiscount}% OFF
+                {(() => {
+                  const selectedListingOriginal = Number(latestListingForSelectedPlatform?.original_price || 0);
+                  const currentPrice = getSelectedPlatformLivePrice() ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
+                  if (selectedListingOriginal > currentPrice) {
+                    const discountPercent = Math.round(((selectedListingOriginal - currentPrice) / selectedListingOriginal) * 100);
+                    return (
+                      <View style={styles.discountChip}>
+                        <Text style={styles.discountChipText}>-{discountPercent}%</Text>
+                      </View>
+                    );
+                  }
+                  return null;
+                })()}
+              </View>
+            </View>
+            
+            {/* Price Change Indicator */}
+            <View style={styles.priceChangeContainer}>
+              {(() => {
+                if (sortedHistoryAsc.length < 2) {
+                  return (
+                    <View style={[styles.priceChangeIndicator, styles.priceChangeNeutral]}>
+                      <Ionicons name="remove" size={12} color={COLORS.gray500} />
+                      <Text style={styles.priceChangeTextNeutral}>No history</Text>
+                    </View>
+                  );
+                }
+
+                const latestPrice = latestHistoryPoint?.price || 0;
+                const previousPrice = sortedHistoryAsc[sortedHistoryAsc.length - 2]?.price || 0;
+                const priceChange = latestPrice - previousPrice;
+                const priceChangePercent = previousPrice > 0 ? (priceChange / previousPrice) * 100 : 0;
+
+                if (Math.abs(priceChangePercent) < 0.5) {
+                  return (
+                    <View style={[styles.priceChangeIndicator, styles.priceChangeNeutral]}>
+                      <Ionicons name="remove" size={12} color={COLORS.gray500} />
+                      <Text style={styles.priceChangeTextNeutral}>Stable</Text>
+                    </View>
+                  );
+                }
+
+                const isIncrease = priceChange > 0;
+                return (
+                  <View style={[
+                    styles.priceChangeIndicator, 
+                    isIncrease ? styles.priceChangeUp : styles.priceChangeDown
+                  ]}>
+                    <Ionicons 
+                      name={isIncrease ? "trending-up" : "trending-down"} 
+                      size={12} 
+                      color={isIncrease ? COLORS.error : COLORS.success} 
+                    />
+                    <Text style={[
+                      styles.priceChangeText,
+                      isIncrease ? styles.priceChangeTextUp : styles.priceChangeTextDown
+                    ]}>
+                      {isIncrease ? '+' : ''}{Math.abs(priceChangePercent).toFixed(1)}%
                     </Text>
                   </View>
-                )}
-              </>
-            );
+                );
+              })()}
+            </View>
+          </View>
+
+          {/* Price Summary */}
+          <View style={styles.priceSummaryRow}>
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryLabel}>Lowest</Text>
+              <Text style={styles.summaryValue}>
+                {(() => {
+                  const validListings = product?.listings?.filter(l => l && l.current_price) || [];
+                  if (validListings.length === 0) return 'N/A';
+                  const lowest = Math.min(...validListings.map(l => l.current_price));
+                  return formatPrice(lowest);
+                })()}
+              </Text>
+            </View>
+            
+            <View style={styles.summaryDivider} />
+            
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryLabel}>Highest</Text>
+              <Text style={styles.summaryValue}>
+                {(() => {
+                  const validListings = product?.listings?.filter(l => l && l.current_price) || [];
+                  if (validListings.length === 0) return 'N/A';
+                  const highest = Math.max(...validListings.map(l => l.current_price));
+                  return formatPrice(highest);
+                })()}
+              </Text>
+            </View>
+            
+            <View style={styles.summaryDivider} />
+            
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryLabel}>Updated</Text>
+              <Text style={styles.summaryValue}>
+                {(() => {
+                  const latestPoint = latestHistoryPoint;
+                  const latestListing = Array.isArray(product?.listings) 
+                    ? product.listings
+                        .filter(l => l && l.last_scraped_at)
+                        .sort((a, b) => toEpochMs(b.last_scraped_at) - toEpochMs(a.last_scraped_at))[0]
+                    : null;
+                  
+                  const updateTime = latestPoint?.date || latestListing?.last_scraped_at;
+                  if (!updateTime) return 'N/A';
+                  
+                  const date = parseApiDate(updateTime);
+                  if (!date) return 'N/A';
+                  
+                  const today = new Date();
+                  const diffMs = today - date;
+                  const diffMins = Math.floor(diffMs / 60000);
+                  const diffHours = Math.floor(diffMins / 60);
+                  const diffDays = Math.floor(diffHours / 24);
+                  
+                  if (diffMins < 1) return 'Just now';
+                  if (diffMins < 60) return `${diffMins} min${diffMins > 1 ? 's' : ''} ago`;
+                  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+                  if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+                  
+                  return date.toLocaleDateString('en-IN', { 
+                    month: 'short', 
+                    day: 'numeric',
+                    year: date.getFullYear() !== today.getFullYear() ? 'numeric' : undefined
+                  });
+                })()}
+              </Text>
+            </View>
+          </View>
+
+          {/* Original Price */}
+          {(() => {
+            const selectedListingOriginal = Number(latestListingForSelectedPlatform?.original_price || 0);
+            const currentPrice = getSelectedPlatformLivePrice() ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
+            if (selectedListingOriginal > currentPrice) {
+              return (
+                <View style={styles.originalPriceContainer}>
+                  <Text style={styles.originalPriceLabel}>Original Price</Text>
+                  <Text style={styles.originalPriceValue}>{formatPrice(selectedListingOriginal)}</Text>
+                  <View style={styles.savingsBadge}>
+                    <Text style={styles.savingsText}>
+                      Save {Math.round(((selectedListingOriginal - currentPrice) / selectedListingOriginal) * 100)}%
+                    </Text>
+                  </View>
+                </View>
+              );
+            }
+            return null;
           })()}
-          {/* ✅ NEW: Show when price was last updated */}
-{sanitizedHistory.length >= 2 && (
-  <View style={styles.priceUpdateInfo}>
-    <Ionicons name="time-outline" size={12} color={COLORS.gray500} />
-    <Text style={styles.priceUpdateText}>
-      Price changed {(() => {
-        const latestPoint = sanitizedHistory[sanitizedHistory.length - 1];
-        const date = new Date(latestPoint.date);
-        const today = new Date();
-        const diffMs = today - date;
-        const diffMins = Math.floor(diffMs / 60000);
-        const diffHours = Math.floor(diffMins / 60);
-        const diffDays = Math.floor(diffHours / 24);
-        
-        if (diffMins < 60) return `${diffMins} mins ago`;
-        if (diffHours < 24) return `${diffHours}h ago`;
-        if (diffDays < 7) return `${diffDays}d ago`;
-        return date.toLocaleDateString('en-IN');
-      })()}
-    </Text>
-  </View>
-)}
-{sanitizedHistory.length === 1 && (
-  <View style={styles.priceUpdateInfo}>
-    <Ionicons name="time-outline" size={12} color={COLORS.success} />
-    <Text style={styles.priceUpdateText}>
-      First price recorded {formatShortDate(sanitizedHistory[0].date)}
-    </Text>
-  </View>
-)}
         </View>
 
-          {/* ✅ NEW: Price Accuracy Disclaimer */}
+        <View style={styles.productSection}>
+          {/* Price Accuracy Disclaimer */}
           <PriceAccuracyDisclaimer 
             lastUpdatedAt={latestKnownUpdateAt}
             freshness_status={freshnessStatus}
           />
 
-          {/* ✅ NEW: Freshness Indicator */}
+          {/* Freshness Indicator */}
           <FreshnessIndicator 
             freshness_status={freshnessStatus}
             lastUpdatedAt={latestKnownUpdateAt}
           />
 
-          {/* ✅ NEW: Price Comparison Table */}
+          {/* Price Comparison Table */}
           {Array.isArray(product?.listings) && product.listings.length > 0 && (
             <View style={{ marginVertical: 12 }}>
               <PriceComparisonTable
@@ -959,120 +1005,183 @@ const ProductDetailScreen = ({ navigation, route }) => {
         {(displayData.variant_type || displayData.storage_gb || displayData.color || displayData.condition) && (
           <View style={styles.variantSection}>
             <Text style={styles.sectionTitle}>Variant Details</Text>
-            
-            {/* Variant Type Badge */}
-            {displayData.variant_type && (
-              <View style={styles.variantTypeContainer}>
-                <View 
-                  style={[
-                    styles.variantTypeBadge,
-                    { backgroundColor: getVariantBadge(displayData.variant_type).color }
-                  ]}
-                >
-                  <Text style={styles.variantTypeText}>
-                    {getVariantBadge(displayData.variant_type).label}
+            <View style={styles.variantInfoContainer}>
+              {displayData.variant_type && (
+                <View style={styles.variantInfo}>
+                  <Text style={styles.variantLabel}>Type</Text>
+                  <Text style={styles.variantValue}>{displayData.variant_type}</Text>
+                </View>
+              )}
+              {displayData.storage_gb && (
+                <View style={styles.variantInfo}>
+                  <Text style={styles.variantLabel}>Storage</Text>
+                  <Text style={styles.variantValue}>{displayData.storage_gb}GB</Text>
+                </View>
+              )}
+              {displayData.color && (
+                <View style={styles.variantInfo}>
+                  <Text style={styles.variantLabel}>Color</Text>
+                  <Text style={styles.variantValue}>{displayData.color}</Text>
+                </View>
+              )}
+              {displayData.condition && (
+                <View style={styles.variantInfo}>
+                  <Text style={styles.variantLabel}>Condition</Text>
+                  <Text style={styles.variantValue}>{displayData.condition}</Text>
+                </View>
+              )}
+            </View>
+          </View>
+        )}
+
+        {/* Professional Specifications Section - Only show non-null values */}
+        {(() => {
+          const filteredSpecs = Object.entries(displayData.specs || {})
+            .filter(([_, value]) => value != null && value !== undefined && value !== '' && String(value).trim() !== '');
+          
+          return filteredSpecs.length > 0 && (
+            <View style={styles.proSpecsContainer}>
+              <View style={styles.proSpecsHeader}>
+                <Text style={styles.proSpecsTitle}>Specifications</Text>
+                <View style={styles.proSpecsCountBadge}>
+                  <Text style={styles.proSpecsCountText}>
+                    {filteredSpecs.length}
                   </Text>
                 </View>
               </View>
-            )}
-            
-            {/* Variant Specs Grid */}
-            {(displayData.storage_gb || displayData.color || displayData.condition) && (
-              <View style={styles.variantSpecsGrid}>
-                {displayData.storage_gb && (
-                  <View style={styles.variantSpecItem}>
-                    <Text style={styles.variantSpecLabel}>Storage</Text>
-                    <Text style={styles.variantSpecValue}>{displayData.storage_gb}GB</Text>
+              
+              <View style={styles.proSpecsGrid}>
+                {filteredSpecs.map(([key, value]) => (
+                  <View key={`spec-${key}`} style={styles.proSpecCard}>
+                    <Text style={styles.proSpecLabel}>
+                      {key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                    </Text>
+                    <Text style={styles.proSpecValue}>{String(value)}</Text>
                   </View>
-                )}
-                {displayData.color && (
-                  <View style={styles.variantSpecItem}>
-                    <Text style={styles.variantSpecLabel}>Color</Text>
-                    <Text style={styles.variantSpecValue}>{displayData.color}</Text>
-                  </View>
-                )}
-                {displayData.condition && (
-                  <View style={styles.variantSpecItem}>
-                    <Text style={styles.variantSpecLabel}>Condition</Text>
-                    <Text style={styles.variantSpecValue}>{displayData.condition}</Text>
-                  </View>
-                )}
+                ))}
               </View>
-            )}
-            
-            {/* Variant Fingerprints for Advanced Users */}
-            {displayData.variant_fingerprint && (
-              <View style={styles.fingerprintInfo}>
-                <Text style={styles.fingerprintLabel}>Variant ID</Text>
-                <Text style={styles.fingerprintValue} numberOfLines={1}>
-                  {displayData.variant_fingerprint}
-                </Text>
-              </View>
-            )}
-          </View>
-        )}
+            </View>
+          );
+        })()}
 
-        {/* Specifications */}
-        {Object.keys(displayData.specs).length > 0 && (
-          <View style={styles.specsSection}>
-            <Text style={styles.sectionTitle}>Specifications</Text>
-            {Object.entries(displayData.specs).filter(([_, value]) => value != null && value !== undefined)
-            .map(([key, value], index) => (
-              <View key={`spec-${key}`} style={styles.specItem}>
-                <Text style={styles.specLabel}>
-                  {key.replace(/_/g, ' ')}
-                </Text>
-                <Text style={styles.specValue}>{String(value)}</Text>
-              </View>
-            ))}
-          </View>
-        )}
-
-        {/* Platform Selector */}
-        <View style={styles.platformSection}>
-          <View style={styles.platformHeaderRow}>
-            <Text style={styles.sectionTitle}>Available Platforms</Text>
-            {Array.isArray(product?.listings) && product.listings.length > 0 && (
-              <View style={styles.platformCountBadge}>
-                <Text style={styles.platformCountText}>
+        {/* Professional Platform Comparison Section - Only show when 2+ platforms available */}
+        {Array.isArray(product?.listings) && product.listings.length > 1 && (
+          <View style={styles.proPlatformContainer}>
+            <View style={styles.proPlatformHeader}>
+              <Text style={styles.proPlatformTitle}>Compare Prices</Text>
+              <View style={styles.proPlatformBadge}>
+                <Text style={styles.proPlatformBadgeText}>
                   {product.listings.length} Platform{product.listings.length !== 1 ? 's' : ''}
                 </Text>
               </View>
-            )}
-          </View>
-          {Array.isArray(product?.listings) && product.listings.length > 0 ? (
-            <FlatList
-              data={product.listings.filter(item => item && item.id)} // 🛡️ Filter out invalid items
-              renderItem={({ item }) => {
-                const badge = getPlatformBadge(item.platform || 'amazon');
-                const isSelected = item.platform === selectedPlatform;
+            </View>
 
-                return (
-                  <TouchableOpacity
-                    style={[
-                      styles.platformSelector,
-                      isSelected && styles.platformSelectorSelected,
-                    ]}
-                    onPress={() => setSelectedPlatform(item.platform)}
-                  >
-                    <Text
+            <View style={styles.proPlatformGrid}>
+              {product.listings
+                .filter(item => item && item.id)
+                .sort((a, b) => (a.current_price || 0) - (b.current_price || 0))
+                .map((item, index) => {
+                  const badge = getPlatformBadge(item.platform || 'amazon');
+                  const isSelected = item.platform === selectedPlatform;
+                  const isCheapest = index === 0; // First item after sorting by price
+                  
+                  return (
+                    <TouchableOpacity
+                      key={`platform-${item.id}`}
                       style={[
-                        styles.platformSelectorText,
-                        isSelected && styles.platformSelectorTextSelected,
+                        styles.proPlatformCard,
+                        isSelected && styles.proPlatformCardSelected,
+                        isCheapest && styles.proPlatformCardCheapest
                       ]}
+                      onPress={() => setSelectedPlatform(item.platform)}
+                      activeOpacity={0.8}
                     >
-                      {badge.icon} {badge.name}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              }}
-              keyExtractor={(item, index) => `listing-platform-${item?.id || `index-${index}`}`}
-              scrollEnabled={false}
-            />
-          ) : (
-            <Text style={{ color: COLORS.textSecondary }}>No listings available</Text>
-          )}
-        </View>
+                      {/* Best Deal Badge */}
+                      {isCheapest && (
+                        <View style={styles.bestDealBadge}>
+                          <Text style={styles.bestDealText}>BEST DEAL</Text>
+                        </View>
+                      )}
+                      
+                      {/* Platform Info */}
+                      <View style={styles.proPlatformInfo}>
+                        <View style={[styles.proPlatformIcon, { backgroundColor: badge.color }]}>
+                          <Text style={styles.proPlatformIconText}>{badge.icon}</Text>
+                        </View>
+                        <Text style={styles.proPlatformName}>{badge.name}</Text>
+                      </View>
+                      
+                      {/* Price */}
+                      <View style={styles.proPlatformPriceSection}>
+                        <Text style={styles.proPlatformPrice}>
+                          {formatPrice(item.current_price)}
+                        </Text>
+                        {item.original_price && item.original_price > item.current_price && (
+                          <Text style={styles.proPlatformOriginalPrice}>
+                            {formatPrice(item.original_price)}
+                          </Text>
+                        )}
+                      </View>
+                      
+                      {/* Discount */}
+                      {item.discount_percentage > 0 && (
+                        <View style={styles.proPlatformDiscount}>
+                          <Text style={styles.proPlatformDiscountText}>
+                            -{Math.round(item.discount_percentage)}%
+                          </Text>
+                        </View>
+                      )}
+                      
+                      {/* Stock Status */}
+                      <View style={[
+                        styles.proPlatformStock,
+                        { borderColor: item.in_stock ? COLORS.success : COLORS.error }
+                      ]}>
+                        <Text style={[
+                          styles.proPlatformStockText,
+                          { color: item.in_stock ? COLORS.success : COLORS.error }
+                        ]}>
+                          {item.in_stock ? 'In Stock' : 'Out of Stock'}
+                        </Text>
+                      </View>
+                      
+                      {/* Rating */}
+                      {item.rating !== null && item.rating !== undefined && (
+                        <View style={styles.proPlatformRating}>
+                          <Ionicons name="star" size={12} color="#FFC107" />
+                          <Text style={styles.proPlatformRatingText}>
+                            {typeof item.rating === 'number' ? item.rating.toFixed(1) : item.rating}
+                          </Text>
+                        </View>
+                      )}
+                      
+                      {/* Action Button */}
+                      <TouchableOpacity
+                        style={[
+                          styles.proPlatformAction,
+                          { backgroundColor: isSelected ? COLORS.primary : COLORS.gray100 }
+                        ]}
+                        onPress={() => handleOpenUrl(item.product_url || item.url)}
+                        activeOpacity={0.8}
+                      >
+                        <Ionicons 
+                          name="open-outline" 
+                          size={16} 
+                          color={isSelected ? COLORS.white : COLORS.gray600} 
+                        />
+                        <Text style={[
+                          styles.proPlatformActionText,
+                          { color: isSelected ? COLORS.white : COLORS.gray600 }
+                        ]}>
+                          {isSelected ? 'Selected' : 'View Deal'}
+                        </Text>
+                      </TouchableOpacity>
+                    </TouchableOpacity>
+                  );
+                })}
+            </View>
+          </View>
+        )}
 
         {/* Price Comparison */}
         <View style={styles.comparisonSection}>
@@ -1195,43 +1304,91 @@ const ProductDetailScreen = ({ navigation, route }) => {
           )}
         </View>
 
-        {/* Price History Chart */}
-        <View style={styles.chartSection}>
-          <View style={styles.chartHeader}>
-            <Text style={styles.sectionTitle}>Price History (120 Days)</Text>
-            {priceHistory && selectedPlatform && (
-              <Text style={styles.platformPriceInfo}>
-                {getPlatformBadge(selectedPlatform).name}
-              </Text>
-            )}
+        {/* Professional Price History Section */}
+        <View style={styles.proPriceHistoryContainer}>
+          <View style={styles.proPriceHistoryHeader}>
+            <Text style={styles.proPriceHistoryTitle}>Price History</Text>
+            <View style={styles.proPriceHistoryHeaderRight}>
+              {priceHistory && selectedPlatform && (
+                <Text style={styles.proPlatformInfo}>
+                  {getPlatformBadge(selectedPlatform).name}
+                </Text>
+              )}
+              <TouchableOpacity
+                style={styles.proInfoIcon}
+                onPress={() => setShowPriceHistoryInfo(!showPriceHistoryInfo)}
+                activeOpacity={0.8}
+              >
+                <Ionicons 
+                  name="information-circle" 
+                  size={20} 
+                  color={showPriceHistoryInfo ? COLORS.primary : COLORS.gray600} 
+                />
+              </TouchableOpacity>
+            </View>
           </View>
-          
+
+          {/* Collapsible Info Section */}
+          {showPriceHistoryInfo && (
+            <Animated.View style={styles.proInfoSection}>
+              <View style={styles.proInfoContent}>
+                <Text style={styles.proInfoTitle}>About Price Analysis</Text>
+                <Text style={styles.proInfoText}>
+                  Our price predictions are based on mathematical analysis of historical price data over the last 120 days. 
+                  We use statistical models to identify trends and patterns, providing insights on potential price movements.
+                </Text>
+                <View style={styles.proInfoGrid}>
+                  <View style={styles.proInfoItem}>
+                    <Text style={styles.proInfoLabel}>Data Points</Text>
+                    <Text style={styles.proInfoValue}>{dataPointsCount}</Text>
+                  </View>
+                  <View style={styles.proInfoItem}>
+                    <Text style={styles.proInfoLabel}>Analysis Period</Text>
+                    <Text style={styles.proInfoValue}>{historySpanDays} days</Text>
+                  </View>
+                  <View style={styles.proInfoItem}>
+                    <Text style={styles.proInfoLabel}>Confidence</Text>
+                    <Text style={styles.proInfoValue}>{Math.round(confidenceScore)}%</Text>
+                  </View>
+                </View>
+                {insightBasis.length > 0 && (
+                  <View style={styles.proInsightSection}>
+                    <Text style={styles.proInsightTitle}>Analysis Based On:</Text>
+                    <Text style={styles.proInsightText}>
+                      {insightBasis.join(' | ')}
+                    </Text>
+                  </View>
+                )}
+              </View>
+            </Animated.View>
+          )}
+
           {priceHistoryStatus === 'loading' && (
-            <View style={styles.chartLoading}>
+            <View style={styles.proLoadingContainer}>
               <ActivityIndicator color={COLORS.primary} />
-              <Text style={{ marginTop: 8, color: COLORS.textSecondary }}>Loading price history...</Text>
+              <Text style={styles.proLoadingText}>Analyzing price history...</Text>
             </View>
           )}
           
           {sanitizedHistory.length > 0 ? (
-            <View style={styles.priceHistoryCard}>
-              {/* Price Stats Grid */}
-              <View style={styles.priceStatsGrid}>
-                <View style={styles.priceStatItem}>
-                  <Text style={styles.priceStatLabel}>Lowest Price</Text>
-                  <Text style={styles.priceStatValue}>
+            <View style={styles.proPriceHistoryContent}>
+              {/* Price Stats Cards */}
+              <View style={styles.proPriceStatsContainer}>
+                <View style={styles.proPriceStatCard}>
+                  <Text style={styles.proPriceStatLabel}>Lowest</Text>
+                  <Text style={styles.proPriceStatValue}>
                     {formatPrice(Math.min(...sanitizedHistory.map((p) => Number(p.price || 0))))}
                   </Text>
                 </View>
-                <View style={styles.priceStatItem}>
-                  <Text style={styles.priceStatLabel}>Highest Price</Text>
-                  <Text style={styles.priceStatValue}>
+                <View style={styles.proPriceStatCard}>
+                  <Text style={styles.proPriceStatLabel}>Highest</Text>
+                  <Text style={styles.proPriceStatValue}>
                     {formatPrice(Math.max(...sanitizedHistory.map((p) => Number(p.price || 0))))}
                   </Text>
                 </View>
-                <View style={styles.priceStatItem}>
-                  <Text style={styles.priceStatLabel}>Average Price</Text>
-                  <Text style={styles.priceStatValue}>
+                <View style={styles.proPriceStatCard}>
+                  <Text style={styles.proPriceStatLabel}>Average</Text>
+                  <Text style={styles.proPriceStatValue}>
                     {formatPrice(
                       sanitizedHistory.reduce((sum, p) => sum + Number(p.price || 0), 0) /
                       sanitizedHistory.length
@@ -1240,130 +1397,88 @@ const ProductDetailScreen = ({ navigation, route }) => {
                 </View>
               </View>
               
-              {/* Price Trend */}
-              {priceHistory.price_drop_percentage && (
-                <View style={styles.priceTrendBox}>
-                  <Ionicons 
-                    name={parseFloat(priceHistory.price_drop_percentage) > 0 ? "arrow-down" : "arrow-up"} 
-                    size={20} 
-                    color={parseFloat(priceHistory.price_drop_percentage) > 0 ? COLORS.success : COLORS.error} 
-                  />
-                  <Text style={[
-                    styles.priceTrendText,
-                    { color: parseFloat(priceHistory.price_drop_percentage) > 0 ? COLORS.success : COLORS.error }
-                  ]}>
-                    {parseFloat(priceHistory.price_drop_percentage) > 0 ? 'Dropped' : 'Increased'} {Math.abs(priceHistory.price_drop_percentage)}% in last 120 days
-                  </Text>
-                </View>
-              )}
-
-              {(priceHistory?.recommendation || hasObservedWeeklyChange || predictionAvailable || recommendationReasons.length > 0 || priceHistory?.upcoming_sale_event) && (
-                <View style={styles.recommendationCard}>
-                  <View style={styles.recommendationHeader}>
-                    <View style={styles.recommendationTitleWrap}>
+              {/* Professional Price Prediction */}
+              {(priceHistory?.recommendation || hasObservedWeeklyChange || predictionAvailable) && (
+                <View style={styles.proPredictionCard}>
+                  <View style={styles.proPredictionHeader}>
+                    <View style={styles.proPredictionTitleRow}>
                       <Ionicons
                         name={recommendationConfig.icon}
                         size={18}
                         color={recommendationConfig.color}
                       />
-                      <Text style={[styles.recommendationTitle, { color: recommendationConfig.color }]}>
+                      <Text style={[styles.proPredictionTitle, { color: recommendationConfig.color }]}>
                         {recommendationConfig.label}
                       </Text>
                     </View>
                     {predictionAvailable && confidenceScore > 0 && (
-                      <View style={styles.confidenceBadge}>
-                        <Text style={styles.confidenceText}>{Math.round(confidenceScore)}% confidence</Text>
+                      <View style={styles.proConfidenceBadge}>
+                        <Text style={styles.proConfidenceText}>{Math.round(confidenceScore)}% confidence</Text>
                       </View>
                     )}
                   </View>
 
-                  <View style={styles.predictionGrid}>
-                    <View style={styles.predictionItem}>
-                      <Text style={styles.predictionLabel}>History Coverage</Text>
-                      <Text style={styles.predictionValue}>{dataPointsCount} points / {historySpanDays} days</Text>
-                    </View>
-                    <View style={styles.predictionItem}>
-                      <Text style={styles.predictionLabel}>Last 7 Days (Observed)</Text>
-                      {hasObservedWeeklyChange ? (
-                        <>
-                          <Text
-                            style={[
-                              styles.predictionValue,
-                              { color: observedChange7d <= 0 ? COLORS.success : COLORS.error },
-                            ]}
-                          >
-                            {observedChange7d <= 0
-                              ? `${Math.abs(observedChange7d).toFixed(1)}% down`
-                              : `${observedChange7d.toFixed(1)}% up`}
+                  <View style={styles.proPredictionContent}>
+                    {hasObservedWeeklyChange ? (
+                      <View style={styles.proTrendItem}>
+                        <Text style={styles.proTrendLabel}>Recent Trend (7 days)</Text>
+                        <Text style={[
+                          styles.proTrendValue,
+                          { color: observedChange7d <= 0 ? COLORS.success : COLORS.error }
+                        ]}>
+                          {observedChange7d <= 0
+                            ? `${Math.abs(observedChange7d).toFixed(1)}% decrease`
+                            : `${observedChange7d.toFixed(1)}% increase`}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.proInsufficientText}>Insufficient recent data for trend analysis</Text>
+                    )}
+
+                    {predictionAvailable && hasPredictedChange7d ? (
+                      <View style={styles.proForecastItem}>
+                        <Text style={styles.proForecastLabel}>7-Day Forecast</Text>
+                        <Text style={[
+                          styles.proForecastValue,
+                          { color: predictedChange7d <= 0 ? COLORS.success : COLORS.error }
+                        ]}>
+                          {predictedChange7d <= -0.5
+                            ? `Expected drop: ${Math.abs(predictedChange7d).toFixed(1)}%`
+                            : predictedChange7d >= 0.5
+                              ? `Expected rise: ${predictedChange7d.toFixed(1)}%`
+                              : 'Expected stable pricing'}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.proInsufficientText}>
+                        Forecast available when sufficient data is collected
+                      </Text>
+                    )}
+
+                    {recommendationReasons.length > 0 && (
+                      <View style={styles.proReasonsSection}>
+                        <Text style={styles.proReasonsTitle}>Key Factors:</Text>
+                        {recommendationReasons.map((reason, idx) => (
+                          <Text key={`reason-${idx}`} style={styles.proReasonText}>
+                            {reason}
                           </Text>
-                          {hasObservedDropAmount && observedDropAmount7d > 0 && (
-                            <Text style={styles.predictionSubText}>Drop: {formatPrice(observedDropAmount7d)}</Text>
-                          )}
-                        </>
-                      ) : (
-                        <Text style={styles.predictionSubText}>Not enough recent points</Text>
-                      )}
-                    </View>
+                        ))}
+                      </View>
+                    )}
                   </View>
-
-                  {predictionAvailable && hasPredictedChange7d ? (
-                    <Text
-                      style={[
-                        styles.predictionDelta,
-                        { color: predictedChange7d <= 0 ? COLORS.success : COLORS.error },
-                      ]}
-                    >
-                      Next 7-day trend signal: {predictedChange7d <= -0.5
-                        ? `likely drop around ${Math.abs(predictedChange7d).toFixed(1)}%`
-                        : predictedChange7d >= 0.5
-                          ? `likely rise around ${predictedChange7d.toFixed(1)}%`
-                          : 'likely flat movement'}
-                    </Text>
-                  ) : (
-                    <Text style={styles.insufficientDataText}>
-                      Honest mode: forecast is hidden until enough history is available.
-                    </Text>
-                  )}
-
-                  {priceHistory?.upcoming_sale_event && (
-                    <Text style={styles.saleEventHint}>
-                      Upcoming: {priceHistory.upcoming_sale_event}
-                      {priceHistory?.days_until_sale_event !== null && priceHistory?.days_until_sale_event !== undefined
-                        ? ` (${priceHistory.days_until_sale_event} day${Number(priceHistory.days_until_sale_event) === 1 ? '' : 's'})`
-                        : ''}
-                    </Text>
-                  )}
-
-                  {recommendationReasons.map((reason, idx) => (
-                    <Text key={`reason-${idx}`} style={styles.recommendationReason}>
-                      - {reason}
-                    </Text>
-                  ))}
-
-                  {insightBasis.length > 0 && (
-                    <Text style={styles.honestyNote}>
-                      Based on: {insightBasis.join(' | ')}
-                    </Text>
-                  )}
                 </View>
               )}
 
-              {/* Recent timeline */}
-              <View style={styles.debugTimelineContainer}>
-                <View style={styles.debugTimelineHeader}>
-                  <Text style={styles.debugTimelineTitle}>Recent Price Updates</Text>
-                  <Text style={styles.debugTimelineSubtitle}>Newest first</Text>
-                </View>
-
-                {sanitizedHistory
-                  .slice()
-                  .sort((a, b) => new Date(b.date) - new Date(a.date))
-                  .slice(0, 8)
-                  .map((point, idx) => {
-                    const pointDate = new Date(point.date);
+              {/* Recent Price Updates - Simplified List */}
+              <View style={styles.proRecentUpdatesContainer}>
+                <Text style={styles.proRecentUpdatesTitle}>Recent Updates</Text>
+                <View style={styles.proRecentUpdatesList}>
+                  {sortedHistoryDesc.slice(0, 5).map((point, idx) => {
+                    const pointDate = parseApiDate(point?.date);
+                    if (!pointDate) return null;
                     return (
-                      <View key={`ph-${idx}-${point.date}`} style={styles.debugTimelineRow}>
-                        <Text style={styles.debugTimelineTime}>
+                      <View key={`ph-${idx}`} style={styles.proRecentUpdateItem}>
+                        <Text style={styles.proRecentUpdateTime}>
                           {pointDate.toLocaleString('en-IN', {
                             month: 'short',
                             day: '2-digit',
@@ -1372,15 +1487,17 @@ const ProductDetailScreen = ({ navigation, route }) => {
                             hour12: true,
                           })}
                         </Text>
-                        <Text style={styles.debugTimelinePrice}>{formatPrice(point.price)}</Text>
+                        <Text style={styles.proRecentUpdatePrice}>{formatPrice(point.price)}</Text>
                       </View>
                     );
                   })}
+                </View>
               </View>
             </View>
           ) : priceHistoryStatus !== 'loading' && (
-            <View style={styles.noPriceHistory}>
-              <Text style={{ color: COLORS.textSecondary }}>
+            <View style={styles.proNoDataContainer}>
+              <Ionicons name="analytics-outline" size={48} color={COLORS.gray400} />
+              <Text style={styles.proNoDataText}>
                 No price history available for this product on {getPlatformBadge(selectedPlatform || 'amazon').name}
               </Text>
             </View>
@@ -1594,30 +1711,716 @@ const styles = StyleSheet.create({
     lineHeight: 30,
   },
 
-  liveRefreshButton: {
+  priceSection: {
+    marginBottom: 10,
+  },
+
+  // Professional Price Section Styles
+  proPriceContainer: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  priceHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 16,
+  },
+  priceInfo: {
+    flex: 1,
+  },
+  priceLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  priceRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 12,
+  },
+  currentPrice: {
+    fontSize: 32,
+    fontWeight: '800',
+    color: COLORS.textPrimary,
+    letterSpacing: -0.5,
+  },
+  discountChip: {
+    backgroundColor: COLORS.success,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: COLORS.primary,
+  },
+  discountChipText: {
+    color: COLORS.white,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  priceChangeContainer: {
+    alignItems: 'flex-end',
+  },
+  priceChangeIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    gap: 4,
+  },
+  priceChangeUp: {
+    backgroundColor: '#FEE2E2',
+  },
+  priceChangeDown: {
+    backgroundColor: '#D1FAE5',
+  },
+  priceChangeNeutral: {
+    backgroundColor: '#F3F4F6',
+  },
+  priceChangeText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  priceChangeTextUp: {
+    color: COLORS.error,
+  },
+  priceChangeTextDown: {
+    color: COLORS.success,
+  },
+  priceChangeTextNeutral: {
+    color: COLORS.gray600,
+  },
+  priceSummaryRow: {
+    flexDirection: 'row',
+    backgroundColor: '#F8F9FA',
     borderRadius: 12,
-    paddingVertical: 11,
-    paddingHorizontal: 14,
-    marginBottom: 14,
-    gap: 8,
+    padding: 16,
+    gap: 16,
   },
-
-  liveRefreshButtonDisabled: {
-    opacity: 0.8,
+  summaryItem: {
+    flex: 1,
+    alignItems: 'center',
   },
-
-  liveRefreshButtonText: {
+  summaryLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 4,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  summaryValue: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  summaryDivider: {
+    width: 1,
+    backgroundColor: COLORS.gray200,
+  },
+  originalPriceContainer: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 16,
+    marginTop: 12,
+    alignItems: 'center',
+  },
+  originalPriceLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 8,
+  },
+  originalPriceValue: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.gray500,
+    textDecorationLine: 'line-through',
+    marginBottom: 8,
+  },
+  savingsBadge: {
+    backgroundColor: COLORS.success,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  savingsText: {
     color: COLORS.white,
     fontSize: 14,
     fontWeight: '700',
   },
 
-  priceSection: {
-    marginBottom: 10,
+  // Professional Specifications Styles
+  proSpecsContainer: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  proSpecsHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  proSpecsTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proSpecsCountBadge: {
+    backgroundColor: COLORS.primary,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  proSpecsCountText: {
+    color: COLORS.white,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  proSpecsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  proSpecCard: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 14,
+    minWidth: '45%',
+    flex: 1,
+    maxWidth: '48%',
+  },
+  proSpecLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 6,
+    textTransform: 'capitalize',
+  },
+  proSpecValue: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+  },
+
+  // Professional Platform Comparison Styles
+  proPlatformContainer: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  proPlatformHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  proPlatformTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proPlatformBadge: {
+    backgroundColor: COLORS.primary,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  proPlatformBadgeText: {
+    color: COLORS.white,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  proPlatformGrid: {
+    gap: 12,
+  },
+  proPlatformCard: {
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: COLORS.gray200,
+    padding: 16,
+    position: 'relative',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  proPlatformCardSelected: {
+    borderColor: COLORS.primary,
+    backgroundColor: '#F0F9FF',
+  },
+  proPlatformCardCheapest: {
+    borderColor: COLORS.success,
+    backgroundColor: '#F0FFF4',
+  },
+  bestDealBadge: {
+    position: 'absolute',
+    top: -8,
+    right: 12,
+    backgroundColor: COLORS.warning,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    zIndex: 1,
+  },
+  bestDealText: {
+    color: COLORS.white,
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+  },
+  proPlatformInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  proPlatformIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  proPlatformIconText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
+  proPlatformName: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+  },
+  proPlatformPriceSection: {
+    alignItems: 'flex-start',
+    marginBottom: 8,
+  },
+  proPlatformPrice: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: COLORS.textPrimary,
+    marginBottom: 4,
+  },
+  proPlatformOriginalPrice: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: COLORS.gray500,
+    textDecorationLine: 'line-through',
+  },
+  proPlatformDiscount: {
+    backgroundColor: COLORS.success,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    alignSelf: 'flex-start',
+  },
+  proPlatformDiscountText: {
+    color: COLORS.white,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  proPlatformStock: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderLeftWidth: 3,
+    marginBottom: 8,
+  },
+  proPlatformStockText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  proPlatformRating: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginBottom: 8,
+  },
+  proPlatformRatingText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+  },
+  proPlatformAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    gap: 6,
+  },
+  proPlatformActionText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+
+  // Professional Header Styles
+  proHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: COLORS.white,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  proBackButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: COLORS.gray100,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  proHeaderTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    letterSpacing: -0.5,
+  },
+  proImageContainer: {
+    marginTop: 16,
+    marginHorizontal: 16,
+    height: 300,
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 16,
+    elevation: 8,
+  },
+  proProductImage: {
+    width: '94%',
+    height: '94%',
+    borderRadius: 16,
+    alignSelf: 'center',
+  },
+  proImagePlaceholder: {
+    width: '94%',
+    height: '94%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: COLORS.gray100,
+    borderRadius: 16,
+  },
+  proTitleContainer: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    backgroundColor: COLORS.white,
+  },
+  proProductTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    lineHeight: 32,
+    marginBottom: 16,
+  },
+
+  // Professional Price History Styles
+  proPriceHistoryContainer: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  proPriceHistoryHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  proPriceHistoryTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proPriceHistoryHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  proPlatformInfo: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    backgroundColor: COLORS.gray100,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  proInfoIcon: {
+    padding: 4,
+  },
+  proInfoSection: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 16,
+  },
+  proInfoContent: {
+    gap: 12,
+  },
+  proInfoTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    marginBottom: 4,
+  },
+  proInfoText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: COLORS.gray600,
+    lineHeight: 18,
+  },
+  proInfoGrid: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 8,
+  },
+  proInfoItem: {
+    flex: 1,
+    alignItems: 'center',
+    backgroundColor: COLORS.white,
+    padding: 12,
+    borderRadius: 8,
+  },
+  proInfoLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 4,
+  },
+  proInfoValue: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proInsightSection: {
+    marginTop: 8,
+  },
+  proInsightTitle: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 4,
+  },
+  proInsightText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: COLORS.gray600,
+    fontStyle: 'italic',
+  },
+  proLoadingContainer: {
+    alignItems: 'center',
+    paddingVertical: 32,
+  },
+  proLoadingText: {
+    marginTop: 8,
+    fontSize: 14,
+    fontWeight: '500',
+    color: COLORS.gray600,
+  },
+  proPriceHistoryContent: {
+    gap: 16,
+  },
+  proPriceStatsContainer: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  proPriceStatCard: {
+    flex: 1,
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+  },
+  proPriceStatLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  proPriceStatValue: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    textAlign: 'center',
+  },
+  proPredictionCard: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 16,
+  },
+  proPredictionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  proPredictionTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  proPredictionTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  proConfidenceBadge: {
+    backgroundColor: COLORS.primary,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  proConfidenceText: {
+    color: COLORS.white,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  proPredictionContent: {
+    gap: 12,
+  },
+  proTrendItem: {
+    backgroundColor: COLORS.white,
+    borderRadius: 8,
+    padding: 12,
+  },
+  proTrendLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 4,
+  },
+  proTrendValue: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  proForecastItem: {
+    backgroundColor: COLORS.white,
+    borderRadius: 8,
+    padding: 12,
+  },
+  proForecastLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 4,
+  },
+  proForecastValue: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  proInsufficientText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: COLORS.gray600,
+    fontStyle: 'italic',
+    textAlign: 'center',
+    paddingVertical: 8,
+  },
+  proReasonsSection: {
+    backgroundColor: COLORS.white,
+    borderRadius: 8,
+    padding: 12,
+  },
+  proReasonsTitle: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 8,
+  },
+  proReasonText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: COLORS.gray600,
+    marginBottom: 4,
+  },
+  proRecentUpdatesContainer: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 16,
+  },
+  proRecentUpdatesTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    marginBottom: 12,
+  },
+  proRecentUpdatesList: {
+    gap: 8,
+  },
+  proRecentUpdateItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: COLORS.white,
+    padding: 8,
+    borderRadius: 6,
+  },
+  proRecentUpdateTime: {
+    fontSize: 11,
+    fontWeight: '500',
+    color: COLORS.gray600,
+  },
+  proRecentUpdatePrice: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proNoDataContainer: {
+    alignItems: 'center',
+    paddingVertical: 32,
+  },
+  proNoDataText: {
+    marginTop: 12,
+    fontSize: 14,
+    fontWeight: '500',
+    color: COLORS.gray600,
+    textAlign: 'center',
   },
 
   bestPrice: {

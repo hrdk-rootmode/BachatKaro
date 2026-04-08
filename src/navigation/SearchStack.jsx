@@ -6,9 +6,7 @@ import React from 'react';
 import { createStackNavigator } from '@react-navigation/stack';
 
 // Real screens
-import SearchScreen from '../screens/search/SearchScreen';
-import SearchResultsScreen from '../screens/search/SearchResultsScreen';
-import URLSearchScreen from '../screens/search/URLSearchScreen';
+import SearchScreenPremium from '../screens/search/SearchScreenPremium';
 import ProductDetailScreen from '../screens/product/ProductDetailScreen';
 import CrossPlatformComparisonScreen from '../screens/product/CrossPlatformComparisonScreen';
 
@@ -46,15 +44,7 @@ const SearchStack = () => {
     >
       <Stack.Screen 
         name="SearchMain" 
-        component={SearchScreen}
-      />
-      <Stack.Screen 
-        name="SearchResults" 
-        component={SearchResultsScreen}
-      />
-      <Stack.Screen 
-        name="URLSearch" 
-        component={URLSearchScreen}
+        component={SearchScreenPremium}
       />
       <Stack.Screen 
         name="ProductDetail" 

@@ -45,6 +45,14 @@ const initialState = {
   proTrialActive: false,           // Temporary trial from streak rewards
   proTrialExpiresAt: null,         // ISO timestamp when trial ends
   proTrialDurationHours: null,     // How many hours the trial lasts
+
+  // Session expiry handling
+  sessionExpired: false,
+  sessionExpiredMessage: null,
+  
+  // Ban information
+  banInfo: null, // Store ban details for navigation
+  accountBlocked: false, // Flag to indicate if account is blocked
 };
 
 // --------------------------------------------
@@ -105,19 +113,27 @@ export const loginWithEmail = createAsyncThunk(
       // Step 4: Single backend call with retry
       let backendResult = await authAPI.getMe();
       
-      if (!backendResult.success) {
-        // ONE retry with fresh token
+      if (!backendResult.success && backendResult.statusCode === 401) {
+        // Retry only for expired/invalid auth tokens.
         const freshToken = await getFreshIdToken(true);
         if (freshToken.success) {
           await storeAuthToken(freshToken.idToken);
           backendResult = await authAPI.getMe();
         }
+      }
         
-        if (!backendResult.success) {
-          // Don't create fallback user - just fail
-          await clearAllAuthData();
-          return rejectWithValue('Backend connection failed. Please try again.');
-        }
+      if (!backendResult.success) {
+        // If the backend is temporarily unavailable, let the user in with
+        // the Firebase identity and sync backend data later.
+        const fallbackUser = buildFallbackUserFromFirebase(firebaseResult.user);
+        await storeUserData(fallbackUser);
+
+        return {
+          user: fallbackUser,
+          firebaseUser: firebaseResult.user,
+          idToken: firebaseResult.idToken,
+          backendSync: false,
+        };
       }
       
       await storeUserData(backendResult.data);
@@ -209,41 +225,52 @@ export const signupWithEmail = createAsyncThunk(
 export const checkAuthStatus = createAsyncThunk(
   'auth/checkAuthStatus',
   async (_, { rejectWithValue }) => {
+    let storedUser = null;
     try {
       // Step 1: Check for stored token
       const storedToken = await withTimeout(getAuthToken(), 5000, 'Read auth token');
-      const storedUser = await withTimeout(getUserData(), 5000, 'Read user data');
+      storedUser = await withTimeout(getUserData(), 5000, 'Read user data');
       
       if (!storedToken || !storedUser) {
-        return { isLoggedIn: false };
+        return { isLoggedIn: false, sessionExpired: false };
       }
       
       // Step 2: Verify token is still valid by calling backend
-      let backendResult = await withTimeout(authAPI.getMe(), 12000, 'Verify auth session');
+      let backendResult = await authAPI.getMe();
 
       // If token is expired, attempt a forced token refresh and retry once.
       if (!backendResult.success && backendResult.statusCode === 401) {
         const refreshResult = await withTimeout(getFreshIdToken(true), 8000, 'Refresh Firebase token');
         if (refreshResult.success && refreshResult.idToken) {
           await storeAuthToken(refreshResult.idToken);
-          backendResult = await withTimeout(authAPI.getMe(), 12000, 'Verify auth session retry');
+          backendResult = await authAPI.getMe();
         }
       }
       
       if (!backendResult.success) {
-        // If backend /auth/me is rejecting with 401 but we have cached user+token,
-        // keep user logged in to avoid blocking app usage.
         if (backendResult.statusCode === 401 && storedUser) {
+          await clearAllAuthData();
+          return {
+            isLoggedIn: false,
+            sessionExpired: true,
+            sessionExpiredMessage: 'Your session has ended. Please log in again to continue.',
+          };
+        }
+
+        // If the backend is temporarily unreachable, keep the cached user so
+        // the app can still open and retry sync later.
+        if (backendResult.statusCode === 0 && storedUser) {
           return {
             isLoggedIn: true,
             user: storedUser,
             backendSync: false,
+            sessionExpired: false,
           };
         }
 
         // Token invalid, clear storage
         await clearAllAuthData();
-        return { isLoggedIn: false };
+        return { isLoggedIn: false, sessionExpired: false };
       }
       
       // Step 3: Update stored user data (might have changed)
@@ -252,11 +279,23 @@ export const checkAuthStatus = createAsyncThunk(
       return {
         isLoggedIn: true,
         user: backendResult.data,
+        sessionExpired: false,
       };
     } catch (error) {
       console.error('Auth check error:', error);
+
+      // Keep users signed in with cached profile when startup verification stalls.
+      if (storedUser) {
+        return {
+          isLoggedIn: true,
+          user: storedUser,
+          backendSync: false,
+          sessionExpired: false,
+        };
+      }
+
       await clearAllAuthData();
-      return { isLoggedIn: false };
+      return { isLoggedIn: false, sessionExpired: false };
     }
   }
 );
@@ -367,6 +406,28 @@ const authSlice = createSlice({
     
     // Reset auth state (for testing)
     resetAuth: () => initialState,
+
+    // Mark session expired from API / 401 recovery
+    markSessionExpired: (state, action) => {
+      state.isAuthenticated = false;
+      state.isLoading = false;
+      state.isInitializing = false;
+      state.user = null;
+      state.firebaseUser = null;
+      state.referralCode = null;
+      state.error = null;
+      state.isPro = false;
+      state.proTrialActive = false;
+      state.proTrialExpiresAt = null;
+      state.proTrialDurationHours = null;
+      state.sessionExpired = true;
+      state.sessionExpiredMessage = action.payload?.message || 'Your session has ended. Please log in again to continue.';
+    },
+
+    clearSessionExpired: (state) => {
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
+    },
     
     // ✅ NEW: Activate Pro Trial (Part 4)
     activateProTrial: (state, action) => {
@@ -434,6 +495,41 @@ const authSlice = createSlice({
       state.proTrialExpiresAt = new Date(adjustedExpiry).toISOString();
       state.proTrialDurationHours = Math.max(1, Math.ceil((adjustedExpiry - now) / (1000 * 60 * 60)));
     },
+
+    // Handle banned user action from API
+    accountBlocked: (state, action) => {
+      const { isBanned, reason, blockedAt, message } = action.payload || {};
+      
+      state.accountBlocked = true;
+      state.isAuthenticated = false;
+      state.isLoading = false;
+      state.isInitializing = false;
+      state.user = null;
+      state.firebaseUser = null;
+      state.referralCode = null;
+      state.error = message || 'Your account has been blocked.';
+      state.isPro = false;
+      state.proTrialActive = false;
+      state.proTrialExpiresAt = null;
+      state.proTrialDurationHours = null;
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
+      
+      // Store ban info for navigation
+      state.banInfo = {
+        isBanned,
+        reason: reason || 'Violation of terms of service',
+        blockedAt: blockedAt || null,
+        message: message || 'Your account has been blocked.'
+      };
+      
+      console.log('[AuthSlice] Account blocked:', { isBanned, reason, blockedAt });
+    },
+
+    clearBanInfo: (state) => {
+      state.banInfo = null;
+      state.accountBlocked = false;
+    },
   },
   
   extraReducers: (builder) => {
@@ -476,6 +572,8 @@ const authSlice = createSlice({
       state.firebaseUser = action.payload.firebaseUser;
       state.referralCode = action.payload.user?.referral_code;
       state.error = null;
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
       
       // ✅ NEW: Set permanent Pro status from user plan
       const userPlan = action.payload.user?.plan?.toLowerCase();
@@ -505,6 +603,8 @@ const authSlice = createSlice({
       state.firebaseUser = action.payload.firebaseUser;
       state.referralCode = action.payload.user?.referral_code;
       state.error = null;
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
       
       // ✅ NEW: Set permanent Pro status from user plan
       const userPlan = action.payload.user?.plan?.toLowerCase();
@@ -530,6 +630,8 @@ const authSlice = createSlice({
       state.isAuthenticated = action.payload.isLoggedIn;
       state.user = action.payload.user || null;
       state.referralCode = action.payload.user?.referral_code || null;
+      state.sessionExpired = Boolean(action.payload.sessionExpired);
+      state.sessionExpiredMessage = action.payload.sessionExpiredMessage || null;
       
       // ✅ NEW: Set permanent Pro status from user plan
       if (action.payload.user) {
@@ -545,6 +647,8 @@ const authSlice = createSlice({
       state.isAuthenticated = false;
       state.user = null;
       state.isPro = false;
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
     });
     
     // --------------------------------------------
@@ -562,6 +666,8 @@ const authSlice = createSlice({
       state.firebaseUser = null;
       state.referralCode = null;
       state.error = null;
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
       
       // ✅ NEW: Clear Pro trial
       state.isPro = false;
@@ -576,6 +682,8 @@ const authSlice = createSlice({
       state.isAuthenticated = false;
       state.user = null;
       state.firebaseUser = null;
+      state.sessionExpired = false;
+      state.sessionExpiredMessage = null;
       
       // ✅ NEW: Clear Pro trial
       state.isPro = false;
@@ -631,10 +739,14 @@ export const {
   updateUserLocal,
   setLoading,
   resetAuth,
+  markSessionExpired,
+  clearSessionExpired,
   activateProTrial,          // ✅ NEW
   clearProTrial,             // ✅ NEW
   checkProTrialExpiration,   // ✅ NEW
   debugAdjustProTrialMinutesForDev,
+  accountBlocked,            // ✅ NEW: Handle banned user
+  clearBanInfo,
 } = authSlice.actions;
 
 // Selectors
@@ -645,6 +757,8 @@ export const selectIsInitializing = (state) => state.auth.isInitializing;
 export const selectAuthError = (state) => state.auth.error;
 export const selectReferralCode = (state) => state.auth.referralCode;
 export const selectReferralValid = (state) => state.auth.referralValid;
+export const selectSessionExpired = (state) => state.auth.sessionExpired;
+export const selectSessionExpiredMessage = (state) => state.auth.sessionExpiredMessage;
 
 // ✅ NEW: Pro Trial Selectors
 export const selectIsPermanentPro = (state) => state.auth.isPro;
@@ -682,5 +796,8 @@ export const selectProTrialInfo = createSelector(
     };
   }
 );
+
+// ✅ NEW: Ban info selector
+export const selectBanInfo = (state) => state.auth.banInfo;
 
 export default authSlice.reducer;

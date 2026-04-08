@@ -6,7 +6,7 @@ import axios from 'axios';
 import * as Device from 'expo-device';
 
 import { API, ERROR_MESSAGES } from '../utils/constants';
-import { getAuthToken, storeAuthToken, getHardwareId, storeHardwareId } from './storage';
+import { getAuthToken, storeAuthToken, getHardwareId, storeHardwareId, clearAllAuthData } from './storage';
 import { getFreshIdToken } from './firebase';
 
 // --------------------------------------------
@@ -23,7 +23,34 @@ const apiClient = axios.create({
   },
 });
 
-console.log('API Client initialized with base URL:', API.BASE_URL);
+try {
+  console.log('API Client initialized with base URL:', API.BASE_URL);
+  if (!API.BASE_URL) {
+    console.warn('⚠️  WARNING: API.BASE_URL is not configured. Backend calls will fail.');
+  }
+} catch (e) {
+  console.error('Error initializing API client:', e);
+}
+
+const getReduxStore = () => {
+  try {
+    // Lazy import avoids require cycle: store -> authSlice -> api -> store
+    const storeModule = require('../store/store');
+    return storeModule?.store || storeModule?.default || null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const dispatchToStore = (action) => {
+  const reduxStore = getReduxStore();
+  if (!reduxStore?.dispatch) {
+    return false;
+  }
+
+  reduxStore.dispatch(action);
+  return true;
+};
 
 // --------------------------------------------
 // GET OR CREATE HARDWARE ID
@@ -90,9 +117,20 @@ apiClient.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config;
+    const requestUrl = originalRequest?.url || '';
+    const isAuthLoginOrSignup = requestUrl.includes('/auth/login') || requestUrl.includes('/auth/signup') || requestUrl.includes('/auth/signup-public');
+    const isLogoutRequest = requestUrl.includes('/auth/logout');
+
+    // Retry transient network failures once for idempotent GET requests.
+    const requestMethod = String(originalRequest?.method || '').toLowerCase();
+    const isNetworkFailure = !error.response && !!error.request;
+    if (isNetworkFailure && requestMethod === 'get' && !originalRequest?._networkRetry) {
+      originalRequest._networkRetry = true;
+      return apiClient(originalRequest);
+    }
     
     // Only retry ONCE on 401, no complex logic
-    if (error.response?.status === 401 && !originalRequest._retry) {
+    if (error.response?.status === 401 && !originalRequest._retry && !isAuthLoginOrSignup && !isLogoutRequest) {
       originalRequest._retry = true;
       
       try {
@@ -105,6 +143,23 @@ apiClient.interceptors.response.use(
         }
       } catch (e) {
         // Silent fail, let error handler below process it
+      }
+
+      try {
+        await clearAllAuthData();
+      } catch (storageError) {
+        console.error('API: Failed to clear auth data after 401:', storageError?.message || storageError);
+      }
+
+      const didDispatchSessionExpiry = dispatchToStore({
+        type: 'auth/markSessionExpired',
+        payload: {
+          message: ERROR_MESSAGES.TOKEN_EXPIRED,
+        },
+      });
+
+      if (!didDispatchSessionExpiry) {
+        console.warn('API: Store unavailable while marking session expired.');
       }
     }
     
@@ -120,6 +175,12 @@ const handleApiError = (error) => {
   let errorMessage = ERROR_MESSAGES.UNKNOWN_ERROR;
   let statusCode = 0;
   let errorCode = null;
+  const requestMethod = String(error.config?.method || 'GET').toUpperCase();
+  const requestPath = error.config?.url || 'unknown-endpoint';
+  const isBackgroundFeedEndpoint =
+    requestPath.includes('/home/cross-platform') ||
+    requestPath.includes('/home/featured') ||
+    requestPath.includes('/search/trending');
   
   if (error.response) {
     // Server responded with error
@@ -134,7 +195,24 @@ const handleApiError = (error) => {
         errorMessage = ERROR_MESSAGES.TOKEN_EXPIRED;
         break;
       case 403:
-        if (errorCode === 'DEVICE_LIMIT') {
+        if (error.response.data?.error === 'account_blocked') {
+          // Handle banned user - don't show generic error
+          errorMessage = error.response.data?.message || 'Your account has been blocked.';
+          // Store ban info for navigation
+          const didDispatchBlocked = dispatchToStore({
+            type: 'auth/accountBlocked',
+            payload: {
+              isBanned: true,
+              reason: error.response.data?.reason || 'Violation of terms of service',
+              blockedAt: error.response.data?.blocked_at,
+              message: error.response.data?.message,
+            },
+          });
+
+          if (!didDispatchBlocked) {
+            console.warn('Failed to dispatch account blocked action: store unavailable.');
+          }
+        } else if (errorCode === 'DEVICE_LIMIT') {
           errorMessage = ERROR_MESSAGES.DEVICE_LIMIT;
         } else {
           errorMessage = 'Access denied.';
@@ -166,13 +244,12 @@ const handleApiError = (error) => {
     }
   } else if (error.request) {
     // Request made but no response
-    console.error(`API Error [Network]: Request to ${error.config?.url} made but no response received`);
-    console.error('Base URL:', apiClient.defaults.baseURL);
-    console.error('Request details:', {
-      method: error.config?.method,
-      url: error.config?.url,
-      fullUrl: error.config?.baseURL + error.config?.url,
-    });
+    const networkLog = `API Error [Network] ${requestMethod} ${requestPath} (base: ${apiClient.defaults.baseURL})`;
+    if (isBackgroundFeedEndpoint) {
+      console.warn(networkLog);
+    } else {
+      console.error(networkLog);
+    }
     errorMessage = ERROR_MESSAGES.NETWORK_ERROR;
   } else {
     // Something else happened
@@ -181,13 +258,18 @@ const handleApiError = (error) => {
     errorMessage = error.message || ERROR_MESSAGES.UNKNOWN_ERROR;
   }
   
-  console.error(`API Error [${statusCode}]:`, errorMessage);
+  if (statusCode === 0 && isBackgroundFeedEndpoint) {
+    console.warn(`API Error [${statusCode}] ${requestMethod} ${requestPath}:`, errorMessage);
+  } else {
+    console.error(`API Error [${statusCode}] ${requestMethod} ${requestPath}:`, errorMessage);
+  }
   
   return {
     success: false,
     error: errorMessage,
     statusCode,
     errorCode,
+    data: error.response?.data || null,
   };
 };
 

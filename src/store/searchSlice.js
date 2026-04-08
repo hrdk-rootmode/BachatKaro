@@ -379,6 +379,7 @@ export const selectPriceHistoryError = (s) => s.search.priceHistoryError;
 export const selectHasMore = (s) => s.search.hasMore;
 export const selectCurrentPage = (s) => s.search.currentPage;
 export const selectCacheHit = (s) => s.search.cacheHit;
+export const selectLastSearchQuery = (s) => s.search.lastQuery;
 // URL Search aliases
 export const selectIsUrlSearching = (s) => s.search.isSearching;
 export const selectUrlSearchError = (s) => s.search.searchError;

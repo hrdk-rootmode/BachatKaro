@@ -2,6 +2,46 @@
 // DEALHUNT APP - DATA FORMATTERS
 // ============================================
 
+const ISO_NO_TZ_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+const SQL_NO_TZ_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+
+const normalizeApiDateInput = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value !== 'string') return value;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  // Backend often sends naive UTC timestamps. Add Z so JS parses as UTC,
+  // then renders correctly in local time (IST on device).
+  if (ISO_NO_TZ_RE.test(trimmed)) {
+    return `${trimmed}Z`;
+  }
+
+  if (SQL_NO_TZ_RE.test(trimmed)) {
+    return `${trimmed.replace(' ', 'T')}Z`;
+  }
+
+  return trimmed;
+};
+
+export const parseApiDate = (value) => {
+  try {
+    const normalized = normalizeApiDateInput(value);
+    if (!normalized) return null;
+    const date = normalized instanceof Date ? normalized : new Date(normalized);
+    return Number.isFinite(date.getTime()) ? date : null;
+  } catch {
+    return null;
+  }
+};
+
+export const toEpochMs = (value) => {
+  const date = parseApiDate(value);
+  return date ? date.getTime() : 0;
+};
+
 /**
  * Format price to Indian currency (₹)
  * Handles both number and Decimal string types from backend
@@ -46,11 +86,8 @@ export const formatDate = (dateString) => {
   }
 
   try {
-    const date = typeof dateString === 'string'
-      ? new Date(dateString)
-      : dateString;
-
-    if (isNaN(date.getTime())) {
+    const date = parseApiDate(dateString);
+    if (!date) {
       return '';
     }
 
@@ -420,8 +457,8 @@ export const truncateText = (text, maxLength = 50) => {
 export const formatShortDate = (dateString) => {
   if (!dateString) return '';
   try {
-    const date = new Date(dateString);
-    if (isNaN(date.getTime())) return '';
+    const date = parseApiDate(dateString);
+    if (!date) return '';
     return new Intl.DateTimeFormat('en-IN', {
       month: 'short',
       day: 'numeric',
@@ -437,7 +474,8 @@ export const formatShortDate = (dateString) => {
 export const formatTimeAgo = (dateString) => {
   if (!dateString) return 'Recently';
   try {
-    const date = new Date(dateString);
+    const date = parseApiDate(dateString);
+    if (!date) return 'Recently';
     const now = new Date();
     const diffMs = now - date;
     const diffMin = Math.floor(diffMs / 60000);

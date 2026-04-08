@@ -1,5 +1,6 @@
 // ============================================
 // DEALHUNT APP - CONSTANTS & CONFIGURATION
+// Part 5 Update: Subscription Plans & Razorpay Config
 // ============================================
 
 import {
@@ -89,6 +90,32 @@ export const API = {
     
     // Subscription (Part 5)
     SUBSCRIPTION_PLANS: '/subscription/plans',
+    SUBSCRIPTION_STATUS: '/subscription/status',
+    SUBSCRIPTION_HISTORY: '/subscription/history',
+    SUBSCRIPTION_HISTORY_ITEM: '/subscription/history', // + /{transaction_id}
+    SUBSCRIPTION_CREATE_ORDER: '/subscription/create-order',
+    SUBSCRIPTION_VERIFY_PAYMENT: '/subscription/verify-payment',
+    SUBSCRIPTION_CANCEL: '/subscription/cancel',
+    SUBSCRIPTION_PAYMENT_METHODS: '/subscription/payment-methods',
+  },
+};
+
+// --------------------------------------------
+// RAZORPAY CONFIGURATION (Part 5)
+// --------------------------------------------
+export const RAZORPAY = {
+  KEY_ID: 'rzp_test_xxxxxxxxxxxxx', // Replace with your test key
+  MODE: 'TEST', // 'TEST' for demo, 'LIVE' for production
+  CURRENCY: 'INR',
+  COMPANY_NAME: 'DealHunt',
+  COMPANY_LOGO: 'https://i.imgur.com/3g7nmJC.png', // Placeholder logo
+  THEME_COLOR: '#FF6B35',
+  
+  // Test card details (for demo reference only)
+  TEST_CARD: {
+    number: '4111 1111 1111 1111',
+    cvv: '123',
+    expiry: '12/25',
   },
 };
 
@@ -116,12 +143,13 @@ export const VALIDATION = {
 
 // --------------------------------------------
 // APP CONFIGURATION
+// ✅ Part 5 Update: Plans match final pricing
 // --------------------------------------------
 export const APP = {
   NAME: APP_NAME || 'DealHunt',
   VERSION: APP_VERSION || '1.0.0',
   
-  // Subscription Plans
+  // Subscription Plans (Final Demo Pricing)
   PLANS: {
     FREE: {
       id: 'free',
@@ -129,25 +157,66 @@ export const APP = {
       searches_per_day: 10,
       watchlist_limit: 5,
       price: 0,
+      interval: null,
     },
-    BASIC: {
-      id: 'basic',
-      name: 'Basic',
-      searches_per_day: 50,
-      watchlist_limit: 20,
-      price: 99, // ₹99/month
+    PRO: {
+      id: 'pro',
+      name: 'Pro',
+      searches_per_day: 30,
+      watchlist_limit: 7,
+      price: 99,
+      interval: 'month',
     },
     PREMIUM: {
       id: 'premium',
       name: 'Premium',
       searches_per_day: -1, // Unlimited
-      watchlist_limit: 50,
-      price: 999, // ₹999/year
+      watchlist_limit: 15,
+      price: 149,
+      interval: 'month',
     },
   },
   
   // First month free trial
   TRIAL_DAYS: 30,
+};
+
+// --------------------------------------------
+// SUBSCRIPTION UI CONSTANTS (Part 5)
+// --------------------------------------------
+export const SUBSCRIPTION = {
+  /** Feature list displayed on the PlansScreen per plan */
+  PLAN_FEATURES: {
+    free: [
+      { icon: 'search-outline', text: '10 searches per day' },
+      { icon: 'heart-outline', text: '5 watchlist items' },
+      { icon: 'ban-outline', text: 'No ads' },
+    ],
+    pro: [
+      { icon: 'search-outline', text: '30 searches per day' },
+      { icon: 'heart-outline', text: '7 watchlist items' },
+      { icon: 'ban-outline', text: 'No ads' },
+      { icon: 'headset-outline', text: 'Priority support' },
+    ],
+    premium: [
+      { icon: 'infinite-outline', text: 'Unlimited searches' },
+      { icon: 'heart-outline', text: '15 watchlist items' },
+      { icon: 'ban-outline', text: 'No ads' },
+      { icon: 'rocket-outline', text: 'Early access features' },
+    ],
+  },
+
+  /** Labels / badges shown on plan cards */
+  PLAN_BADGES: {
+    pro: { text: '🔥 RECOMMENDED', color: '#EF4444' },
+    premium: { text: '⭐ BEST VALUE', color: '#8B5CF6' },
+  },
+
+  /** Reasons the upgrade prompt can appear */
+  UPGRADE_REASONS: {
+    WATCHLIST_LIMIT: 'watchlist_limit',
+    SEARCH_LIMIT: 'search_limit',
+  },
 };
 
 // --------------------------------------------
@@ -204,6 +273,12 @@ export const COLORS = {
   info: '#2196F3',
   infoLight: '#E3F2FD',
   
+  // ✅ Part 5: Subscription-specific colors
+  pro: '#F59E0B',          // Amber/Gold for Pro
+  proDark: '#D97706',
+  premium: '#8B5CF6',      // Purple for Premium
+  premiumDark: '#7C3AED',
+  
   // Background
   background: '#FFFFFF',
   backgroundSecondary: '#F5F5F5',
@@ -250,14 +325,19 @@ export const ERROR_MESSAGES = {
   SEARCH_LIMIT: 'Daily search limit reached. Upgrade your plan for more searches.',
   TOKEN_EXPIRED: 'Session expired. Please login again.',
   UNKNOWN_ERROR: 'Something went wrong. Please try again.',
+  PAYMENT_FAILED: 'Payment failed. Please try again or use a different method.',
+  PAYMENT_CANCELLED: 'Payment was cancelled. No charges were made.',
+  SUBSCRIPTION_ERROR: 'Failed to process subscription. Please try again.',
 };
 
 export default {
   FIREBASE_CONFIG,
   API,
+  RAZORPAY,
   STORAGE_KEYS,
   VALIDATION,
   APP,
+  SUBSCRIPTION,
   COLORS,
   REFERRAL_REWARDS,
   ERROR_MESSAGES,

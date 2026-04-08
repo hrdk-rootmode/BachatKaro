@@ -4,7 +4,7 @@
 // ============================================
 
 import React, { useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, AppState } from 'react-native';
+import { View, Text, StyleSheet, ActivityIndicator, AppState, Image, Alert, Modal, TouchableOpacity } from 'react-native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { useSelector, useDispatch } from 'react-redux';
 
@@ -13,7 +13,8 @@ import MainTabs from './MainTabs';
 
 // Screens
 import LoginScreen from '../screens/auth/LoginScreen';
-
+import PlansScreen from '../screens/subscription/PlansScreen';
+import BannedUserScreen from '../screens/auth/BannedUserScreen';
 // Store
 import {
   checkAuthStatus,
@@ -21,10 +22,18 @@ import {
   selectIsAuthenticated,
   selectIsInitializing,
   checkProTrialExpiration,
+  selectUser,
+  refreshUserData,
+  selectSessionExpired,
+  selectSessionExpiredMessage,
+  clearSessionExpired,
+  selectBanInfo,
+  clearBanInfo,
 } from '../store/authSlice';
-
-// ✅ NEW: Import streak check
+import { fetchWatchlist } from '../store/watchlistSlice';
+import { fetchPaymentHistory, fetchSubscriptionStatus } from '../store/subscriptionSlice';
 import { checkAndMarkStreak } from '../store/streakSlice';
+import { selectThemePalette, syncThemeWithPlan } from '../store/themeSlice';
 
 // Constants
 import { COLORS, APP } from '../utils/constants';
@@ -35,10 +44,10 @@ import { COLORS, APP } from '../utils/constants';
 
 const LoadingScreen = () => (
   <View style={styles.loadingContainer}>
-    <Text style={styles.loadingLogo}>🔍</Text>
+    <Image source={require('../../assets/deal.png')} style={styles.loadingLogo} resizeMode="contain" />
     <Text style={styles.loadingAppName}>{APP.NAME}</Text>
     <ActivityIndicator size="large" color={COLORS.primary} style={styles.loadingSpinner} />
-    <Text style={styles.loadingText}>Loading...</Text>
+    {/* <Text style={styles.loadingText}>Loading...</Text> */}
   </View>
 );
 
@@ -56,12 +65,19 @@ const AppNavigator = () => {
   const dispatch = useDispatch();
   const isAuthenticated = useSelector(selectIsAuthenticated);
   const isInitializing = useSelector(selectIsInitializing);
+  const user = useSelector(selectUser);
+  const sessionExpired = useSelector(selectSessionExpired);
+  const sessionExpiredMessage = useSelector(selectSessionExpiredMessage);
+  const themePalette = useSelector(selectThemePalette);
+  const banInfo = useSelector(selectBanInfo);
   
-  // ✅ NEW: Track if we've already checked streak this session
+  // NEW: Track if we've already checked streak this session
   const hasCheckedStreakRef = useRef(false);
   
-  // ✅ NEW: Track app state for foreground detection
+  // NEW: Track app state for foreground detection
   const appState = useRef(AppState.currentState);
+  const lastSubscriptionFingerprintRef = useRef('');
+  const hasShownSessionExpiryAlertRef = useRef(false);
 
   // Check auth status on mount
   useEffect(() => {
@@ -74,6 +90,33 @@ const AppNavigator = () => {
 
     return () => clearTimeout(watchdog);
   }, [dispatch]);
+
+  useEffect(() => {
+    if (!sessionExpired || isAuthenticated || isInitializing || hasShownSessionExpiryAlertRef.current) {
+      return;
+    }
+
+    hasShownSessionExpiryAlertRef.current = true;
+
+    Alert.alert(
+      'Welcome back soon',
+      sessionExpiredMessage || 'Your session has ended. Please log in again to continue using DealHunt.',
+      [
+        {
+          text: 'Login again',
+          onPress: () => {
+            dispatch(clearSessionExpired());
+            hasShownSessionExpiryAlertRef.current = false;
+          },
+        },
+      ],
+      { cancelable: false }
+    );
+  }, [dispatch, isAuthenticated, isInitializing, sessionExpired, sessionExpiredMessage]);
+
+  const handleDismissBanModal = () => {
+    dispatch(clearBanInfo());
+  };
 
   // ✅ NEW: Check streak when user is authenticated and initialization complete
   useEffect(() => {
@@ -94,8 +137,11 @@ const AppNavigator = () => {
     // Reset the flag when user logs out
     if (!isAuthenticated) {
       hasCheckedStreakRef.current = false;
+      if (!sessionExpired) {
+        hasShownSessionExpiryAlertRef.current = false;
+      }
     }
-  }, [isAuthenticated, isInitializing, dispatch]);
+  }, [isAuthenticated, isInitializing, dispatch, sessionExpired]);
 
   // ✅ NEW: Handle app state changes (foreground/background)
   useEffect(() => {
@@ -109,6 +155,11 @@ const AppNavigator = () => {
         
         // Check Pro trial expiration
         dispatch(checkProTrialExpiration());
+        if (isAuthenticated) {
+          dispatch(refreshUserData());
+          dispatch(fetchSubscriptionStatus());
+          dispatch(fetchWatchlist());
+        }
         
         // Optionally: Re-check streak if user has been away for a while
         // For now, we only check once per app session
@@ -120,7 +171,35 @@ const AppNavigator = () => {
     return () => {
       subscription?.remove();
     };
-  }, [dispatch]);
+  }, [dispatch, isAuthenticated]);
+
+  // Keep theme synced with user subscription plan.
+  useEffect(() => {
+    dispatch(syncThemeWithPlan({ plan: user?.plan || 'free' }));
+  }, [dispatch, user?.plan]);
+
+  // Auto-refresh app data when subscription details change so all tabs stay in sync.
+  useEffect(() => {
+    if (!isAuthenticated) {
+      lastSubscriptionFingerprintRef.current = '';
+      return;
+    }
+
+    const fingerprint = `${String(user?.plan || 'free')}|${String(user?.plan_expires_at || '')}`;
+    if (!lastSubscriptionFingerprintRef.current) {
+      lastSubscriptionFingerprintRef.current = fingerprint;
+      return;
+    }
+
+    if (lastSubscriptionFingerprintRef.current !== fingerprint) {
+      lastSubscriptionFingerprintRef.current = fingerprint;
+      dispatch(refreshUserData());
+      dispatch(fetchSubscriptionStatus());
+      dispatch(fetchPaymentHistory({ limit: 100 }));
+      dispatch(fetchWatchlist());
+      dispatch(checkAndMarkStreak());
+    }
+  }, [dispatch, isAuthenticated, user?.plan, user?.plan_expires_at]);
 
   // ✅ NEW: Periodic Pro trial expiration check (every minute)
   useEffect(() => {
@@ -138,19 +217,65 @@ const AppNavigator = () => {
     return <LoadingScreen />;
   }
 
+  const banMessage =
+    banInfo?.message ||
+    'Your account has been suspended due to a violation of our terms of service.';
+  const banReason = banInfo?.reason;
+
+  if (isAuthenticated) {
+    return (
+      <>
+        <Stack.Navigator screenOptions={{ headerShown: false }}>
+          <Stack.Screen
+            name="Main"
+            component={MainTabs}
+            options={{
+              animationTypeForReplace: 'push',
+            }}
+            initialParams={{ appThemePrimary: themePalette.primary }}
+          />
+          <Stack.Screen
+            name="Plans"
+            component={PlansScreen}
+            options={{
+              presentation: 'modal',
+              animationTypeForReplace: 'push',
+              gestureEnabled: true,
+            }}
+          />
+          <Stack.Screen
+            name="BannedUser"
+            component={BannedUserScreen}
+            options={{
+              animationTypeForReplace: 'push',
+              gestureEnabled: false,
+            }}
+          />
+        </Stack.Navigator>
+        <Modal
+          visible={Boolean(banInfo?.isBanned)}
+          transparent
+          animationType="fade"
+          onRequestClose={handleDismissBanModal}
+        >
+          <View style={styles.banModalOverlay}>
+            <View style={styles.banModalCard}>
+              <Text style={styles.banModalTitle}>Account Suspended</Text>
+              <Text style={styles.banModalMessage}>{banMessage}</Text>
+              {banReason ? <Text style={styles.banModalReason}>Reason: {banReason}</Text> : null}
+              <TouchableOpacity style={styles.banModalButton} onPress={handleDismissBanModal}>
+                <Text style={styles.banModalButtonText}>OK</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+      </>
+    );
+  }
+
   return (
-    <Stack.Navigator screenOptions={{ headerShown: false }}>
-      {isAuthenticated ? (
-        // Authenticated: Show main app with tabs
-        <Stack.Screen
-          name="Main"
-          component={MainTabs}
-          options={{
-            animationTypeForReplace: 'push',
-          }}
-        />
-      ) : (
-        // Not authenticated: Show login
+    <>
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
         <Stack.Screen
           name="Login"
           component={LoginScreen}
@@ -158,8 +283,25 @@ const AppNavigator = () => {
             animationTypeForReplace: 'pop',
           }}
         />
-      )}
-    </Stack.Navigator>
+      </Stack.Navigator>
+      <Modal
+        visible={Boolean(banInfo?.isBanned)}
+        transparent
+        animationType="fade"
+        onRequestClose={handleDismissBanModal}
+      >
+        <View style={styles.banModalOverlay}>
+          <View style={styles.banModalCard}>
+            <Text style={styles.banModalTitle}>Account Suspended</Text>
+            <Text style={styles.banModalMessage}>{banMessage}</Text>
+            {banReason ? <Text style={styles.banModalReason}>Reason: {banReason}</Text> : null}
+            <TouchableOpacity style={styles.banModalButton} onPress={handleDismissBanModal}>
+              <Text style={styles.banModalButtonText}>OK</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </>
   );
 };
 
@@ -172,18 +314,19 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: COLORS.background,
+    backgroundColor: '#FF6B35',
   },
   
   loadingLogo: {
-    fontSize: 80,
+    width: 120,
+    height: 120,
     marginBottom: 16,
   },
   
   loadingAppName: {
     fontSize: 32,
     fontWeight: 'bold',
-    color: COLORS.primary,
+    color: '#FFFFFF',
     marginBottom: 24,
   },
   
@@ -193,7 +336,62 @@ const styles = StyleSheet.create({
   
   loadingText: {
     fontSize: 16,
-    color: COLORS.gray500,
+    color: '#FFFFFF',
+  },
+
+  banModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+
+  banModalCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 20,
+    paddingVertical: 22,
+    elevation: 8,
+  },
+
+  banModalTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#151515',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+
+  banModalMessage: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: '#2E2E2E',
+    textAlign: 'center',
+  },
+
+  banModalReason: {
+    marginTop: 12,
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#A33A1D',
+    textAlign: 'center',
+  },
+
+  banModalButton: {
+    marginTop: 18,
+    backgroundColor: COLORS.primary,
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+
+  banModalButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
   },
 });
 

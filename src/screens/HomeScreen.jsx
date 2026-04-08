@@ -15,6 +15,8 @@ import Button from '../components/common/Button';
 import { useAuth } from '../hooks/useAuth';
 import { COLORS, APP } from '../utils/constants';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSelector } from 'react-redux';
+import { selectThemePalette } from '../store/themeSlice';
 // --------------------------------------------
 // HOME SCREEN COMPONENT
 // --------------------------------------------
@@ -30,6 +32,7 @@ const HomeScreen = () => {
     signOut,
     isLoading,
   } = useAuth();
+  const themePalette = useSelector(selectThemePalette);
 
   // --------------------------------------------
   // HANDLERS
@@ -57,19 +60,19 @@ const HomeScreen = () => {
   // --------------------------------------------
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.container, { backgroundColor: themePalette.background || COLORS.background }]}>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.welcomeText}>Welcome to</Text>
-          <Text style={styles.appName}>{APP.NAME} 🔍</Text>
+          <Text style={[styles.welcomeText, { color: themePalette.textSecondary || COLORS.gray600 }]}>Welcome to</Text>
+          <Text style={[styles.appName, { color: themePalette.primary || COLORS.primary }]}>{APP.NAME} 🔍</Text>
         </View>
 
         {/* Success Card */}
-        <View style={styles.successCard}>
+        <View style={[styles.successCard, { backgroundColor: themePalette.glow || COLORS.successLight, borderColor: themePalette.accent || COLORS.success }]}>
           <Text style={styles.successIcon}>✅</Text>
           <Text style={styles.successTitle}>Authentication Complete!</Text>
           <Text style={styles.successSubtitle}>
@@ -78,7 +81,7 @@ const HomeScreen = () => {
         </View>
 
         {/* User Info Card */}
-        <View style={styles.card}>
+        <View style={[styles.card, { backgroundColor: themePalette.surface || COLORS.white, borderColor: themePalette.border || COLORS.gray200 }]}>
           <Text style={styles.cardTitle}>👤 Your Profile</Text>
           
           <View style={styles.infoRow}>
@@ -102,7 +105,7 @@ const HomeScreen = () => {
         </View>
 
         {/* Stats Card */}
-        <View style={styles.card}>
+        <View style={[styles.card, { backgroundColor: themePalette.surface || COLORS.white, borderColor: themePalette.border || COLORS.gray200 }]}>
           <Text style={styles.cardTitle}>📊 Your Stats</Text>
           
           <View style={styles.statsGrid}>
@@ -124,7 +127,7 @@ const HomeScreen = () => {
         </View>
 
         {/* Referral Card */}
-        <View style={styles.card}>
+        <View style={[styles.card, { backgroundColor: themePalette.surface || COLORS.white, borderColor: themePalette.border || COLORS.gray200 }]}>
           <Text style={styles.cardTitle}>🎁 Your Referral Code</Text>
           <View style={styles.referralContainer}>
             <Text style={styles.referralCode}>{referralCode || 'Loading...'}</Text>
@@ -135,7 +138,7 @@ const HomeScreen = () => {
         </View>
 
         {/* Coming Soon Card */}
-        <View style={styles.comingSoonCard}>
+        <View style={[styles.comingSoonCard, { backgroundColor: themePalette.surfaceMuted || COLORS.gray50, borderColor: themePalette.border || COLORS.gray200 }]}>
           <Text style={styles.comingSoonTitle}>🚀 Coming in Next Parts</Text>
           <Text style={styles.comingSoonItem}>• Part 2: Search & Price Comparison</Text>
           <Text style={styles.comingSoonItem}>• Part 3: Watchlist & Alerts</Text>

@@ -14,10 +14,14 @@ import ProductSection from '../components/home/ProductSection';
 
 import {
   fetchTrending,
+  selectLastSearchQuery,
+  selectSearchResults,
   selectTrendingProducts,
   selectTrendingStatus,
 } from '../store/searchSlice';
+import { selectThemePalette } from '../store/themeSlice';
 import { homeAPI } from '../services/homeApi';
+import { toEpochMs } from '../utils/formatters';
 import { COLORS, APP } from '../utils/constants';
 
 const CATEGORY_SECTIONS = [
@@ -97,12 +101,82 @@ const CATEGORY_SECTIONS = [
 
 const CROSS_PLATFORM_HIGHLIGHT_LIMIT = 24;
 
+const toEpoch = (value) => {
+  return toEpochMs(value);
+};
+
+const getStableKey = (product) => {
+  const byFingerprint = product?.variant_fingerprint || product?.base_fingerprint;
+  if (byFingerprint) return `fp:${String(byFingerprint).toLowerCase()}`;
+
+  const byId = product?.product_id || product?.id;
+  if (byId) return `id:${String(byId)}`;
+
+  return `title:${String(product?.title || '').trim().toLowerCase()}`;
+};
+
+const dedupeProducts = (items) => {
+  const map = new Map();
+
+  for (const item of items || []) {
+    if (!item) continue;
+    const key = getStableKey(item);
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, item);
+      continue;
+    }
+
+    const existingFreshness = Math.max(
+      toEpoch(existing?.last_price_change_at),
+      toEpoch(existing?.last_updated_at)
+    );
+    const incomingFreshness = Math.max(
+      toEpoch(item?.last_price_change_at),
+      toEpoch(item?.last_updated_at)
+    );
+
+    // Prefer fresher records so home cards don't stay stale.
+    if (incomingFreshness >= existingFreshness) {
+      map.set(key, item);
+    }
+  }
+
+  return Array.from(map.values());
+};
+
 const matchCategory = (product) => {
   const searchable = `${product?.title || ''} ${product?.category || ''} ${product?.subcategory || ''} ${product?.ai_generated_essence || ''}`.toLowerCase();
   const found = CATEGORY_SECTIONS.find((category) =>
     category.keywords.some((keyword) => searchable.includes(keyword))
   );
   return found?.id || null;
+};
+
+const getCategoryRelevanceForQuery = (category, query) => {
+  const normalized = String(query || '').toLowerCase().trim();
+  if (!normalized) return 0;
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return 0;
+
+  let score = 0;
+  for (const word of words) {
+    if (category.keywords.some((k) => k.includes(word) || word.includes(k))) score += 2;
+    if (category.query.includes(word)) score += 1;
+    if (category.title.toLowerCase().includes(word)) score += 1;
+  }
+
+  return score;
+};
+
+const getCategoryMatchStrength = (product, category) => {
+  const searchable = `${product?.title || ''} ${product?.category || ''} ${product?.subcategory || ''} ${product?.ai_generated_essence || ''}`.toLowerCase();
+  let score = 0;
+  for (const keyword of category.keywords) {
+    if (searchable.includes(keyword)) score += 1;
+  }
+  return score;
 };
 
 const HomeScreenV2 = () => {
@@ -113,6 +187,9 @@ const HomeScreenV2 = () => {
 
   const trending = useSelector(selectTrendingProducts) || [];
   const trendingStatus = useSelector(selectTrendingStatus);
+  const searchResults = useSelector(selectSearchResults) || [];
+  const lastSearchQuery = useSelector(selectLastSearchQuery) || '';
+  const themePalette = useSelector(selectThemePalette);
 
   const [refreshing, setRefreshing] = React.useState(false);
   const [visibleItemsPerSection, setVisibleItemsPerSection] = React.useState(8);
@@ -163,22 +240,36 @@ const HomeScreenV2 = () => {
 
   useFocusEffect(
     useCallback(() => {
-      fetchHomeData();
-    }, [fetchHomeData])
+      Promise.all([dispatch(fetchTrending()), fetchHomeData()]);
+    }, [dispatch, fetchHomeData])
   );
 
   // Derived sections from trending data
   const trendingProducts = useMemo(() => trending, [trending]);
 
   const mergedFeedProducts = useMemo(() => {
-    const map = new Map();
-    [...trending, ...homeFeatured, ...homeDeals].forEach((item) => {
-      const id = item?.product_id || item?.id;
-      if (!id) return;
-      if (!map.has(id)) map.set(id, item);
-    });
-    return Array.from(map.values());
-  }, [homeDeals, homeFeatured, trending]);
+    return dedupeProducts([
+      ...searchResults,
+      ...homeDeals,
+      ...homeFeatured,
+      ...trending,
+    ]);
+  }, [homeDeals, homeFeatured, searchResults, trending]);
+
+  const relatedSearchProducts = useMemo(() => {
+    if (!lastSearchQuery || !Array.isArray(searchResults) || searchResults.length === 0) {
+      return [];
+    }
+
+    return dedupeProducts(searchResults)
+      .sort((a, b) => {
+        const queryA = String(a?.title || '').toLowerCase().includes(lastSearchQuery.toLowerCase()) ? 1 : 0;
+        const queryB = String(b?.title || '').toLowerCase().includes(lastSearchQuery.toLowerCase()) ? 1 : 0;
+        if (queryB !== queryA) return queryB - queryA;
+        return (Number(b?.discount_percentage || 0) - Number(a?.discount_percentage || 0));
+      })
+      .slice(0, 24);
+  }, [lastSearchQuery, searchResults]);
 
   const crossPlatformProducts = useMemo(() => {
     const explicit = Array.isArray(crossPlatformHighlights) ? crossPlatformHighlights : [];
@@ -229,16 +320,26 @@ const HomeScreenV2 = () => {
   }, [homeDeals, trending]);
 
   const recentPriceChanges = useMemo(() => {
-    const source = homeDeals.length > 0 ? homeDeals : trending;
-    return [...source]
-      .filter(p => (p.discount_percentage || 0) >= 8)
-      .sort((a, b) => (b.discount_percentage || 0) - (a.discount_percentage || 0));
-  }, [homeDeals, trending]);
+    const source = mergedFeedProducts.length > 0 ? mergedFeedProducts : (homeDeals.length > 0 ? homeDeals : trending);
+    return dedupeProducts(source)
+      .filter((p) => Boolean(p?.last_price_change_at || p?.last_updated_at || (p?.discount_percentage || 0) >= 5))
+      .sort((a, b) => {
+        const changeA = toEpoch(a?.last_price_change_at);
+        const changeB = toEpoch(b?.last_price_change_at);
+        if (changeB !== changeA) return changeB - changeA;
+
+        const freshA = toEpoch(a?.last_updated_at);
+        const freshB = toEpoch(b?.last_updated_at);
+        if (freshB !== freshA) return freshB - freshA;
+
+        return (Number(b?.discount_percentage || 0) - Number(a?.discount_percentage || 0));
+      });
+  }, [homeDeals, mergedFeedProducts, trending]);
 
   const budgetPicks = useMemo(() =>
-    [...trending]
+    [...mergedFeedProducts]
       .filter(p => (p.best_price || 0) < 5000 && (p.best_price || 0) > 0),
-    [trending]
+    [mergedFeedProducts]
   );
 
   const categoryWiseSections = useMemo(() => {
@@ -248,21 +349,70 @@ const HomeScreenV2 = () => {
     }, {});
 
     for (const product of mergedFeedProducts) {
-      const categoryId = matchCategory(product);
+      let categoryId = matchCategory(product);
+
+      if (!categoryId) {
+        let bestCategory = null;
+        let bestScore = 0;
+        for (const category of CATEGORY_SECTIONS) {
+          const score = getCategoryMatchStrength(product, category);
+          if (score > bestScore) {
+            bestScore = score;
+            bestCategory = category;
+          }
+        }
+        categoryId = bestCategory?.id || null;
+      }
+
       if (!categoryId) continue;
       grouped[categoryId].push(product);
     }
 
-    return CATEGORY_SECTIONS
+    const sections = CATEGORY_SECTIONS
       .map((category) => ({
         ...category,
-        products: grouped[category.id] || [],
+        products: dedupeProducts(grouped[category.id] || []).sort((a, b) => {
+          const queryBoostA = lastSearchQuery
+            ? Number(String(a?.title || '').toLowerCase().includes(lastSearchQuery.toLowerCase()))
+            : 0;
+          const queryBoostB = lastSearchQuery
+            ? Number(String(b?.title || '').toLowerCase().includes(lastSearchQuery.toLowerCase()))
+            : 0;
+          if (queryBoostB !== queryBoostA) return queryBoostB - queryBoostA;
+
+          const freshA = Math.max(toEpoch(a?.last_price_change_at), toEpoch(a?.last_updated_at));
+          const freshB = Math.max(toEpoch(b?.last_price_change_at), toEpoch(b?.last_updated_at));
+          if (freshB !== freshA) return freshB - freshA;
+
+          return (Number(b?.discount_percentage || 0) - Number(a?.discount_percentage || 0));
+        }),
       }))
       .filter((category) => category.products.length > 0 || trendingStatus === 'loading' || homeDataLoading);
-  }, [homeDataLoading, mergedFeedProducts, trendingStatus]);
+
+    if (!lastSearchQuery) return sections;
+
+    return [...sections].sort((a, b) => {
+      const queryRelevanceA = getCategoryRelevanceForQuery(a, lastSearchQuery);
+      const queryRelevanceB = getCategoryRelevanceForQuery(b, lastSearchQuery);
+      if (queryRelevanceB !== queryRelevanceA) return queryRelevanceB - queryRelevanceA;
+      return b.products.length - a.products.length;
+    });
+  }, [homeDataLoading, lastSearchQuery, mergedFeedProducts, trendingStatus]);
 
   const topCategories = useMemo(() => {
     const mapped = [
+      ...(relatedSearchProducts.length > 0
+        ? [{
+            id: 'related-search',
+            label: 'For You',
+            emoji: '🎯',
+            query: lastSearchQuery,
+            homeSectionId: 'related-search',
+            bg: '#E6FFFB',
+            border: '#99F6E4',
+            count: relatedSearchProducts.length,
+          }]
+        : []),
       {
         id: 'trending',
         label: 'Trending',
@@ -356,13 +506,13 @@ const HomeScreenV2 = () => {
     ];
 
     return mapped.filter((category) => category.count > 0 || trendingStatus === 'loading' || homeDataLoading);
-  }, [categoryWiseSections, crossPlatformProducts.length, homeCategoryCounts, homeDataLoading, newArrivals.length, trendingProducts.length, trendingStatus]);
+  }, [categoryWiseSections, crossPlatformProducts.length, homeCategoryCounts, homeDataLoading, lastSearchQuery, newArrivals.length, relatedSearchProducts.length, trendingProducts.length, trendingStatus]);
 
   const maxItemsAvailable = useMemo(() => {
-    const baseCounts = [trendingProducts.length, newArrivals.length, crossPlatformProducts.length, bestDeals.length, budgetPicks.length, recentPriceChanges.length];
+    const baseCounts = [trendingProducts.length, newArrivals.length, crossPlatformProducts.length, bestDeals.length, budgetPicks.length, recentPriceChanges.length, relatedSearchProducts.length];
     const categoryCounts = categoryWiseSections.map((s) => s.products.length);
     return Math.max(0, ...baseCounts, ...categoryCounts);
-  }, [trendingProducts.length, newArrivals.length, crossPlatformProducts.length, bestDeals.length, budgetPicks.length, recentPriceChanges.length, categoryWiseSections]);
+  }, [trendingProducts.length, newArrivals.length, crossPlatformProducts.length, bestDeals.length, budgetPicks.length, recentPriceChanges.length, relatedSearchProducts.length, categoryWiseSections]);
 
   // Navigation handlers
   const handleProductPress = useCallback((product) => {
@@ -425,24 +575,24 @@ const HomeScreenV2 = () => {
   }, [isLoadingMore, maxItemsAvailable, visibleItemsPerSection]);
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
-      <StatusBar barStyle="dark-content" backgroundColor={COLORS.white} />
+    <SafeAreaView style={[styles.container, { backgroundColor: themePalette.background || styles.container.backgroundColor }]} edges={['top']}>
+      <StatusBar barStyle="dark-content" backgroundColor={themePalette.surface || COLORS.white} />
 
       {/* Header */}
-      <View style={styles.header}>
+      <View style={[styles.header, { backgroundColor: themePalette.surface || COLORS.white, borderBottomColor: themePalette.border || COLORS.gray100 }]}>
         <View style={styles.headerLeft}>
-          <Text style={styles.logo}>DH</Text>
-          <Text style={styles.appName}>{APP.NAME}</Text>
+          <Text style={[styles.logo, { backgroundColor: themePalette.primary || COLORS.primary }]}>DH</Text>
+          <Text style={[styles.appName, { color: themePalette.text || COLORS.textPrimary }]}>{APP.NAME}</Text>
         </View>
         <View style={styles.headerRight}>
           <TouchableOpacity style={styles.iconBtn}>
-            <Ionicons name="notifications-outline" size={24} color={COLORS.textPrimary} />
+            <Ionicons name="notifications-outline" size={24} color={themePalette.text || COLORS.textPrimary} />
           </TouchableOpacity>
         </View>
       </View>
 
       {/* Search Bar (Tap to navigate) */}
-      <TouchableOpacity style={styles.searchBar} onPress={handleSearchTap} activeOpacity={0.8}>
+      <TouchableOpacity style={[styles.searchBar, { backgroundColor: themePalette.surface || COLORS.white, borderColor: themePalette.border || COLORS.gray200 }]} onPress={handleSearchTap} activeOpacity={0.8}>
         <Ionicons name="search" size={20} color={COLORS.gray400} />
         <Text style={styles.searchPlaceholder}>Search products across platforms...</Text>
       </TouchableOpacity>
@@ -454,7 +604,12 @@ const HomeScreenV2 = () => {
         onScroll={handleScroll}
         scrollEventThrottle={16}
         refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[COLORS.primary]} tintColor={COLORS.primary} />
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            colors={[themePalette.primary || COLORS.primary]}
+            tintColor={themePalette.primary || COLORS.primary}
+          />
         }
       >
         {/* Banner Carousel */}
@@ -463,19 +618,21 @@ const HomeScreenV2 = () => {
         {/* Quick Categories */}
         <QuickCategories onCategoryPress={handleCategoryPress} categories={topCategories} />
 
-        {/* Trending Now */}
-        <View onLayout={(e) => registerSectionOffset('trending-now', e.nativeEvent.layout.y)}>
-          <ProductSection
-            title="Trending Now"
-            emoji="🔥"
-            subtitle="Most viewed and searched products right now"
-            accentColor="#F97316"
-            products={trendingProducts}
-            maxItems={visibleItemsPerSection}
-            onProductPress={handleProductPress}
-            isLoading={isLoading}
-          />
-        </View>
+        {/* Personalized by last user search */}
+        {relatedSearchProducts.length > 0 && (
+          <View onLayout={(e) => registerSectionOffset('related-search', e.nativeEvent.layout.y)}>
+            <ProductSection
+              title={`Based on "${lastSearchQuery}"`}
+              emoji="🎯"
+              subtitle="Products related to your most recent search"
+              accentColor="#0891B2"
+              products={relatedSearchProducts}
+              maxItems={visibleItemsPerSection}
+              onProductPress={handleProductPress}
+              isLoading={false}
+            />
+          </View>
+        )}
 
         {/* New Arrivals */}
         <View onLayout={(e) => registerSectionOffset('new-arrivals', e.nativeEvent.layout.y)}>
@@ -488,6 +645,20 @@ const HomeScreenV2 = () => {
             maxItems={visibleItemsPerSection}
             onProductPress={handleProductPress}
             isLoading={isLoading || homeDataLoading}
+          />
+        </View>
+
+        {/* Trending Now */}
+        <View onLayout={(e) => registerSectionOffset('trending-now', e.nativeEvent.layout.y)}>
+          <ProductSection
+            title="Trending Now"
+            emoji="🔥"
+            subtitle="Most viewed and searched products right now"
+            accentColor="#F97316"
+            products={trendingProducts}
+            maxItems={visibleItemsPerSection}
+            onProductPress={handleProductPress}
+            isLoading={isLoading}
           />
         </View>
 
@@ -510,7 +681,7 @@ const HomeScreenV2 = () => {
           <ProductSection
             title="Recently Price Changed"
             emoji="📉"
-            subtitle="Fresh items with active price movement"
+            subtitle="Sorted by latest price-change and update timestamps"
             accentColor="#7C3AED"
             products={recentPriceChanges}
             maxItems={visibleItemsPerSection}
@@ -569,8 +740,8 @@ const HomeScreenV2 = () => {
         )}
 
         {/* Footer */}
-        <View style={styles.footer}>
-          <Text style={styles.footerText}>Compare prices across 6 platforms</Text>
+        <View style={[styles.footer, { backgroundColor: themePalette.surfaceMuted || '#EEF0F6' }]}>
+          <Text style={[styles.footerText, { color: themePalette.textSecondary || COLORS.textSecondary }]}>Compare prices across 6 platforms</Text>
           <Text style={styles.footerPlatforms}>Amazon • Flipkart • Meesho • Myntra • Nykaa • Croma</Text>
         </View>
       </ScrollView>

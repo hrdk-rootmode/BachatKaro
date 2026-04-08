@@ -4,12 +4,12 @@
     "slug": "dealhunt-app",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/deal.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "scheme": "dealhunt",
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/deal.png",
       "resizeMode": "contain",
       "backgroundColor": "#FF6B35"
     },
@@ -19,7 +19,7 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/deal.png",
         "backgroundColor": "#FF6B35"
       },
       "edgeToEdgeEnabled": true,
