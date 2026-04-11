@@ -16,7 +16,7 @@ Usage:
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.orm import selectinload
 from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -123,6 +123,52 @@ class QueryService:
         
         self.logger.debug(f"Search found {len(products)}/{total} products")
         return products, total
+    
+    async def search_products_by_keywords(
+        self,
+        keywords: List[str],
+        limit: int = 100
+    ) -> List[Product]:
+        """
+        Search products by multiple keywords (category filtering)
+        
+        Args:
+            keywords: List of keywords to match against title, category, subcategory
+            limit: Max results to return
+            
+        Returns:
+            List of Product ORM objects matching any keyword
+        """
+        if not keywords:
+            return []
+        
+        self.logger.debug(f"Query: search_products_by_keywords(keywords={keywords}, limit={limit})")
+        
+        normalized_keywords = [str(k or "").strip().lower() for k in keywords]
+        normalized_keywords = [k for k in normalized_keywords if len(k) >= 2]
+        if not normalized_keywords:
+            return []
+
+        # Build OR conditions for all keywords over stable Product fields.
+        conditions = []
+        for keyword in normalized_keywords:
+            search_token = f"%{keyword}%"
+            conditions.append(func.lower(Product.title).like(search_token))
+            conditions.append(func.lower(Product.category).like(search_token))
+            conditions.append(func.lower(func.coalesce(Product.subcategory, "")).like(search_token))
+            conditions.append(func.lower(func.coalesce(Product.brand, "")).like(search_token))
+
+        result = await self.db.execute(
+            select(Product)
+            .where(or_(*conditions))
+            .order_by(Product.created_at.desc())
+            .limit(limit)
+        )
+        products = result.scalars().all()
+
+        self.logger.debug(f"Keyword search found {len(products)} products")
+        return products
+
     
     # ========================================================================
     # LISTING QUERIES

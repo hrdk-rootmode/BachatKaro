@@ -272,3 +272,133 @@ async def get_home_cross_platform(
     except Exception as e:
         logger.error(f"Error fetching cross-platform home products: {e}", exc_info=True)
         return []
+
+
+@router.get("/category/{category_id}", response_model=List[TrendingProductResponse])
+async def get_category_products(
+    category_id: str,
+    limit: int = 100,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get all products for a specific category
+    
+    ✅ Direct DB access (no cache)
+    ✅ Category-specific filtering
+    ✅ Real-time category products
+    """
+    try:
+        query_service = QueryService(db)
+        
+        # Map category IDs to search keywords and tighter include/exclude guards.
+        category_keywords_map = {
+            'mobiles': ['phone', 'smartphone', 'iphone', 'samsung', 'redmi', 'oneplus', 'realme', 'pixel', 'oppo', 'vivo', 'mobile'],
+            'tablets': ['ipad', 'tablet', 'tab'],
+            'laptops': ['laptop', 'notebook', 'macbook', 'chromebook', 'gaming laptop', 'ultrabook'],
+            'mobile_accessories': ['cover', 'case', 'tempered', 'protector', 'charger', 'cable', 'earbuds', 'earphones', 'power bank', 'magsafe', 'airpods', 'mobile accessory'],
+            'laptop_accessories': ['laptop bag', 'sleeve', 'mouse', 'keyboard', 'cooling pad', 'dock', 'usb hub', 'webcam', 'external ssd', 'hard disk', 'laptop accessory'],
+            'fashion': ['shirt', 'tshirt', 't-shirt', 'jeans', 'dress', 'saree', 'kurta', 'shoes', 'fashion', 'watch', 'clothing'],
+            'home_kitchen': ['mixer', 'kitchen', 'cookware', 'vacuum', 'chair', 'table', 'mattress', 'home', 'furniture'],
+            'books': ['book', 'novel', 'author', 'paperback', 'hardcover', 'bestseller'],
+        }
+
+        category_rules = {
+            'mobiles': {
+                'include_any': ['mobile', 'smartphone', 'phone', 'iphone', 'samsung', 'redmi', 'oneplus', 'realme', 'vivo', 'oppo', 'pixel'],
+                'exclude_any': ['women', 'men', 'kurta', 'saree', 'dress', 'shoe']
+            },
+            'tablets': {
+                'include_any': ['tablet', 'ipad', 'tab'],
+                'exclude_any': ['women', 'men', 'kurta', 'saree', 'dress', 'shoe']
+            },
+            'laptops': {
+                'include_any': ['laptop', 'notebook', 'macbook', 'chromebook', 'ultrabook'],
+                'exclude_any': ['women', 'men', 'kurta', 'saree', 'dress', 'shoe', 'lipstick', 'makeup']
+            },
+            'mobile_accessories': {
+                'include_any': ['cover', 'case', 'tempered', 'charger', 'cable', 'earbud', 'earphone', 'power bank', 'magsafe'],
+                'exclude_any': ['kurta', 'saree', 'dress', 'shoe']
+            },
+            'laptop_accessories': {
+                'include_any': ['laptop bag', 'sleeve', 'mouse', 'keyboard', 'cooling pad', 'dock', 'usb hub', 'webcam', 'ssd', 'hard disk'],
+                'exclude_any': ['kurta', 'saree', 'dress', 'shoe']
+            },
+            'fashion': {
+                'include_any': ['fashion', 'shirt', 'tshirt', 'jeans', 'dress', 'saree', 'kurta', 'shoe', 'clothing'],
+                'exclude_any': ['laptop', 'mobile', 'tablet', 'vacuum', 'cookware']
+            },
+            'home_kitchen': {
+                'include_any': ['home', 'kitchen', 'cookware', 'vacuum', 'furniture', 'mixer', 'chair', 'table', 'mattress'],
+                'exclude_any': ['kurta', 'saree', 'dress', 'shoe']
+            },
+            'books': {
+                'include_any': ['book', 'novel', 'author', 'paperback', 'hardcover', 'bestseller'],
+                'exclude_any': ['laptop', 'mobile', 'fashion', 'dress', 'saree']
+            },
+        }
+        
+        keywords = category_keywords_map.get(category_id, [])
+        if not keywords:
+            logger.warning(f"Unknown category: {category_id} | User: {user.id}")
+            return []
+        
+        # Get products matching category keywords
+        products = await query_service.search_products_by_keywords(
+            keywords=keywords,
+            limit=max(limit * 4, 160)
+        )
+        
+        if not products:
+            logger.info(f"No products found for category {category_id} | User: {user.id}")
+            return []
+        
+        # Get and format listings
+        category_products = []
+        rules = category_rules.get(category_id, {"include_any": keywords, "exclude_any": []})
+        include_any = [str(x).lower() for x in rules.get("include_any", [])]
+        exclude_any = [str(x).lower() for x in rules.get("exclude_any", [])]
+
+        for product in products:
+            try:
+                searchable = " ".join([
+                    str(getattr(product, "title", "") or ""),
+                    str(getattr(product, "brand", "") or ""),
+                    str(getattr(product, "category", "") or ""),
+                    str(getattr(product, "subcategory", "") or ""),
+                ]).lower()
+
+                if exclude_any and any(token in searchable for token in exclude_any):
+                    continue
+                if include_any and not any(token in searchable for token in include_any):
+                    continue
+
+                # Get listings for this product
+                listings = await query_service.get_product_listings(str(product.id))
+                valid_listings = BusinessLogic.filter_valid_listings(listings, product)
+                
+                if not valid_listings:
+                    continue
+                
+                # Use listing with best price
+                best_listing = min(valid_listings, key=lambda l: l.current_price or float('inf'))
+                
+                # Get platform count for this product
+                platform_count = len(valid_listings)
+                response = BusinessLogic.format_trending_response(product, best_listing, platform_count=platform_count)
+                response.rank = len(category_products) + 1
+                category_products.append(response)
+
+                if len(category_products) >= limit:
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error formatting product {product.id}: {e}")
+                continue
+        
+        logger.info(f"Category {category_id} products: {len(category_products)} | User: {user.id}")
+        return category_products
+        
+    except Exception as e:
+        logger.error(f"Error fetching category products: {e}", exc_info=True)
+        return []

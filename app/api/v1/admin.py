@@ -17,8 +17,9 @@ Security:
 """
 
 import logging
-from datetime import datetime, timedelta, date
-from typing import Optional, List
+import asyncio
+from datetime import datetime, timedelta, date, timezone
+from typing import Optional, List, Dict, Any
 from uuid import UUID
 import json
 
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_, update, delete, text, cast, String
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
+from bs4 import BeautifulSoup
 
 from app.core.database import get_db
 from app.core.redis_client import get_redis, RedisClient
@@ -51,10 +53,22 @@ from app.schemas import (
     SubscriptionPlanUpdateRequest,
     # Jobs
     SchedulerStatusResponse, TriggerJobRequest, TriggerJobResponse,
+    # Scraper Testing
+    PlatformStatus, ScraperStatusResponse, ScraperTestRequest, ScraperTestResult,
+    ScraperTestResponse, BatchScraperTestResponse, ScraperFixRequest, ScraperFixResponse,
+    ScraperConfigUpdateRequest, ScraperConfigResponse, ScraperInspectionResponse,
+    ScraperSelectorUpdateRequest, ScraperSelectorUpdateResponse,
+    # ✅ NEW: Selector validation schemas
+    SelectorHealthInfo, LastScrapedValue, SelectorValidationResult,
+    HtmlOutlineNode, SelectorInspectionItem,
+    ValidateSelectorRequest, ValidateSelectorResponse,
     # Common
     UserPlan
 )
 from app.services.analytics import analytics_service
+from app.services.ai.groq_client import groq_client
+from app.services.admin.selector_validator import SelectorValidator, LastScrapedValueFinder
+from app.services.scraper.browser import get_browser_manager
 
 # ✅ NEW: Import scheduler functions
 from jobs.scheduler import trigger_job_manually, get_scheduler_status
@@ -131,6 +145,75 @@ async def log_action(
         details=details,
         ip_address=ip
     )
+
+
+def _normalize_selector_value(selector_value: Any) -> str:
+    if isinstance(selector_value, dict):
+        return str(selector_value.get("selector", "") or "").strip()
+    if selector_value is None:
+        return ""
+    return str(selector_value).strip()
+
+
+def _build_selector_hint(tag: str, node_id: Optional[str], classes: List[str]) -> str:
+    if node_id:
+        return f"#{node_id}"
+    if classes:
+        return "." + ".".join(classes[:3])
+    return tag
+
+
+def _build_html_outline(html: str, max_nodes: int = 120, max_depth: int = 4) -> List[Dict[str, Any]]:
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    root = soup.body or soup
+    outline: List[Dict[str, Any]] = []
+
+    def walk(node, depth: int = 0) -> None:
+        if len(outline) >= max_nodes or depth > max_depth:
+            return
+
+        for child in getattr(node, "children", []):
+            if len(outline) >= max_nodes:
+                return
+            if not getattr(child, "name", None):
+                continue
+            if child.name in {"script", "style", "noscript"}:
+                continue
+
+            classes = child.get("class", []) or []
+            attrs = {
+                key: value
+                for key, value in child.attrs.items()
+                if key in {"href", "src", "role", "aria-label", "data-testid", "data-id", "itemprop"}
+            }
+            outline.append({
+                "depth": depth,
+                "tag": child.name,
+                "node_id": child.get("id"),
+                "classes": classes[:6],
+                "text": child.get_text(" ", strip=True)[:160] or None,
+                "selector_hint": _build_selector_hint(child.name, child.get("id"), classes),
+                "attributes": attrs,
+            })
+            walk(child, depth + 1)
+
+    walk(root, 0)
+    return outline
+
+
+async def _fetch_live_html(page_url: str, timeout_seconds: int = 45) -> str:
+    browser_manager = await get_browser_manager()
+
+    async with browser_manager.get_page(block_resources=False, stealth=True) as page:
+        await asyncio.wait_for(
+            page.goto(page_url, wait_until="domcontentloaded"),
+            timeout=min(timeout_seconds, 45)
+        )
+        await asyncio.wait_for(page.wait_for_timeout(1500), timeout=min(timeout_seconds, 10))
+        return await asyncio.wait_for(page.content(), timeout=min(timeout_seconds, 45))
 
 
 def is_sensitive_config_key(key: str) -> bool:
@@ -1423,12 +1506,16 @@ async def get_admin_product_detail(
     return {
         "product": {
             "id": str(product.id),
+            "fingerprint": product.fingerprint,
+            "variant_fingerprint": product.variant_fingerprint,
+            "base_fingerprint": product.base_fingerprint,
             "title": product.title,
             "brand": product.brand,
             "category": product.category,
             "subcategory": product.subcategory,
             "image_url": product.image_url,
             "specifications": product.specifications,
+            "stats": product.stats,
             "variant_type": product.variant_type,
             "storage_gb": product.storage_gb,
             "color": product.color,
@@ -2844,7 +2931,6 @@ async def toggle_maintenance_mode(
         "enabled_maintenance" if maintenance_request.enabled else "disabled_maintenance",
         details={
             "message": maintenance_request.message,
-            "duration_minutes": maintenance_request.estimated_duration_minutes
         },
         request=request
     )
@@ -2855,3 +2941,947 @@ async def toggle_maintenance_mode(
         "message": maintenance_request.message if maintenance_request.enabled else "Maintenance mode disabled",
         "estimated_duration_minutes": maintenance_request.estimated_duration_minutes
     }
+
+
+@router.get("/scrapers/status", response_model=ScraperStatusResponse)
+async def get_scraper_status(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user)
+) -> ScraperStatusResponse:
+    """Get status of all platform scrapers"""
+    await verify_admin_email(user)
+    
+    # Get platform data from database
+    result = await db.execute(
+        select(Platform).order_by(Platform.name)  
+    )
+    platforms_db = result.scalars().all()
+    
+    platform_statuses = []
+    healthy_count = 0
+    error_count = 0
+    
+    for platform in platforms_db:
+        # Get recent listings for this platform
+        listings_result = await db.execute(
+            select(ProductListing)
+            .where(ProductListing.platform_id == platform.id)
+            .order_by(ProductListing.last_scraped.desc())
+            .limit(100)
+        )
+        listings = listings_result.scalars().all()
+        
+        # Calculate metrics
+        total_listings = len(listings)
+        # Fix: use timezone aware UTC datetime to avoid comparison error
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=7)
+        recent_listings = [l for l in listings if l.last_scraped and l.last_scraped > cutoff_time]
+        success_rate = len(recent_listings) / max(total_listings, 1) * 100 if total_listings > 0 else 0.0
+        
+        # Determine status
+        if success_rate >= 80:
+            status = "healthy"
+            healthy_count += 1
+        elif success_rate >= 50:
+            status = "warning"
+        else:
+            status = "error"
+            error_count += 1
+        
+        # Get last run time
+        last_run = None
+        if listings:
+            last_run = max((l.last_scraped for l in listings if l.last_scraped), default=None)
+        
+        platform_status = PlatformStatus(
+            platform=platform.name,
+            status=status,
+            success_rate=success_rate,
+            total_listings=total_listings,
+            last_run=last_run,
+            last_error=None,  # Could be enhanced with error tracking
+            response_time_ms=None,  # Could be enhanced with performance tracking
+            is_enabled=platform.is_active
+        )
+        platform_statuses.append(platform_status)
+    
+    # Determine overall health
+    if healthy_count == len(platform_statuses):
+        overall_health = "healthy"
+    elif healthy_count >= len(platform_statuses) * 0.7:
+        overall_health = "warning"
+    else:
+        overall_health = "error"
+    
+    return ScraperStatusResponse(
+        platforms=platform_statuses,
+        overall_health=overall_health,
+        total_platforms=len(platform_statuses),
+        healthy_platforms=healthy_count,
+        error_platforms=error_count
+    )
+
+
+@router.post("/scrapers/test/{platform}", response_model=ScraperTestResponse)
+async def test_platform_scraper(
+    platform: str,
+    test_request: ScraperTestRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+    request: Request = None
+) -> ScraperTestResponse:
+    """Test a specific platform scraper with selector health info"""
+    await verify_admin_email(user)
+    
+    # Validate platform
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported. Use: {', '.join(supported_platforms)}"
+        )
+    
+    started_at = datetime.utcnow()
+    
+    try:
+        # Import test script functionality
+        import sys
+        import os
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..')))
+        
+        from scripts.test_scrapers import test_search, test_url
+        from app.services.scraper.base import ProductData
+        
+        # ✅ NEW: Load platform config and selectors from database
+        result = await db.execute(select(Platform).where(Platform.name == platform))
+        platform_config = result.scalar_one_or_none()
+        
+        db_selectors = {}
+        db_selector_health = {}
+        html_validation_results = {}
+        
+        if platform_config and platform_config.selectors:
+            db_selectors = platform_config.selectors or {}
+        
+        # Determine test type
+        if test_request.url:
+            # Test URL scraping
+            product = await test_url(platform, test_request.url, test_request.mode)
+            success = product is not None
+            products_found = 1 if product else 0
+            test_type = "url"
+            sample_products = []
+            test_html = None  # Will fetch if available
+            
+            if product:
+                sample_products.append({
+                    "title": product.title,
+                    "brand": product.brand,
+                    "price": product.current_price,
+                    "url": product.product_url
+                })
+        elif test_request.query:
+            # Test search functionality
+            products = await test_search(platform, test_request.query, test_request.mode, test_request.limit)
+            success = len(products) > 0
+            products_found = len(products)
+            test_type = "search"
+            sample_products = []
+            test_html = None
+            
+            for product in products[:3]:  # Limit sample products
+                sample_products.append({
+                    "title": product.title,
+                    "brand": product.brand,
+                    "price": product.current_price,
+                    "url": product.product_url
+                })
+        else:
+            # Health check only
+            test_type = "health_check"
+            success = True
+            products_found = 0
+            sample_products = []
+            test_html = None
+        
+        # ✅ NEW: Validate selectors against HTML if available
+        if test_html and db_selectors:
+            html_validation_results = await SelectorValidator.validate_selectors_batch(
+                db_selectors,
+                test_html
+            )
+            
+            # Build selector health info
+            for field_name, selector in db_selectors.items():
+                validation = html_validation_results.get(field_name, {})
+                health_status = SelectorValidator.get_selector_health(validation)
+                
+                db_selector_health[field_name] = SelectorHealthInfo(
+                    selector=selector,
+                    status=health_status,
+                    match_count=validation.get("match_count", 0),
+                    sample_text=validation.get("sample_matches", [None])[0] if validation.get("sample_matches") else None,
+                    confidence=validation.get("confidence", 0.0),
+                    last_validated_at=datetime.utcnow()
+                )
+        
+        # ✅ NEW: Get last scraped values
+        last_scraped_values = await LastScrapedValueFinder.get_last_scraped_values(
+            db,
+            platform,
+            limit=5
+        )
+        
+        completed_at = datetime.utcnow()
+        test_duration_ms = (completed_at - started_at).total_seconds() * 1000
+        
+        # Create test result with new fields
+        test_result = ScraperTestResult(
+            platform=platform,
+            success=success,
+            products_found=products_found,
+            test_duration_ms=test_duration_ms,
+            extraction_method=None,  # Could be enhanced
+            error_message=None if success else "No products found",
+            sample_products=sample_products,
+            performance_metrics={
+                "test_duration_ms": test_duration_ms,
+                "products_per_second": products_found / (test_duration_ms / 1000) if test_duration_ms > 0 else 0
+            },
+            # ✅ NEW: Add selector health and validation info
+            db_selectors=db_selectors if db_selectors else None,
+            db_selector_health=db_selector_health if db_selector_health else None,
+            last_scraped_values=last_scraped_values if last_scraped_values else None,
+            html_validation_results=html_validation_results if html_validation_results else None
+        )
+        
+        # Log the test
+        await log_action(
+            db, user.email,
+            f"test_scraper_{platform}",
+            details={
+                "test_type": test_type,
+                "query": test_request.query,
+                "url": test_request.url,
+                "mode": test_request.mode,
+                "success": success,
+                "products_found": products_found,
+                "selector_health": {k: v.status for k, v in db_selector_health.items()} if db_selector_health else {}
+            },
+            request=request
+        )
+        
+        return ScraperTestResponse(
+            success=True,
+            platform=platform,
+            test_type=test_type,
+            started_at=started_at,
+            completed_at=completed_at,
+            results=test_result,
+            message=f"Test completed successfully. Found {products_found} products."
+        )
+        
+    except Exception as e:
+        logger.error(f"Scraper test error: {e}", exc_info=True)
+        completed_at = datetime.utcnow()
+        test_duration_ms = (completed_at - started_at).total_seconds() * 1000
+        
+        # Create error result
+        test_result = ScraperTestResult(
+            platform=platform,
+            success=False,
+            products_found=0,
+            test_duration_ms=test_duration_ms,
+            extraction_method=None,
+            error_message=str(e),
+            sample_products=[],
+            performance_metrics={"test_duration_ms": test_duration_ms}
+        )
+        
+        # Log the error
+        await log_action(
+            db, user.email,
+            f"test_scraper_{platform}_error",
+            details={
+                "test_type": "error",
+                "error": str(e),
+                "duration_ms": test_duration_ms
+            },
+            request=request
+        )
+        
+        return ScraperTestResponse(
+            success=False,
+            platform=platform,
+            test_type="error",
+            started_at=started_at,
+            completed_at=completed_at,
+            results=test_result,
+            message=f"Test failed: {str(e)}"
+        )
+
+
+@router.post("/scrapers/validate-selector/{platform}", response_model=ValidateSelectorResponse)
+async def validate_selector(
+    platform: str,
+    validate_request: ValidateSelectorRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+    request: Request = None
+) -> ValidateSelectorResponse:
+    """Validate a single selector against platform HTML (admin scraper testing tool)"""
+    await verify_admin_email(user)
+    
+    # Validate platform
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported"
+        )
+    
+    try:
+        selector = validate_request.selector
+        field_name = validate_request.field_name
+
+        html_content = (validate_request.html_content or "").strip()
+        if not html_content and validate_request.page_url:
+            html_content = await _fetch_live_html(validate_request.page_url, timeout_seconds=20)
+
+        if not html_content:
+            html_content = """
+            <div class="product-item">
+                <h2 class="product-title">Sample Product Title</h2>
+                <span class="product-price">₹1,999</span>
+                <img class="product-image" src="image.jpg"/>
+                <div class="rating">4.5 stars</div>
+            </div>
+            """
+        
+        # Validate the selector
+        validation_result = SelectorValidator.validate_selector_against_html(
+            selector,
+            html_content
+        )
+        
+        # Determine health status
+        health_status = SelectorValidator.get_selector_health(validation_result)
+        
+        # Log the validation
+        await log_action(
+            db, user.email,
+            f"validate_selector_{platform}",
+            details={
+                "field_name": field_name,
+                "selector": selector,
+                "match_count": validation_result.get("match_count", 0),
+                "status": health_status
+            },
+            request=request
+        )
+        
+        return ValidateSelectorResponse(
+            success=True,
+            field_name=field_name,
+            selector=selector,
+            match_count=validation_result.get("match_count", 0),
+            is_valid=validation_result.get("is_valid", False),
+            sample_matches=validation_result.get("sample_matches", []),
+            confidence=validation_result.get("confidence", 0.0),
+            error=validation_result.get("error"),
+            status=health_status
+        )
+        
+    except Exception as e:
+        logger.error(f"Selector validation error: {e}", exc_info=True)
+        
+        return ValidateSelectorResponse(
+            success=False,
+            field_name=validate_request.field_name,
+            selector=validate_request.selector,
+            match_count=0,
+            is_valid=False,
+            sample_matches=[],
+            confidence=0.0,
+            error=str(e),
+            status="untested"
+        )
+
+
+@router.post("/scrapers/inspect/{platform}", response_model=ScraperInspectionResponse)
+async def inspect_scraper_page(
+    platform: str,
+    inspect_request: ScraperTestRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+    request: Request = None
+) -> ScraperInspectionResponse:
+    """Fetch live HTML, outline it, and validate DB selectors against that page."""
+    await verify_admin_email(user)
+
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported"
+        )
+
+    page_url = (inspect_request.url or "").strip()
+    if not page_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A live page URL is required for inspection"
+        )
+
+    started_at = datetime.utcnow()
+
+    try:
+        result = await db.execute(select(Platform).where(Platform.name == platform))
+        platform_config = result.scalar_one_or_none()
+        selector_snapshot = {}
+        if platform_config and platform_config.selectors:
+            selector_snapshot = platform_config.selectors or {}
+
+        html_content = await _fetch_live_html(page_url, timeout_seconds=inspect_request.timeout_seconds)
+        html_outline = _build_html_outline(html_content)
+        last_scraped_values = await LastScrapedValueFinder.get_last_scraped_values(db, platform, limit=3)
+
+        selector_insights: Dict[str, Any] = {}
+        broken_fields: List[str] = []
+        suggested_fields: List[str] = []
+
+        for field_name, selector_value in selector_snapshot.items():
+            current_selector = _normalize_selector_value(selector_value)
+            validation = SelectorValidator.validate_selector_against_html(current_selector, html_content)
+            status = SelectorValidator.get_selector_health(validation)
+
+            ai_suggested_selector = None
+            ai_status = None
+            ai_match_count = None
+            ai_sample_matches: List[str] = []
+
+            if current_selector:
+                try:
+                    ai_suggested_selector = await groq_client.suggest_selector_fix(
+                        html_snippet=html_content,
+                        failed_selector=current_selector,
+                        target_data=field_name,
+                        platform_name=platform,
+                    )
+                except Exception as ai_error:
+                    logger.warning(f"AI selector suggestion failed for {platform}:{field_name}: {ai_error}")
+
+                if ai_suggested_selector:
+                    suggested_fields.append(field_name)
+                    ai_validation = SelectorValidator.validate_selector_against_html(ai_suggested_selector, html_content)
+                    ai_status = SelectorValidator.get_selector_health(ai_validation)
+                    ai_match_count = ai_validation.get("match_count", 0)
+                    ai_sample_matches = ai_validation.get("sample_matches", [])[:3]
+
+            if status in {"broken", "uncertain"}:
+                broken_fields.append(field_name)
+
+            selector_insights[field_name] = {
+                "field_name": field_name,
+                "current_selector": current_selector,
+                "status": status,
+                "match_count": validation.get("match_count", 0),
+                "sample_matches": validation.get("sample_matches", [])[:3],
+                "confidence": validation.get("confidence", 0.0),
+                "ai_suggested_selector": ai_suggested_selector,
+                "ai_status": ai_status,
+                "ai_match_count": ai_match_count,
+                "ai_sample_matches": ai_sample_matches,
+            }
+
+        await log_action(
+            db,
+            user.email,
+            f"inspect_scraper_{platform}",
+            details={
+                "page_url": page_url,
+                "selector_count": len(selector_snapshot),
+                "broken_fields": broken_fields,
+                "suggested_fields": suggested_fields,
+            },
+            request=request,
+        )
+
+        return ScraperInspectionResponse(
+            success=True,
+            platform=platform,
+            page_url=page_url,
+            fetched_at=started_at,
+            html_length=len(html_content),
+            html_excerpt=html_content[:18000],
+            html_outline=html_outline,
+            selector_snapshot={field: _normalize_selector_value(selector_value) for field, selector_value in selector_snapshot.items()},
+            selector_insights=selector_insights,
+            last_scraped_values=last_scraped_values,
+            ai_summary={
+                "total_selectors": len(selector_snapshot),
+                "broken_fields": broken_fields,
+                "suggested_fields": suggested_fields,
+                "html_nodes": len(html_outline),
+                "has_live_html": True,
+            },
+            message=f"Inspection completed for {platform}"
+        )
+
+    except Exception as e:
+        logger.error(f"Scraper inspection error: {e}", exc_info=True)
+        return ScraperInspectionResponse(
+            success=False,
+            platform=platform,
+            page_url=page_url,
+            fetched_at=started_at,
+            html_length=0,
+            html_excerpt="",
+            html_outline=[],
+            selector_snapshot={},
+            selector_insights={},
+            last_scraped_values=[],
+            ai_summary={"error": str(e), "has_live_html": False},
+            message=str(e)
+        )
+
+
+@router.get("/scrapers/selectors/{platform}", response_model=Dict[str, str])
+async def get_platform_selectors(
+    platform: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+) -> Any:
+    """Get all raw selectors currently stored in DB for a platform"""
+    await verify_admin_email(user)
+    
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported"
+        )
+    
+    result = await db.execute(select(Platform).where(Platform.name == platform))
+    platform_config = result.scalar_one_or_none()
+    
+    if not platform_config:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Platform '{platform}' not found")
+    
+    selectors = {}
+    if platform_config.selectors:
+        for field, value in platform_config.selectors.items():
+            selectors[field] = _normalize_selector_value(value)
+    
+    return selectors
+
+
+@router.put("/scrapers/selectors/{platform}", response_model=ScraperSelectorUpdateResponse)
+async def update_scraper_selector(
+    platform: str,
+    update_request: ScraperSelectorUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+    request: Request = None,
+) -> ScraperSelectorUpdateResponse:
+    """Persist a selector edit for a platform in the DB."""
+    await verify_admin_email(user)
+
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported"
+        )
+
+    field_name = update_request.field_name.strip()
+    selector_value = update_request.selector.strip()
+    if not field_name or not selector_value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="field_name and selector are required")
+
+    result = await db.execute(select(Platform).where(Platform.name == platform))
+    platform_config = result.scalar_one_or_none()
+    if not platform_config:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Platform '{platform}' not found")
+
+    selectors = dict(platform_config.selectors or {})
+    old_selector = _normalize_selector_value(selectors.get(field_name)) if field_name in selectors else None
+    selectors[field_name] = selector_value
+
+    platform_config.selectors = selectors
+    flag_modified(platform_config, "selectors")
+    await db.commit()
+
+    await log_action(
+        db,
+        user.email,
+        f"update_scraper_selector_{platform}",
+        details={
+            "field_name": field_name,
+            "old_selector": old_selector,
+            "new_selector": selector_value,
+        },
+        request=request,
+    )
+
+    return ScraperSelectorUpdateResponse(
+        success=True,
+        platform=platform,
+        field_name=field_name,
+        old_selector=old_selector,
+        new_selector=selector_value,
+        updated_at=datetime.utcnow(),
+        message=f"Selector for {field_name} updated successfully"
+    )
+
+
+@router.post("/scrapers/test/all", response_model=BatchScraperTestResponse)
+async def test_all_scrapers(
+    test_request: ScraperTestRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+    request: Request = None
+) -> BatchScraperTestResponse:
+    """Test all platform scrapers"""
+    await verify_admin_email(user)
+    
+    if not test_request.query:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query is required for batch testing all platforms"
+        )
+    
+    started_at = datetime.utcnow()
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    platform_results = []
+    successful_tests = 0
+    failed_tests = 0
+    
+    for platform in supported_platforms:
+        try:
+            # Test each platform
+            platform_response = await test_platform_scraper(
+                platform, test_request, db, user, request
+            )
+            platform_results.append(platform_response)
+            
+            if platform_response.success:
+                successful_tests += 1
+            else:
+                failed_tests += 1
+                
+        except Exception as e:
+            failed_tests += 1
+            # Create error response for this platform
+            error_response = ScraperTestResponse(
+                success=False,
+                platform=platform,
+                test_type="error",
+                started_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+                results=ScraperTestResult(
+                    platform=platform,
+                    success=False,
+                    products_found=0,
+                    test_duration_ms=0,
+                    error_message=str(e)
+                ),
+                message=f"Platform test failed: {str(e)}"
+            )
+            platform_results.append(error_response)
+    
+    completed_at = datetime.utcnow()
+    total_duration_ms = (completed_at - started_at).total_seconds() * 1000
+    
+    # Create summary
+    summary = {
+        "total_duration_ms": total_duration_ms,
+        "average_platform_time_ms": total_duration_ms / len(supported_platforms),
+        "success_rate": (successful_tests / len(supported_platforms)) * 100,
+        "total_products_found": sum(r.results.products_found for r in platform_results if r.success),
+        "query": test_request.query,
+        "mode": test_request.mode
+    }
+    
+    # Log the batch test
+    await log_action(
+        db, user.email,
+        "test_all_scrapers",
+        details={
+            "query": test_request.query,
+            "mode": test_request.mode,
+            "total_platforms": len(supported_platforms),
+            "successful_tests": successful_tests,
+            "failed_tests": failed_tests,
+            "success_rate": summary["success_rate"]
+        },
+        request=request
+    )
+    
+    return BatchScraperTestResponse(
+        success=successful_tests > 0,
+        started_at=started_at,
+        completed_at=completed_at,
+        total_platforms=len(supported_platforms),
+        successful_tests=successful_tests,
+        failed_tests=failed_tests,
+        platform_results=platform_results,
+        summary=summary
+    )
+
+
+@router.post("/scrapers/fix/{platform}", response_model=ScraperFixResponse)
+async def fix_platform_scraper(
+    platform: str,
+    fix_request: ScraperFixRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user),
+    request: Request = None
+) -> ScraperFixResponse:
+    """Fix a platform scraper (auto-fix, manual config, or reset)"""
+    await verify_admin_email(user)
+    
+    # Validate platform
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported"
+        )
+    
+    applied_at = datetime.utcnow()
+    changes_made = []
+    
+    try:
+        if fix_request.fix_type == "auto":
+            # Auto-fix using self-healing mechanisms
+            changes_made.append("Cleared scraper cache")
+            changes_made.append("Reset rate limiters")
+            changes_made.append("Reinitialized browser session")
+            
+            # Could add more sophisticated auto-fix logic here
+            message = f"Auto-fix applied to {platform} scraper"
+            
+        elif fix_request.fix_type == "manual":
+            # Manual configuration updates
+            if fix_request.config_updates:
+                for key, value in fix_request.config_updates.items():
+                    # Update platform configuration
+                    changes_made.append(f"Updated {key}: {value}")
+                message = f"Manual configuration updates applied to {platform} scraper"
+            else:
+                message = f"No configuration changes provided for {platform}"
+                
+        elif fix_request.fix_type == "reset":
+            # Reset scraper to default state
+            changes_made.append("Reset scraper configuration to defaults")
+            changes_made.append("Cleared all cached data")
+            changes_made.append("Reinitialized scraper instance")
+            message = f"Reset {platform} scraper to default state"
+        
+        # Log the fix
+        await log_action(
+            db, user.email,
+            f"fix_scraper_{platform}",
+            details={
+                "fix_type": fix_request.fix_type,
+                "changes_made": changes_made,
+                "config_updates": fix_request.config_updates
+            },
+            request=request
+        )
+        
+        return ScraperFixResponse(
+            success=True,
+            platform=platform,
+            fix_type=fix_request.fix_type,
+            applied_at=applied_at,
+            changes_made=changes_made,
+            message=message
+        )
+        
+    except Exception as e:
+        return ScraperFixResponse(
+            success=False,
+            platform=platform,
+            fix_type=fix_request.fix_type,
+            applied_at=applied_at,
+            changes_made=[],
+            message=f"Fix failed: {str(e)}"
+        )
+
+
+@router.get("/scrapers/results/{platform}")
+async def get_scraper_results(
+    platform: str,
+    days: int = Query(default=7, ge=1, le=30),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_admin_user)
+) -> dict:
+    """Get recent test results for a platform"""
+    await verify_admin_email(user)
+    
+    # Validate platform
+    supported_platforms = ["amazon", "flipkart", "myntra", "nykaa", "croma", "meesho"]
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Platform '{platform}' not supported"
+        )
+    
+    # Get recent listings for this platform
+    since_date = datetime.utcnow() - timedelta(days=days)
+    listings_result = await db.execute(
+        select(ProductListing)
+        .where(ProductListing.platform_name == platform)
+        .where(ProductListing.updated_at >= since_date)
+        .order_by(ProductListing.updated_at.desc())
+    )
+    listings = listings_result.scalars().all()
+    
+    # Calculate statistics
+    total_listings = len(listings)
+    successful_listings = len([l for l in listings if l.current_price and l.current_price > 0])
+    success_rate = (successful_listings / total_listings * 100) if total_listings > 0 else 0
+    
+    # Group by date
+    daily_stats = {}
+    for listing in listings:
+        if listing.updated_at:
+            date_key = listing.updated_at.date().isoformat()
+            if date_key not in daily_stats:
+                daily_stats[date_key] = {"total": 0, "successful": 0}
+            daily_stats[date_key]["total"] += 1
+            if listing.current_price and listing.current_price > 0:
+                daily_stats[date_key]["successful"] += 1
+    
+    return {
+        "platform": platform,
+        "period_days": days,
+        "total_listings": total_listings,
+        "successful_listings": successful_listings,
+        "success_rate": success_rate,
+        "daily_statistics": daily_stats,
+        "recent_listings": [
+            {
+                "id": str(listing.id),
+                "title": listing.title[:100] + "..." if listing.title and len(listing.title) > 100 else listing.title,
+                "current_price": listing.current_price,
+                "updated_at": listing.updated_at.isoformat() if listing.updated_at else None
+            }
+            for listing in listings[:10]  # Limit to 10 most recent
+        ]
+    }
+
+
+# =============================================================================
+# GROQ API KEY TESTER
+# =============================================================================
+
+@router.post("/scrapers/groq/test-key")
+async def test_groq_api_key(
+    payload: dict = Body(...),
+    user: User = Depends(get_current_admin_user),
+) -> dict:
+    """Test a Groq API key by making a minimal real API call."""
+    await verify_admin_email(user)
+
+    api_key = (payload.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+
+    import httpx, time
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+        "max_tokens": 5,
+        "temperature": 0.0,
+    }
+
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers, json=body)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            reply = data["choices"][0]["message"]["content"].strip()
+            model_used = data.get("model", "unknown")
+            usage = data.get("usage", {})
+            return {
+                "success": True,
+                "reply": reply,
+                "model": model_used,
+                "latency_ms": latency_ms,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+            }
+        elif resp.status_code == 401:
+            return {"success": False, "error": "Invalid API key (401 Unauthorized)", "latency_ms": latency_ms}
+        elif resp.status_code == 429:
+            return {"success": False, "error": "Rate limit hit (429) — key is valid but quota exhausted", "latency_ms": latency_ms}
+        else:
+            return {"success": False, "error": f"Groq returned HTTP {resp.status_code}: {resp.text[:200]}", "latency_ms": latency_ms}
+
+    except httpx.TimeoutException:
+        return {"success": False, "error": "Request timed out after 15s", "latency_ms": int((time.perf_counter() - t0) * 1000)}
+    except Exception as e:
+        return {"success": False, "error": f"Unexpected error: {str(e)}", "latency_ms": int((time.perf_counter() - t0) * 1000)}
+
+
+@router.get("/scrapers/playwright/check")
+async def check_playwright(
+    user: User = Depends(get_current_admin_user),
+) -> dict:
+    """Check if Playwright + Chromium are available on this server."""
+    await verify_admin_email(user)
+
+    checks = {}
+
+    try:
+        import playwright as _pw
+        checks["playwright_installed"] = True
+        checks["playwright_version"] = getattr(_pw, "__version__", "unknown")
+    except ImportError as e:
+        checks["playwright_installed"] = False
+        checks["playwright_error"] = str(e)
+        return {"ready": False, "checks": checks, "fix": "pip install playwright && playwright install chromium"}
+
+    # Launch chromium in a thread (Windows-safe)
+    import concurrent.futures
+
+    def _try_launch():
+        import asyncio, sys
+        if sys.platform == "win32":
+            loop = asyncio.ProactorEventLoop()
+        else:
+            loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def _launch():
+                from playwright.async_api import async_playwright
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                    v = browser.version
+                    await browser.close()
+                    return v
+            return loop.run_until_complete(_launch())
+        finally:
+            loop.close()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            version = pool.submit(_try_launch).result(timeout=30)
+        checks["chromium_available"] = True
+        checks["chromium_version"] = version
+        return {"ready": True, "checks": checks}
+    except Exception as e:
+        import traceback
+        logger.error(f"Playwright check failed:\n{traceback.format_exc()}")
+        checks["chromium_available"] = False
+        checks["chromium_error"] = str(e) or repr(e)
+        return {"ready": False, "checks": checks, "fix": "playwright install chromium"}

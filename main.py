@@ -9,6 +9,14 @@ Features:
 - Self-healing scrapers
 """
 
+import sys
+import asyncio
+
+# Playwright launches Chromium via asyncio subprocess APIs, which require
+# ProactorEventLoop on Windows.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse

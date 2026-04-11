@@ -1239,3 +1239,223 @@ class TriggerJobResponse(BaseModel):
     started_at: datetime
     message: str
     async_execution: bool = False
+
+
+# ==================== SCRAPER TESTING SCHEMAS ====================
+
+class PlatformStatus(BaseModel):
+    """Status of a single platform scraper"""
+    platform: str
+    status: str  # "healthy", "error", "warning", "unknown"
+    success_rate: float
+    total_listings: int
+    last_run: Optional[datetime]
+    last_error: Optional[str]
+    response_time_ms: Optional[float]
+    is_enabled: bool
+
+
+class ScraperStatusResponse(BaseModel):
+    """Response with all platform scraper statuses"""
+    platforms: List[PlatformStatus]
+    overall_health: str
+    total_platforms: int
+    healthy_platforms: int
+    error_platforms: int
+
+
+class ScraperTestRequest(BaseModel):
+    """Request to test a platform scraper"""
+    query: Optional[str] = None
+    url: Optional[str] = None
+    limit: int = Field(default=5, ge=1, le=20)
+    mode: str = Field(default="standalone", pattern="^(offline|standalone|db)$")
+    timeout_seconds: int = Field(default=45, ge=10, le=120)
+
+
+class SelectorHealthInfo(BaseModel):
+    """Health information for a single selector"""
+    selector: str
+    status: str  # "working", "broken", "untested"
+    match_count: int
+    sample_text: Optional[str] = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    last_validated_at: Optional[datetime] = None
+
+
+class LastScrapedValue(BaseModel):
+    """Last scraped value for a field"""
+    field_name: str
+    value: Optional[str] = None
+    extraction_method: Optional[str] = None  # "dom_selector", "api_native", "ai_healed", "json_ld"
+    confidence: Optional[float] = None
+    last_scraped_at: Optional[datetime] = None
+    source: Optional[str] = None  # platform or db
+
+
+class SelectorValidationResult(BaseModel):
+    """Validation result for a selector against HTML"""
+    field_name: str
+    selector: str
+    match_count: int
+    is_valid: bool
+    sample_matches: List[str] = Field(default_factory=list, max_items=3)
+
+
+class ValidateSelectorRequest(BaseModel):
+    """Request to validate a single selector"""
+    selector: str = Field(..., min_length=1, max_length=500)
+    field_name: str = Field(..., min_length=1, max_length=100)
+    html_content: Optional[str] = Field(default=None, max_length=200000)
+    page_url: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ValidateSelectorResponse(BaseModel):
+    """Response after validating a selector"""
+    success: bool
+    field_name: str
+    selector: str
+    match_count: int
+    is_valid: bool
+    sample_matches: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    error: Optional[str] = None
+    status: str  # "working", "broken", "uncertain", "untested"
+
+
+class HtmlOutlineNode(BaseModel):
+    """Single node in a compact HTML outline"""
+    depth: int
+    tag: str
+    node_id: Optional[str] = None
+    classes: List[str] = Field(default_factory=list)
+    text: Optional[str] = None
+    selector_hint: Optional[str] = None
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SelectorInspectionItem(BaseModel):
+    """Live selector inspection result for a single field"""
+    field_name: str
+    current_selector: str
+    status: str
+    match_count: int
+    sample_matches: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    ai_suggested_selector: Optional[str] = None
+    ai_status: Optional[str] = None
+    ai_match_count: Optional[int] = None
+    ai_sample_matches: List[str] = Field(default_factory=list)
+
+
+class ScraperInspectionResponse(BaseModel):
+    """Live HTML inspection payload for admin diagnostics"""
+    success: bool
+    platform: str
+    page_url: str
+    fetched_at: datetime
+    html_length: int
+    html_excerpt: str
+    html_outline: List[HtmlOutlineNode] = Field(default_factory=list)
+    selector_snapshot: Dict[str, str] = Field(default_factory=dict)
+    selector_insights: Dict[str, SelectorInspectionItem] = Field(default_factory=dict)
+    last_scraped_values: List[LastScrapedValue] = Field(default_factory=list)
+    ai_summary: Dict[str, Any] = Field(default_factory=dict)
+    message: str = ""
+
+
+class ScraperSelectorUpdateRequest(BaseModel):
+    """Request to persist a selector update for a platform"""
+    field_name: str = Field(..., min_length=1, max_length=100)
+    selector: str = Field(..., min_length=1, max_length=500)
+
+
+class ScraperSelectorUpdateResponse(BaseModel):
+    """Response after persisting a selector update"""
+    success: bool
+    platform: str
+    field_name: str
+    old_selector: Optional[str] = None
+    new_selector: str
+    updated_at: datetime
+    message: str
+
+
+class ScraperTestResult(BaseModel):
+    """Result of a single scraper test"""
+    platform: str
+    success: bool
+    products_found: int
+    test_duration_ms: float
+    extraction_method: Optional[str]
+    error_message: Optional[str]
+    sample_products: List[Dict[str, Any]] = []
+    performance_metrics: Dict[str, float] = {}
+    
+    # ✅ NEW: Selector health and validation info
+    db_selectors: Optional[Dict[str, str]] = Field(None, description="Current DB selectors for this platform")
+    db_selector_health: Optional[Dict[str, SelectorHealthInfo]] = Field(None, description="Health status for each DB selector")
+    last_scraped_values: Optional[List[LastScrapedValue]] = Field(None, description="Last scraped values for comparison")
+    html_validation_results: Optional[Dict[str, SelectorValidationResult]] = Field(None, description="Validation results against live HTML")
+
+
+class ScraperTestResponse(BaseModel):
+    """Response after testing a platform scraper"""
+    success: bool
+    platform: str
+    test_type: str  # "search", "url", "health_check"
+    started_at: datetime
+    completed_at: datetime
+    results: ScraperTestResult
+    message: str
+
+
+class BatchScraperTestResponse(BaseModel):
+    """Response after testing multiple platforms"""
+    success: bool
+    started_at: datetime
+    completed_at: datetime
+    total_platforms: int
+    successful_tests: int
+    failed_tests: int
+    platform_results: List[ScraperTestResponse]
+    summary: Dict[str, Any]
+
+
+class ScraperFixRequest(BaseModel):
+    """Request to fix a platform scraper"""
+    platform: str
+    fix_type: str = Field(default="auto", pattern="^(auto|manual|reset)$")
+    config_updates: Optional[Dict[str, Any]] = None
+    force_retrain: bool = False
+
+
+class ScraperFixResponse(BaseModel):
+    """Response after fixing a platform scraper"""
+    success: bool
+    platform: str
+    fix_type: str
+    applied_at: datetime
+    changes_made: List[str]
+    message: str
+    verification_result: Optional[ScraperTestResult] = None
+
+
+class ScraperConfigUpdateRequest(BaseModel):
+    """Request to update scraper configuration"""
+    platform: str
+    config_key: str
+    config_value: Any
+    config_type: str = Field(default="string", pattern="^(string|number|boolean|json)$")
+    description: Optional[str] = None
+
+
+class ScraperConfigResponse(BaseModel):
+    """Response after updating scraper configuration"""
+    success: bool
+    platform: str
+    config_key: str
+    old_value: Any
+    new_value: Any
+    updated_at: datetime
+    message: str

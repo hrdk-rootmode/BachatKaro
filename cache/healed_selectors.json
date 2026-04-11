@@ -2,13 +2,13 @@
   "amazon": {
     "product_title": {
       "selector": "#productTitle",
-      "healed_at": "2026-04-08T06:03:34.248296",
+      "healed_at": "2026-04-10T16:15:17.516050",
       "method": "promoted",
       "version": 1,
-      "success_count": 942,
+      "success_count": 1002,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-08T08:43:28.310744"
+      "last_success": "2026-04-10T17:36:32.005443"
     },
     "original_price": {
       "selector": "span[class*=\"price\"]",
@@ -22,23 +22,23 @@
     },
     "product_price": {
       "selector": "span.a-price-whole",
-      "healed_at": "2026-04-08T06:03:34.294472",
+      "healed_at": "2026-04-10T16:15:17.556258",
       "method": "promoted",
       "version": 1,
-      "success_count": 942,
+      "success_count": 1000,
       "fail_count": 2,
       "promoted": true,
-      "last_success": "2026-04-08T08:43:28.351279"
+      "last_success": "2026-04-10T17:36:32.043683"
     },
     "product_rating": {
       "selector": "span.a-icon-alt",
-      "healed_at": "2026-04-08T06:03:34.394141",
+      "healed_at": "2026-04-10T16:15:17.663194",
       "method": "promoted",
       "version": 1,
-      "success_count": 930,
+      "success_count": 988,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-08T08:43:28.475522"
+      "last_success": "2026-04-10T17:36:32.124736"
     },
     "review_count": {
       "selector": "span.a-icon-alt",
@@ -62,13 +62,13 @@
     },
     "brand": {
       "selector": "span.a-icon-alt",
-      "healed_at": "2026-04-08T06:03:34.443385",
+      "healed_at": "2026-04-10T16:15:17.700004",
       "method": "promoted",
       "version": 1,
-      "success_count": 938,
+      "success_count": 998,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-08T08:43:28.511555"
+      "last_success": "2026-04-10T17:36:32.160686"
     },
     "discount_percent": {
       "selector": "span.a-offscreen",
@@ -91,13 +91,13 @@
     },
     "product_image": {
       "selector": "img:nth-of-type(1)",
-      "healed_at": "2026-04-08T08:44:43.805982",
+      "healed_at": "2026-04-10T16:52:51.576952",
       "method": "promoted",
       "version": 4,
-      "success_count": 2482,
+      "success_count": 2660,
       "fail_count": 0,
       "promoted": true,
-      "last_success": "2026-04-08T08:44:43.808062"
+      "last_success": "2026-04-10T17:36:32.083294"
     }
   },
   "flipkart": {
