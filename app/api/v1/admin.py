@@ -155,6 +155,40 @@ def _normalize_selector_value(selector_value: Any) -> str:
     return str(selector_value).strip()
 
 
+CATEGORY_OVERRIDE_KEY = "__category_overrides__"
+
+
+def _normalize_category_name(category: Optional[str]) -> Optional[str]:
+    if category is None:
+        return None
+    cleaned = str(category).strip().lower().replace(" ", "_")
+    if not cleaned or cleaned in {"all", "default", "general", "none"}:
+        return None
+    return cleaned[:80]
+
+
+def _resolve_selector_snapshot(selectors_payload: Dict[str, Any], category: Optional[str] = None) -> Dict[str, Any]:
+    """Merge top-level selectors with optional category overrides."""
+    payload = dict(selectors_payload or {})
+    snapshot = {
+        key: value
+        for key, value in payload.items()
+        if key != CATEGORY_OVERRIDE_KEY and isinstance(key, str)
+    }
+
+    normalized_category = _normalize_category_name(category)
+    if not normalized_category:
+        return snapshot
+
+    category_overrides = payload.get(CATEGORY_OVERRIDE_KEY, {}) or {}
+    if isinstance(category_overrides, dict):
+        category_bucket = category_overrides.get(normalized_category, {}) or {}
+        if isinstance(category_bucket, dict):
+            snapshot.update(category_bucket)
+
+    return snapshot
+
+
 def _build_selector_hint(tag: str, node_id: Optional[str], classes: List[str]) -> str:
     if node_id:
         return f"#{node_id}"
@@ -451,7 +485,7 @@ async def list_users(
         usage = u.usage_stats or {}
         streak = u.streak_data or {}
 
-        usage_total_searches = usage.get("total_searches", usage.get("daily_searches", 0))
+        usage_total_searches = usage.get("total_searches", 0)
         db_total_searches = search_counts.get(u.id, 0)
         total_searches = max(int(usage_total_searches or 0), int(db_total_searches or 0))
 
@@ -544,7 +578,7 @@ async def get_user_detail(
     
     usage = target_user.usage_stats or {}
     streak = target_user.streak_data or {}
-    usage_total_searches = usage.get("total_searches", usage.get("daily_searches", 0))
+    usage_total_searches = usage.get("total_searches", 0)
     total_searches = max(int(usage_total_searches or 0), int(db_total_searches or 0))
     
     accounts_on_device = 0
@@ -3243,6 +3277,7 @@ async def validate_selector(
     try:
         selector = validate_request.selector
         field_name = validate_request.field_name
+        category = _normalize_category_name(validate_request.category)
 
         html_content = (validate_request.html_content or "").strip()
         if not html_content and validate_request.page_url:
@@ -3274,6 +3309,7 @@ async def validate_selector(
             details={
                 "field_name": field_name,
                 "selector": selector,
+                "category": category,
                 "match_count": validation_result.get("match_count", 0),
                 "status": health_status
             },
@@ -3327,6 +3363,7 @@ async def inspect_scraper_page(
         )
 
     page_url = (inspect_request.url or "").strip()
+    category = _normalize_category_name(inspect_request.category)
     if not page_url:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3340,7 +3377,7 @@ async def inspect_scraper_page(
         platform_config = result.scalar_one_or_none()
         selector_snapshot = {}
         if platform_config and platform_config.selectors:
-            selector_snapshot = platform_config.selectors or {}
+            selector_snapshot = _resolve_selector_snapshot(platform_config.selectors or {}, category)
 
         html_content = await _fetch_live_html(page_url, timeout_seconds=inspect_request.timeout_seconds)
         html_outline = _build_html_outline(html_content)
@@ -3400,6 +3437,7 @@ async def inspect_scraper_page(
             f"inspect_scraper_{platform}",
             details={
                 "page_url": page_url,
+                "category": category,
                 "selector_count": len(selector_snapshot),
                 "broken_fields": broken_fields,
                 "suggested_fields": suggested_fields,
@@ -3420,6 +3458,7 @@ async def inspect_scraper_page(
             last_scraped_values=last_scraped_values,
             ai_summary={
                 "total_selectors": len(selector_snapshot),
+                "category": category,
                 "broken_fields": broken_fields,
                 "suggested_fields": suggested_fields,
                 "html_nodes": len(html_outline),
@@ -3449,6 +3488,7 @@ async def inspect_scraper_page(
 @router.get("/scrapers/selectors/{platform}", response_model=Dict[str, str])
 async def get_platform_selectors(
     platform: str,
+    category: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_admin_user),
 ) -> Any:
@@ -3468,9 +3508,11 @@ async def get_platform_selectors(
     if not platform_config:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Platform '{platform}' not found")
     
+    normalized_category = _normalize_category_name(category)
     selectors = {}
-    if platform_config.selectors:
-        for field, value in platform_config.selectors.items():
+    selector_snapshot = _resolve_selector_snapshot(platform_config.selectors or {}, normalized_category)
+    if selector_snapshot:
+        for field, value in selector_snapshot.items():
             selectors[field] = _normalize_selector_value(value)
     
     return selectors
@@ -3480,6 +3522,7 @@ async def get_platform_selectors(
 async def update_scraper_selector(
     platform: str,
     update_request: ScraperSelectorUpdateRequest,
+    category: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_admin_user),
     request: Request = None,
@@ -3504,9 +3547,23 @@ async def update_scraper_selector(
     if not platform_config:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Platform '{platform}' not found")
 
+    normalized_category = _normalize_category_name(update_request.category or category)
     selectors = dict(platform_config.selectors or {})
-    old_selector = _normalize_selector_value(selectors.get(field_name)) if field_name in selectors else None
-    selectors[field_name] = selector_value
+    old_selector = None
+
+    if normalized_category:
+        category_overrides = dict(selectors.get(CATEGORY_OVERRIDE_KEY) or {})
+        category_bucket = dict(category_overrides.get(normalized_category) or {})
+        old_selector = _normalize_selector_value(category_bucket.get(field_name)) if field_name in category_bucket else None
+        category_bucket[field_name] = selector_value
+        category_overrides[normalized_category] = category_bucket
+        selectors[CATEGORY_OVERRIDE_KEY] = category_overrides
+
+        # Backward-compatible: keep latest category selector available at top level.
+        selectors[field_name] = selector_value
+    else:
+        old_selector = _normalize_selector_value(selectors.get(field_name)) if field_name in selectors else None
+        selectors[field_name] = selector_value
 
     platform_config.selectors = selectors
     flag_modified(platform_config, "selectors")
@@ -3518,6 +3575,7 @@ async def update_scraper_selector(
         f"update_scraper_selector_{platform}",
         details={
             "field_name": field_name,
+            "category": normalized_category,
             "old_selector": old_selector,
             "new_selector": selector_value,
         },
@@ -3528,6 +3586,7 @@ async def update_scraper_selector(
         success=True,
         platform=platform,
         field_name=field_name,
+        category=normalized_category,
         old_selector=old_selector,
         new_selector=selector_value,
         updated_at=datetime.utcnow(),

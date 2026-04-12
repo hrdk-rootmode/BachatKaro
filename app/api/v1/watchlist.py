@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, delete
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import logging
 
@@ -26,6 +26,8 @@ from app.services.plan_catalog import get_plan_catalog, get_plan_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+WATCHLIST_GRACE_DAYS = 2
 
 
 # =============================================================================
@@ -89,6 +91,66 @@ def format_watchlist_item(
     )
 
 
+def _parse_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+async def _get_watchlist_state(user: User, db: AsyncSession) -> dict:
+    plan_catalog = await get_plan_catalog(db)
+    usage_stats = dict(user.usage_stats or {})
+    current_plan = str(user.plan).lower()
+    base_limit = get_plan_limit(plan_catalog, current_plan, "watchlist_limit", 5)
+    watchlist_bonus = int(usage_stats.get("watchlist_bonus") or 0)
+    limit = base_limit + watchlist_bonus
+    grace_until = _parse_datetime(usage_stats.get("watchlist_grace_until"))
+    now = datetime.utcnow()
+    grace_active = bool(grace_until and grace_until > now)
+    grace_days_remaining = int((grace_until - now).days) if grace_active else None
+
+    return {
+        "base_limit": base_limit,
+        "limit": limit,
+        "watchlist_bonus": watchlist_bonus,
+        "grace_until": grace_until,
+        "is_grace_period": grace_active,
+        "grace_days_remaining": grace_days_remaining,
+        "warning_message": usage_stats.get("watchlist_grace_reason"),
+    }
+
+
+async def _prune_excess_watchlist_items(user: User, db: AsyncSession, redis: RedisClient, limit: int) -> int:
+    result = await db.execute(
+        select(UserWatchlist)
+        .where(UserWatchlist.user_id == user.id)
+        .order_by(UserWatchlist.created_at.asc(), UserWatchlist.id.asc())
+    )
+    watchlist_items = result.scalars().all()
+    current_count = len(watchlist_items)
+
+    if current_count <= limit:
+        return 0
+
+    prune_count = current_count - limit
+    for item in watchlist_items[:prune_count]:
+        await db.delete(item)
+
+    await db.commit()
+    await redis.delete(f"watchlist:{user.id}")
+
+    logger.warning(
+        f"Watchlist auto-pruned | User: {user.id} | Removed: {prune_count} | Limit: {limit}"
+    )
+
+    return prune_count
+
+
 # =============================================================================
 # ROUTES
 # =============================================================================
@@ -113,6 +175,13 @@ async def get_watchlist(
         logger.info(f"Watchlist cache HIT | User: {user.id}")
         return WatchlistResponse(**cached)
     
+    watchlist_state = await _get_watchlist_state(user, db)
+
+    # Auto-prune only after the grace window has expired
+    pruned_count = 0
+    if not watchlist_state["is_grace_period"]:
+        pruned_count = await _prune_excess_watchlist_items(user, db, redis, watchlist_state["limit"])
+
     # Get watchlist items
     result = await db.execute(
         select(UserWatchlist)
@@ -129,14 +198,34 @@ async def get_watchlist(
             items.append(format_watchlist_item(item, product, listing))
     
     # Get limit based on plan
-    plan_catalog = await get_plan_catalog(db)
-    limit = get_plan_limit(plan_catalog, str(user.plan).lower(), "watchlist_limit", 5)
+    limit = watchlist_state["limit"]
+    total_count = len(items)
+    over_limit_count = max(0, total_count - limit)
+    warning_message = None
+
+    if over_limit_count > 0:
+        if watchlist_state["is_grace_period"]:
+            remaining = watchlist_state["grace_days_remaining"]
+            warning_message = (
+                f"Grace period active: remove {over_limit_count} item{'s' if over_limit_count != 1 else ''} within {remaining} day{'s' if remaining != 1 else ''}."
+                if remaining is not None
+                else f"Grace period active: remove {over_limit_count} excess item{'s' if over_limit_count != 1 else ''}."
+            )
+        else:
+            warning_message = (
+                f"Watchlist exceeds your limit by {over_limit_count} item{'s' if over_limit_count != 1 else ''}."
+            )
     
     response = WatchlistResponse(
         items=items,
-        total_count=len(items),
+        total_count=total_count,
         limit=limit,
-        limit_reached=len(items) >= limit
+        limit_reached=total_count >= limit,
+        is_grace_period=watchlist_state["is_grace_period"],
+        grace_days_remaining=watchlist_state["grace_days_remaining"],
+        over_limit_count=over_limit_count,
+        warning_message=warning_message,
+        pruned_count=pruned_count,
     )
     
     # Cache for 5 minutes
@@ -166,19 +255,27 @@ async def add_to_watchlist(
     - Enable/disable notifications
     - Respects plan-based limits
     """
-    # Check watchlist limit
+    watchlist_state = await _get_watchlist_state(user, db)
+    limit = watchlist_state["limit"]
+
+    # If grace has expired, auto-prune before allowing any more actions.
+    if not watchlist_state["is_grace_period"]:
+        await _prune_excess_watchlist_items(user, db, redis, limit)
+
     result = await db.execute(
         select(UserWatchlist)
         .where(UserWatchlist.user_id == user.id)
     )
     current_count = len(result.scalars().all())
-    plan_catalog = await get_plan_catalog(db)
-    limit = get_plan_limit(plan_catalog, str(user.plan).lower(), "watchlist_limit", 5)
-    
+
     if current_count >= limit:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Watchlist limit reached ({limit} items). Upgrade your plan for more slots."
+            detail=(
+                f"Watchlist limit reached ({limit} items)."
+                if not watchlist_state["is_grace_period"]
+                else f"Watchlist grace period active. Remove {current_count - limit + 1} item{'s' if current_count - limit + 1 != 1 else ''} before adding more."
+            )
         )
     
     # Check if product exists
@@ -298,23 +395,23 @@ async def remove_from_watchlist(
     """
     Remove product from watchlist
     """
-    # Get watchlist item
+    # Resolve the watchlist row by either watchlist item ID or product ID.
+    # The frontend can send either form depending on where removal is triggered.
     result = await db.execute(
-        select(UserWatchlist)
-        .where(
+        select(UserWatchlist).where(
             and_(
-                UserWatchlist.id == item_id,
-                UserWatchlist.user_id == user.id
+                UserWatchlist.user_id == user.id,
+                (UserWatchlist.id == item_id) | (UserWatchlist.product_id == item_id)
             )
         )
     )
     watchlist_item = result.scalar_one_or_none()
-    
+
     if not watchlist_item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Watchlist item not found"
-        )
+        # Treat already-removed items as success so stale UI state does not surface
+        # an unnecessary error after the list has refreshed.
+        logger.info(f"Watchlist item already absent | User: {user.id} | Item: {item_id}")
+        return None
     
     # Delete
     await db.delete(watchlist_item)

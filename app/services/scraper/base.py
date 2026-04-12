@@ -19,6 +19,7 @@ import time
 import re
 import hashlib
 import json
+import html
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1464,6 +1465,190 @@ class BasePlatformHandler(ABC):
         extracted["_extraction_stats"] = extraction_stats
         return extracted
 
+    async def universal_search_fallback(
+        self,
+        page,
+        html_content: str,
+        limit: int = 10,
+    ) -> List[ProductData]:
+        """Generic product-list fallback used when platform-specific extraction fails."""
+        products: List[ProductData] = []
+        seen_urls = set()
+
+        try:
+            dom_items = await page.evaluate('''() => {
+                const out = [];
+                const selectors = [
+                    'a[href*="/p/"]',
+                    'a[href*="/dp/"]',
+                    'a[href*="/product/"]',
+                    'a[href*="productId="]',
+                    'li.product-base',
+                    '[data-testid*="product"]',
+                    '[class*="product-card"]',
+                    '[class*="product"]',
+                    'article',
+                    'section',
+                    '[data-id]'
+                ];
+
+                const seen = new Set();
+
+                const normalizeHref = (href) => {
+                    if (!href) return '';
+                    if (href.startsWith('//')) return `https:${href}`;
+                    return href;
+                };
+
+                const pickText = (card) => {
+                    const candidates = [];
+                    card.querySelectorAll('h1, h2, h3, h4, h5, [class*="title"], [class*="name"], img[alt]').forEach((el) => {
+                        const text = (el.textContent || el.getAttribute('alt') || '').trim();
+                        if (text && text.length >= 5) candidates.push(text);
+                    });
+                    if (candidates.length > 0) return candidates[0];
+
+                    const lines = (card.innerText || card.textContent || '')
+                        .split('\n')
+                        .map((line) => line.trim())
+                        .filter((line) => line.length >= 5 && line.length <= 220 && !/[₹$€£]/.test(line));
+                    return lines.length > 0 ? lines[0] : '';
+                };
+
+                const pickPrice = (text) => {
+                    const patterns = [
+                        /₹\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)/gi,
+                        /Rs\.?\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)/gi,
+                        /INR\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)/gi
+                    ];
+                    const values = [];
+                    for (const pattern of patterns) {
+                        for (const match of text.matchAll(pattern)) {
+                            if (match && match[1]) {
+                                const cleaned = match[1].replace(/,/g, '');
+                                const amount = Number.parseFloat(cleaned);
+                                if (Number.isFinite(amount) && amount > 0) {
+                                    values.push(amount);
+                                }
+                            }
+                        }
+                    }
+                    if (values.length > 0) {
+                        return String(Math.min(...values));
+                    }
+                    return '';
+                };
+
+                const pickImage = (card) => {
+                    const imgs = card.querySelectorAll('img[src], img[data-src], img[data-srcset]');
+                    for (const img of imgs) {
+                        const rawSrc = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-srcset') || '';
+                        const src = rawSrc.toLowerCase();
+                        if (!src) continue;
+                        if (src.includes('wishlist') || src.includes('svgicons') || src.includes('/icon/') || src.includes('/icons/')) continue;
+                        if (src.endsWith('.svg') || src.startsWith('data:image/svg')) continue;
+                        return rawSrc;
+                    }
+                    return '';
+                };
+
+                for (const selector of selectors) {
+                    document.querySelectorAll(selector).forEach((card) => {
+                        if (seen.size >= 40) return;
+
+                        const link = card.querySelector('a[href]') || card.closest('a[href]');
+                        const href = normalizeHref(link ? (link.getAttribute('href') || link.href || '') : (card.getAttribute('href') || ''));
+                        if (!href) return;
+
+                        const loweredHref = href.toLowerCase();
+                        const looksLikeProduct = loweredHref.includes('/p/') || loweredHref.includes('/dp/') || loweredHref.includes('/product/') || loweredHref.includes('productid=');
+                        if (!looksLikeProduct || seen.has(href)) return;
+
+                        const text = (card.innerText || card.textContent || '').trim();
+                        if (!text || text.length < 10) return;
+                        if (/access denied|captcha|security check|loading|view all/i.test(text)) return;
+
+                        const title = pickText(card);
+                        const price = pickPrice(text);
+                        if (!title || !price) return;
+
+                        seen.add(href);
+                        out.push({ href, title, price, image: pickImage(card) });
+                    });
+                }
+
+                return out.slice(0, 40);
+            }''')
+
+            for item in dom_items or []:
+                title = self._clean_product_title(item.get("title"))
+                price = self._clean_price(item.get("price"))
+                href = self._clean_url(item.get("href"))
+                if not title or not price or not href or href in seen_urls:
+                    continue
+
+                image = item.get("image")
+                image_url = image if self._is_meaningful_extracted_value("product_image", image) else None
+                product_id = self.extract_product_id(href) or hashlib.md5(href.encode()).hexdigest()[:16]
+
+                products.append(ProductData(
+                    external_id=product_id,
+                    title=title[:200],
+                    current_price=price,
+                    product_url=self.build_affiliate_url(href),
+                    platform_name=self.platform_name,
+                    image_url=image_url,
+                    in_stock=True,
+                    extraction_method=ExtractionMethod.REGEX_FALLBACK,
+                    data_source=HandlerType.SCRAPER,
+                    raw_data={
+                        "source": "universal_search_fallback",
+                        "url": href,
+                        "raw_title": str(item.get("title") or "")[:300],
+                    },
+                ))
+                seen_urls.add(href)
+
+            if products:
+                return products[:limit]
+        except Exception as e:
+            logger.debug(f"Universal search fallback DOM pass failed: {e}")
+
+        try:
+            for href, block in re.findall(r'<a[^>]+href="([^"]*(?:/p/|/dp/|/product/|productId=)[^"]*)"[^>]*>(.*?)</a>', html_content or '', re.IGNORECASE | re.DOTALL)[:40]:
+                clean_href = self._clean_url(href)
+                if not clean_href or clean_href in seen_urls:
+                    continue
+
+                text = self._clean_text(re.sub(r'<[^>]+>', ' ', block))
+                title = self._clean_product_title(text)
+                price = self._clean_price(text)
+                if not title or not price:
+                    continue
+
+                product_id = self.extract_product_id(clean_href) or hashlib.md5(clean_href.encode()).hexdigest()[:16]
+                products.append(ProductData(
+                    external_id=product_id,
+                    title=title,
+                    current_price=price,
+                    product_url=self.build_affiliate_url(clean_href),
+                    platform_name=self.platform_name,
+                    extraction_method=ExtractionMethod.REGEX_FALLBACK,
+                    data_source=HandlerType.SCRAPER,
+                    raw_data={
+                        "source": "universal_search_fallback_html",
+                        "url": clean_href,
+                        "raw_title": text[:300],
+                    },
+                ))
+                seen_urls.add(clean_href)
+                if len(products) >= limit:
+                    return products[:limit]
+        except Exception as e:
+            logger.debug(f"Universal search fallback HTML pass failed: {e}")
+
+        return products[:limit]
+
     def _extract_regex_fallback_value(
         self,
         pattern: str,
@@ -1518,7 +1703,15 @@ class BasePlatformHandler(ABC):
 
         if field_lower in ["product_url", "url"]:
             url = str(value).strip()
-            return url.startswith("http") or url.startswith("/")
+            if not (url.startswith("http") or url.startswith("/")):
+                return False
+
+            lowered = url.lower()
+            bad_tokens = ["wishlist.svg", "svgicons", "/icon/", "/icons/", "placeholder", "default-image"]
+            if any(token in lowered for token in bad_tokens):
+                return False
+
+            return any(token in lowered for token in ["/p/", "/dp/", "/product/", "/catalog/", "productid="])
 
         if "image" in field_lower:
             image_url = str(value).strip().lower()
@@ -1607,6 +1800,8 @@ class BasePlatformHandler(ABC):
         
         if not isinstance(text, str):
             text = str(text)
+
+        text = html.unescape(text)
         
         text = re.sub(r'\s+', ' ', text).strip()
         
@@ -1621,6 +1816,37 @@ class BasePlatformHandler(ABC):
             text = re.sub(pattern, '', text, flags=re.IGNORECASE)
         
         return text.strip() if text else None
+
+    def _clean_product_title(self, title: Any) -> Optional[str]:
+        """Clean product title and remove embedded price/promo fragments."""
+        cleaned = self._clean_text(title)
+        if not cleaned:
+            return None
+
+        original = cleaned
+
+        # For noisy titles like "Name ₹29,999 ₹34,999 14% off", keep part before price.
+        price_token = re.search(r'(?i)(?:₹|rs\.?|inr)\s*\d', cleaned)
+        if price_token and price_token.start() > 0:
+            cleaned = cleaned[:price_token.start()].strip()
+
+        promo_patterns = [
+            r'\b\d+(?:\.\d+)?\s*%\s*off\b',
+            r'\bfree\s+delivery\b',
+            r'\bexclusive\s+offers?\b',
+            r'\bsupplier\b',
+            r'\|',
+        ]
+        for pattern in promo_patterns:
+            cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+
+        cleaned = re.sub(r'\s+\d(?:\.\d)?(?:\s*\(\d+\))?\s*$', '', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(" -|,.:;")
+
+        if len(cleaned) < 6:
+            return original[:200]
+
+        return cleaned[:200]
     
     def _clean_price(self, price_str: Any) -> Optional[Decimal]:
         """Clean price string and convert to Decimal"""
@@ -1631,7 +1857,31 @@ class BasePlatformHandler(ABC):
             return Decimal(str(price_str))
         
         try:
-            cleaned = re.sub(r'[₹$€£,\s]', '', str(price_str))
+            text = str(price_str).strip()
+            
+            # Extract all currency-prefixed prices and ignore discount amounts like "₹171 off".
+            prices = []
+            for pattern in [
+                r'₹\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)',  # Indian Rupee
+                r'Rs\.?\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)',  # Rupee abbreviation
+                r'\$\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)',  # US Dollar
+                r'€\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)',  # Euro
+                r'£\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)',  # Pound
+            ]:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    try:
+                        val = Decimal(match.group(1).replace(',', ''))
+                        if val > 0:
+                            prices.append(val)
+                    except Exception:
+                        pass
+            
+            # Return the minimum (handles "₹99 ₹968" correctly by picking 99)
+            if prices:
+                return min(prices)
+            
+            # Fallback: try to extract any number if no currency prefix found
+            cleaned = re.sub(r'[₹$€£,\s]', '', text)
             match = re.search(r'[\d.]+', cleaned)
             if match:
                 return Decimal(match.group())

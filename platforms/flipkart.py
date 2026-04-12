@@ -150,7 +150,12 @@ class FlipkartScraper(BasePlatformHandler):
 
         return current_price, original_price
 
-    def _to_decimal_price(self, raw: Any) -> Optional[Decimal]:
+    def _to_decimal_price(
+        self,
+        raw: Any,
+        title_hint: Optional[str] = None,
+        context_text: str = "",
+    ) -> Optional[Decimal]:
         """
         Convert extracted price value to Decimal safely.
         ✅ FIXED: Better decimal handling and universal x100 detection
@@ -166,8 +171,11 @@ class FlipkartScraper(BasePlatformHandler):
                 value = Decimal(str(raw))
                 if value <= 0:
                     return None
-                # ✅ Apply x100 fix universally
-                return self._fix_price_anomalies(value)
+                return self._fix_price_anomalies(
+                    value,
+                    title_hint=title_hint,
+                    context_text=context_text,
+                )
             except Exception:
                 return None
 
@@ -180,14 +188,22 @@ class FlipkartScraper(BasePlatformHandler):
             value = Decimal(cleaned)
             if value <= 0:
                 return None
-            # ✅ Apply x100 fix universally
-            return self._fix_price_anomalies(value)
+            return self._fix_price_anomalies(
+                value,
+                title_hint=title_hint,
+                context_text=context_text,
+            )
         except Exception:
             return None
 
-    def _fix_price_anomalies(self, price: Decimal) -> Decimal:
+    def _fix_price_anomalies(
+        self,
+        price: Decimal,
+        title_hint: Optional[str] = None,
+        context_text: str = "",
+    ) -> Decimal:
         """
-        ✅ UNIVERSAL price anomaly detection and correction
+        Price anomaly detection and correction with category guard.
         Handles:
         1. x100 inflation (99900 → 999)
         2. Decimal-as-integer (21834 → 218)
@@ -196,13 +212,20 @@ class FlipkartScraper(BasePlatformHandler):
         if price < Decimal("10"):
             return price
         
-        # Detect x100 inflation: price >= 10000
+        category = self._detect_category(f"{title_hint or ''} {context_text or ''}")
+
+        # Detect x100 inflation, but only for categories where low ticket pricing is common.
+        # Never auto-divide mobile/laptop/tablet/watch where 5-digit prices are normal.
         if price >= Decimal("10000"):
-            corrected = price / Decimal("100")
-            # If result is reasonable (₹20-₹50,000), use it
-            if Decimal("20") <= corrected <= Decimal("50000"):
-                logger.debug(f"🔧 x100 fix: ₹{price} → ₹{corrected}")
-                return corrected.quantize(Decimal('1'), rounding=ROUND_DOWN)
+            x100_allowed_categories = {"accessories", "fashion", "book", "home", "kitchen", "bag", "general"}
+            if category in x100_allowed_categories:
+                corrected = price / Decimal("100")
+                # Guardrail: only accept corrections that land in practical low-ticket range.
+                if Decimal("20") <= corrected <= Decimal("5000"):
+                    logger.debug(
+                        f"🔧 x100 fix ({category}): ₹{price} → ₹{corrected}"
+                    )
+                    return corrected.quantize(Decimal('1'), rounding=ROUND_DOWN)
         
         # Detect decimal-as-integer: 21834 → 218.34 → 218
         # This happens when "218.34" is parsed as "21834" (decimal point removed)
@@ -227,16 +250,42 @@ class FlipkartScraper(BasePlatformHandler):
         current_price: Optional[Decimal],
         original_price: Optional[Decimal],
         discount_hint: Optional[float] = None,
+        title_hint: Optional[str] = None,
+        context_text: str = "",
     ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[float]]:
         """
         Ensure current_price is payable (discounted) and original_price is strike-through MRP.
         ✅ FIXED: Always use LOWER price as current (payable)
         """
-        current = self._to_decimal_price(current_price)
-        original = self._to_decimal_price(original_price)
+        current = self._to_decimal_price(
+            current_price,
+            title_hint=title_hint,
+            context_text=context_text,
+        )
+        original = self._to_decimal_price(
+            original_price,
+            title_hint=title_hint,
+            context_text=context_text,
+        )
 
         if current is None:
             return None, None, None
+
+        category = self._detect_category(f"{title_hint or ''} {context_text or ''}")
+
+        # Guard for electronics truncation like 523 instead of 52300 when MRP is known.
+        if (
+            original is not None
+            and category in {"mobile", "laptop", "tablet"}
+            and current < Decimal("1000")
+            and original >= Decimal("10000")
+        ):
+            corrected_current = (current * Decimal("100")).quantize(Decimal('1'), rounding=ROUND_DOWN)
+            if corrected_current <= original:
+                logger.info(
+                    f"🔧 Corrected truncated electronics current price: ₹{current} → ₹{corrected_current}"
+                )
+                current = corrected_current
 
         # ✅ CRITICAL FIX: If original < current, ALWAYS swap (current must be payable price)
         if original is not None and original < current:
@@ -359,6 +408,14 @@ class FlipkartScraper(BasePlatformHandler):
                 
                 if products:
                     logger.info(f"✅ JS extraction: {len(products)} products")
+                else:
+                    logger.warning("⚠️ Flipkart JS extraction returned no products, trying universal fallback")
+                    html_content = await page_obj.content()
+                    fallback_products = await self.universal_search_fallback(page_obj, html_content, limit=20)
+                    if fallback_products:
+                        products = fallback_products
+                        extraction_method = ExtractionMethod.REGEX_FALLBACK
+                        logger.info(f"✅ Universal fallback recovered {len(products)} Flipkart products")
             
             await self.rate_limiter.record_success("flipkart")
             self.record_success()
@@ -445,9 +502,13 @@ class FlipkartScraper(BasePlatformHandler):
                     return Number.isFinite(amount) && amount > 0 ? Math.floor(amount) : null;
                 };
 
-                const fixLikelyX100 = (amount, text, href) => {
+                const fixLikelyX100 = (amount, text, href, category = 'general') => {
                     if (!amount || amount < 10000) return amount;
                     const combined = `${String(text || '').toLowerCase()} ${String(href || '').toLowerCase()}`;
+                    const protectedCategories = new Set(['mobile', 'laptop', 'tablet', 'watch']);
+                    if (protectedCategories.has(category)) {
+                        return amount;
+                    }
                     const accessoryHints = ['charger', 'cable', 'case', 'cover', 'pouch', 'adapter', 'wire', 'earphone', 'headphone', 'buds', 'airpods'];
                     if (!accessoryHints.some((hint) => combined.includes(hint))) return amount;
 
@@ -623,6 +684,15 @@ class FlipkartScraper(BasePlatformHandler):
 
                     let currentPrice = chooseCurrentCandidate(currentCandidates, allPriceCandidates, category);
 
+                    if ((category === 'mobile' || category === 'laptop' || category === 'tablet') && currentPrice && currentPrice < 1000) {
+                        const highCandidates = [...currentCandidates, ...allPriceCandidates].filter((v) => v >= 10000);
+                        if (highCandidates.length > 0) {
+                            const correctedCurrent = Math.min(...highCandidates);
+                            log(`   🔧 Corrected low electronics price: ₹${currentPrice} → ₹${correctedCurrent}`);
+                            currentPrice = correctedCurrent;
+                        }
+                    }
+
                     let originalPrice = originalCandidates.length > 0
                         ? Math.max(...originalCandidates)
                         : null;
@@ -645,9 +715,9 @@ class FlipkartScraper(BasePlatformHandler):
                     // Contextual x100 correction
                     const beforeCurrent = currentPrice;
                     const beforeOriginal = originalPrice;
-                    currentPrice = fixLikelyX100(currentPrice, text, href);
+                    currentPrice = fixLikelyX100(currentPrice, text, href, category);
                     if (originalPrice) {
-                        originalPrice = fixLikelyX100(originalPrice, text, href);
+                        originalPrice = fixLikelyX100(originalPrice, text, href, category);
                     }
                     
                     if (beforeCurrent !== currentPrice || beforeOriginal !== originalPrice) {
@@ -722,8 +792,20 @@ class FlipkartScraper(BasePlatformHandler):
             products = []
             for item in products_data:
                 try:
-                    extracted_current = self._to_decimal_price(item.get('price'))
-                    extracted_original = self._to_decimal_price(item.get('originalPrice'))
+                    url = item.get('url', '')
+                    if url and not url.startswith('http'):
+                        url = f"{self.BASE_URL}{url}"
+
+                    extracted_current = self._to_decimal_price(
+                        item.get('price'),
+                        title_hint=item.get('title'),
+                        context_text=url,
+                    )
+                    extracted_original = self._to_decimal_price(
+                        item.get('originalPrice'),
+                        title_hint=item.get('title'),
+                        context_text=url,
+                    )
                     discount_hint = item.get('discount')
 
                     logger.debug(
@@ -735,6 +817,8 @@ class FlipkartScraper(BasePlatformHandler):
                         current_price=extracted_current,
                         original_price=extracted_original,
                         discount_hint=discount_hint,
+                        title_hint=item.get('title'),
+                        context_text=url,
                     )
 
                     if current_price and original_price and original_price > current_price:
@@ -745,10 +829,6 @@ class FlipkartScraper(BasePlatformHandler):
                     if not current_price:
                         logger.warning(f"⚠️ Skipping product - no valid current price: {item.get('title', '')[:50]}")
                         continue
-                    
-                    url = item.get('url', '')
-                    if url and not url.startswith('http'):
-                        url = f"{self.BASE_URL}{url}"
                     
                     product_id = self.extract_product_id(url)
                     if not product_id:
@@ -1236,8 +1316,16 @@ class FlipkartScraper(BasePlatformHandler):
             logger.info(f"   Original: {product_data.get('originalPrice')}")
             logger.info(f"   Discount: {product_data.get('discount')}")
 
-            extracted_current = self._to_decimal_price(product_data.get('price'))
-            extracted_original = self._to_decimal_price(product_data.get('originalPrice'))
+            extracted_current = self._to_decimal_price(
+                product_data.get('price'),
+                title_hint=product_data.get('title'),
+                context_text=product_url,
+            )
+            extracted_original = self._to_decimal_price(
+                product_data.get('originalPrice'),
+                title_hint=product_data.get('title'),
+                context_text=product_url,
+            )
 
             logger.info(f"📊 After decimal conversion:")
             logger.info(f"   Current: {extracted_current}")
@@ -1254,6 +1342,8 @@ class FlipkartScraper(BasePlatformHandler):
                 current_price=extracted_current,
                 original_price=extracted_original,
                 discount_hint=discount_hint,
+                title_hint=product_data.get('title'),
+                context_text=product_url,
             )
 
             logger.info(f"📊 After normalization:")

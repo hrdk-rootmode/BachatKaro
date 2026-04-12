@@ -149,6 +149,15 @@ class NykaaScraper(BasePlatformHandler):
                 if not products:
                     products = await self._extract_search_dom(page_obj)
                     extraction_method = ExtractionMethod.DOM_JAVASCRIPT
+
+                if not products:
+                    logger.warning("⚠️ Nykaa standard extraction returned no products, trying universal fallback")
+                    html_content = await page_obj.content()
+                    fallback_products = await self.universal_search_fallback(page_obj, html_content, limit=20)
+                    if fallback_products:
+                        products = fallback_products
+                        extraction_method = ExtractionMethod.REGEX_FALLBACK
+                        logger.info(f"✅ Universal fallback recovered {len(products)} Nykaa products")
             
             await self.rate_limiter.record_success("nykaa")
             self.record_success()

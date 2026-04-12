@@ -477,6 +477,11 @@ class WatchlistResponse(BaseModel):
     total_count: int
     limit: int
     limit_reached: bool
+    is_grace_period: bool = False
+    grace_days_remaining: Optional[int] = None
+    over_limit_count: int = 0
+    warning_message: Optional[str] = None
+    pruned_count: int = 0
 
 
 # ==================== STREAK SCHEMAS ====================
@@ -1268,6 +1273,7 @@ class ScraperTestRequest(BaseModel):
     """Request to test a platform scraper"""
     query: Optional[str] = None
     url: Optional[str] = None
+    category: Optional[str] = Field(default=None, max_length=80)
     limit: int = Field(default=5, ge=1, le=20)
     mode: str = Field(default="standalone", pattern="^(offline|standalone|db)$")
     timeout_seconds: int = Field(default=45, ge=10, le=120)
@@ -1306,6 +1312,7 @@ class ValidateSelectorRequest(BaseModel):
     """Request to validate a single selector"""
     selector: str = Field(..., min_length=1, max_length=500)
     field_name: str = Field(..., min_length=1, max_length=100)
+    category: Optional[str] = Field(default=None, max_length=80)
     html_content: Optional[str] = Field(default=None, max_length=200000)
     page_url: Optional[str] = Field(default=None, max_length=2000)
 
@@ -1368,6 +1375,7 @@ class ScraperSelectorUpdateRequest(BaseModel):
     """Request to persist a selector update for a platform"""
     field_name: str = Field(..., min_length=1, max_length=100)
     selector: str = Field(..., min_length=1, max_length=500)
+    category: Optional[str] = Field(default=None, max_length=80)
 
 
 class ScraperSelectorUpdateResponse(BaseModel):
@@ -1375,6 +1383,7 @@ class ScraperSelectorUpdateResponse(BaseModel):
     success: bool
     platform: str
     field_name: str
+    category: Optional[str] = None
     old_selector: Optional[str] = None
     new_selector: str
     updated_at: datetime

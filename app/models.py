@@ -476,6 +476,48 @@ class Transaction(Base):
     )
 
 # =============================================================================
+# TABLE 6.5: NOTIFICATIONS (User Alerts)
+# =============================================================================
+class Notification(Base):
+    """
+    User notifications for price drops, stock updates, and events
+    Stores alert history with read/unread status
+    """
+    __tablename__ = "notifications"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    # Notification type
+    type = Column(String(30), nullable=False, index=True)
+    # Types: price_drop, back_in_stock, streak_reminder, subscription_expiry
+    
+    # Content
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    
+    # Flexible data (product_id, old_price, new_price, platform, etc.)
+    data = Column(JSONB, default={})
+    
+    # Status
+    is_read = Column(Boolean, default=False, index=True)
+    
+    # Metadata
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id], backref="notifications")
+    
+    __table_args__ = (
+        Index('idx_notifications_user', 'user_id'),
+        Index('idx_notifications_user_unread', 'user_id', 'is_read', 
+              postgresql_where=Column('is_read') == False),
+        Index('idx_notifications_created', 'created_at'),
+        Index('idx_notifications_type', 'type'),
+    )
+
+# =============================================================================
 # TABLE 7: SYSTEM_LOGS (Daily Operations)
 # =============================================================================
 class SystemLog(Base):

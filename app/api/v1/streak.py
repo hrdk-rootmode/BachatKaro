@@ -38,13 +38,26 @@ FREEZE_LIMITS = {
 }
 
 DEFAULT_MILESTONES = [
-    {"days": 3, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🔥", "badge_name": "Fire Starter"},
-    {"days": 7, "reward_type": "searches", "reward_value": 10, "badge_emoji": "⭐", "badge_name": "Week Warrior"},
-    {"days": 14, "reward_type": "watchlist_slots", "reward_value": 2, "badge_emoji": "💪", "badge_name": "Dedicated"},
-    {"days": 30, "reward_type": "premium_days", "reward_value": 7, "badge_emoji": "👑", "badge_name": "Monthly Master"},
-    {"days": 60, "reward_type": "premium_days", "reward_value": 14, "badge_emoji": "💎", "badge_name": "Diamond Hunter"},
-    {"days": 100, "reward_type": "premium_days", "reward_value": 30, "badge_emoji": "🏆", "badge_name": "Century Champion"},
-    {"days": 365, "reward_type": "premium_days", "reward_value": 90, "badge_emoji": "🎖️", "badge_name": "Legendary Saver"},
+    # Early milestones - Quick wins
+    {"days": 3, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🔥", "badge_name": "Fire Starter", "description": "+5 bonus searches"},
+    {"days": 5, "reward_type": "premium_days", "reward_value": 7, "badge_emoji": "🏆", "badge_name": "5-Day Warrior", "description": "+7 days free trial"},
+    {"days": 7, "reward_type": "watchlist_slots", "reward_value": 1, "badge_emoji": "⭐", "badge_name": "Week Warrior", "description": "+1 watchlist slot"},
+    {"days": 10, "reward_type": "watchlist_slots", "reward_value": 2, "badge_emoji": "🌟", "badge_name": "10-Day Legend", "description": "+2 watchlist slots"},
+    
+    # Mid-tier milestones - Building consistency
+    {"days": 15, "reward_type": "watchlist_slots", "reward_value": 5, "badge_emoji": "💪", "badge_name": "Dedicated Hunter", "description": "+5 watchlist slots"},
+    {"days": 20, "reward_type": "unlimited_search_hours", "reward_value": 6, "badge_emoji": "🕒", "badge_name": "Search Master", "description": "6 hours unlimited search"},
+    {"days": 30, "reward_type": "premium_days", "reward_value": 10, "badge_emoji": "👑", "badge_name": "Monthly Champion", "description": "+10 days free subscription"},
+    
+    # Advanced milestones - Long-term commitment
+    {"days": 45, "reward_type": "watchlist_slots", "reward_value": 10, "badge_emoji": "📈", "badge_name": "Watchlist Expert", "description": "+10 watchlist slots"},
+    {"days": 60, "reward_type": "premium_days", "reward_value": 14, "badge_emoji": "💎", "badge_name": "Diamond Hunter", "description": "+14 days free subscription"},
+    {"days": 90, "reward_type": "free_month", "reward_value": 1, "badge_emoji": "📆", "badge_name": "Quarter Master", "description": "Next month completely free"},
+    
+    # Elite milestones - Ultimate rewards
+    {"days": 100, "reward_type": "premium_days", "reward_value": 30, "badge_emoji": "🏆", "badge_name": "Century Champion", "description": "+30 days free subscription"},
+    {"days": 180, "reward_type": "free_month", "reward_value": 2, "badge_emoji": "📆", "badge_name": "Half-Year Hero", "description": "Next 2 months completely free"},
+    {"days": 365, "reward_type": "premium_days", "reward_value": 90, "badge_emoji": "🎖️", "badge_name": "Legendary Saver", "description": "+90 days free subscription"},
 ]
 
 
@@ -97,6 +110,21 @@ def get_next_milestone(current_streak: int, claimed_milestones: List[int]) -> Op
 
 async def get_milestones_from_db(db: AsyncSession) -> List[dict]:
     """Get milestones from database or use defaults"""
+    normalized_overrides = {
+        7: {
+            "reward_type": "watchlist_slots",
+            "reward_value": 1,
+            "badge_emoji": "⭐",
+            "badge_name": "Week Warrior",
+        },
+        10: {
+            "reward_type": "watchlist_slots",
+            "reward_value": 2,
+            "badge_emoji": "🌟",
+            "badge_name": "10-Day Legend",
+        },
+    }
+
     result = await db.execute(
         select(StreakMilestone)
         .where(StreakMilestone.is_active == True)
@@ -110,10 +138,10 @@ async def get_milestones_from_db(db: AsyncSession) -> List[dict]:
     return [
         {
             "days": m.streak_days,
-            "reward_type": m.reward_type,
-            "reward_value": m.reward_value,
-            "badge_emoji": m.badge_emoji,
-            "badge_name": m.badge_name,
+            "reward_type": normalized_overrides.get(m.streak_days, {}).get("reward_type", m.reward_type),
+            "reward_value": normalized_overrides.get(m.streak_days, {}).get("reward_value", m.reward_value),
+            "badge_emoji": normalized_overrides.get(m.streak_days, {}).get("badge_emoji", m.badge_emoji),
+            "badge_name": normalized_overrides.get(m.streak_days, {}).get("badge_name", m.badge_name),
             "badge_color": m.badge_color
         }
         for m in db_milestones
@@ -131,17 +159,38 @@ async def apply_milestone_reward(
     
     if reward_type == "searches":
         # Add bonus searches
-        if user.usage_stats is None:
-            user.usage_stats = {}
-        user.usage_stats["daily_search_bonus"] = user.usage_stats.get("daily_search_bonus", 0) + reward_value
+        usage_stats = dict(user.usage_stats or {})
+        usage_stats["daily_search_bonus"] = usage_stats.get("daily_search_bonus", 0) + reward_value
+        user.usage_stats = usage_stats
         return f"+{reward_value} bonus searches"
     
     elif reward_type == "watchlist_slots":
         # Add bonus watchlist slots
-        if user.usage_stats is None:
-            user.usage_stats = {}
-        user.usage_stats["watchlist_bonus"] = user.usage_stats.get("watchlist_bonus", 0) + reward_value
+        usage_stats = dict(user.usage_stats or {})
+        usage_stats["watchlist_bonus"] = usage_stats.get("watchlist_bonus", 0) + reward_value
+        user.usage_stats = usage_stats
         return f"+{reward_value} watchlist slots"
+    
+    elif reward_type == "unlimited_search_hours":
+        # Add unlimited search hours
+        usage_stats = dict(user.usage_stats or {})
+        if "unlimited_search_until" not in usage_stats:
+            usage_stats["unlimited_search_until"] = None
+        
+        # Extend existing unlimited search or add new time
+        current_until = usage_stats.get("unlimited_search_until")
+        start_time = datetime.utcnow()
+        
+        if current_until and datetime.fromisoformat(current_until.replace('Z', '+00:00')) > start_time:
+            # Extend existing unlimited search
+            new_until = datetime.fromisoformat(current_until.replace('Z', '+00:00')) + timedelta(hours=reward_value)
+        else:
+            # Start new unlimited search period
+            new_until = start_time + timedelta(hours=reward_value)
+        
+        usage_stats["unlimited_search_until"] = new_until.isoformat()
+        user.usage_stats = usage_stats
+        return f"{reward_value} hours unlimited search"
     
     elif reward_type == "premium_days":
         # Add premium days
@@ -153,6 +202,17 @@ async def apply_milestone_reward(
         else:
             user.plan_expires_at = datetime.utcnow() + timedelta(days=reward_value)
         return f"+{reward_value} days premium"
+    
+    elif reward_type == "free_month":
+        # Give free month(s)
+        if user.plan == "free":
+            user.plan = "pro"
+            user.plan_expires_at = datetime.utcnow() + timedelta(days=30 * reward_value)
+        elif user.plan_expires_at:
+            user.plan_expires_at = user.plan_expires_at + timedelta(days=30 * reward_value)
+        else:
+            user.plan_expires_at = datetime.utcnow() + timedelta(days=30 * reward_value)
+        return f"{reward_value} month{'s' if reward_value > 1 else ''} completely free"
     
     elif reward_type == "badge":
         # Badge is automatically added via claimed milestones
@@ -228,8 +288,34 @@ async def daily_check_in(
     confetti = False
     milestones = await get_milestones_from_db(db)
     
+    # Special 5-day activation logic
+    if current_streak == 5 and 5 not in claimed_milestones:
+        # Auto-activate 5-day streak completion
+        if user.plan == "free" and user.plan_expires_at and user.plan_expires_at <= datetime.utcnow():
+            # Extend free trial by 7 days for 5-day streak
+            user.plan_expires_at = datetime.utcnow() + timedelta(days=7)
+            reward_description = "🎉 5-day streak! +7 days free trial activated!"
+            
+            reward_unlocked = {
+                "milestone_days": 5,
+                "reward_type": "premium_days",
+                "reward_value": 7,
+                "badge_emoji": "🔥",
+                "badge_name": "5-Day Warrior",
+                "description": reward_description
+            }
+            claimed_milestones.append(5)
+            message = reward_description
+            confetti = True
+            logger.info(f"5-day streak reward activated | User: {user.id} | Trial extended 7 days")
+    
+    # Check other milestones
     for milestone in milestones:
         if milestone["days"] == current_streak and milestone["days"] not in claimed_milestones:
+            # Skip 5-day as it's handled above
+            if milestone["days"] == 5:
+                continue
+                
             # Unlock reward!
             reward_description = await apply_milestone_reward(user, milestone, db)
             claimed_milestones.append(milestone["days"])
@@ -261,6 +347,8 @@ async def daily_check_in(
     
     # Invalidate cache
     await redis.delete(f"streak:{user.id}")
+    if reward_unlocked:
+        await redis.delete(f"watchlist:{user.id}")
     
     # Track in Redis for analytics
     await redis.increment(f"check_ins:daily:{date.today().isoformat()}")

@@ -145,6 +145,27 @@ async def activate_subscription(
         user.usage_stats = {}
     user.usage_stats["subscription_activated_at"] = _utc_now().isoformat()
     user.usage_stats["subscription_platform"] = platform
+    user.usage_stats.pop("subscription_cancelled_at", None)
+    user.usage_stats.pop("watchlist_grace_until", None)
+    user.usage_stats.pop("watchlist_grace_reason", None)
+    
+    # Initialize streak data for new subscribers
+    if not user.streak_data:
+        user.streak_data = {
+            "current_streak": 0,
+            "longest_streak": 0,
+            "last_check_in": None,
+            "total_check_ins": 0,
+            "streak_rewards_claimed": [],
+            "freeze_count": 2  # Base freeze count
+        }
+    
+    # Auto-activate streak for new subscribers
+    if user.streak_data.get("current_streak", 0) == 0 and not user.streak_data.get("last_check_in"):
+        user.streak_data["current_streak"] = 1
+        user.streak_data["last_check_in"] = now.isoformat()
+        user.streak_data["total_check_ins"] = 1
+        logger.info(f"Auto-activated streak for new subscriber | User: {user.id}")
     
     await db.commit()
     
@@ -727,6 +748,8 @@ async def google_play_webhook(
                         user.usage_stats = {}
                     user.usage_stats["subscription_cancelled_at"] = _utc_now().isoformat()
                     user.usage_stats["cancellation_source"] = "google_webhook"
+                    user.usage_stats["watchlist_grace_until"] = (_utc_now() + timedelta(days=2)).isoformat()
+                    user.usage_stats["watchlist_grace_reason"] = "subscription_canceled"
                     await db.commit()
                     
                     logger.info(f"Subscription cancelled via webhook | User: {user.id}")
@@ -967,6 +990,8 @@ async def cancel_subscription(
     
     user.usage_stats["subscription_cancelled_at"] = _utc_now().isoformat()
     user.usage_stats["auto_renew"] = False
+    user.usage_stats["watchlist_grace_until"] = (_utc_now() + timedelta(days=2)).isoformat()
+    user.usage_stats["watchlist_grace_reason"] = "subscription_canceled"
     
     await db.commit()
     

@@ -205,6 +205,16 @@ class CromaScraper(BasePlatformHandler):
                                 logger.info(f"[FALLBACK] Got {len(products)} products from generic fallback")
                     except Exception as e:
                         logger.warning(f"Generic fallback also failed: {e}")
+
+                if not products or len(products) < 1:
+                    logger.warning("[WARNING] Croma generic fallback empty, trying shared universal fallback")
+                    try:
+                        fallback_products = await self.universal_search_fallback(page_obj, html_content, limit=20)
+                        if fallback_products:
+                            products = fallback_products
+                            logger.info(f"[FALLBACK] Got {len(products)} products from shared universal fallback")
+                    except Exception as e:
+                        logger.warning(f"Shared universal fallback also failed: {e}")
             
             await self.rate_limiter.record_success("croma")
             self.record_success()

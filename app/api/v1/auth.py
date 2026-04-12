@@ -696,6 +696,8 @@ async def get_user_stats(
 
     # Calculate watchlist limit
     watchlist_limit = get_plan_limit(plan_catalog, current_plan, "watchlist_limit", settings.PLAN_FREE_WISHLIST)
+    watchlist_bonus = _safe_int(usage_stats.get("watchlist_bonus"), 0)
+    effective_watchlist_limit = watchlist_limit + watchlist_bonus
     
     # Calculate days remaining for subscription
     days_remaining = None
@@ -714,7 +716,7 @@ async def get_user_stats(
         searches_today=searches_today,
         searches_remaining=searches_remaining,
         watchlist_count=watchlist_count,
-        watchlist_limit=watchlist_limit,
+        watchlist_limit=effective_watchlist_limit,
         current_streak=current_streak,
         freeze_count=freeze_count,
         plan=current_plan,

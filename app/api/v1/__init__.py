@@ -20,7 +20,7 @@ async def api_v1_root():
 	}
 
 # Import routers
-from app.api.v1 import auth, search, products, watchlist, streak, subscription, admin, home   
+from app.api.v1 import auth, search, products, watchlist, streak, subscription, admin, home, notifications   
 
 # Include routers
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
@@ -31,3 +31,4 @@ api_router.include_router(streak.router, prefix="/streak", tags=["Streak & Gamif
 api_router.include_router(subscription.router, prefix="/subscription", tags=["Subscription & Payments"])
 api_router.include_router(admin.router, prefix="/admin", tags=["Admin Dashboard"])
 api_router.include_router(home.router, prefix="/home", tags=["Home"])
+api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])

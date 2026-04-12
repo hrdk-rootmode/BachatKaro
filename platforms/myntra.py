@@ -23,6 +23,7 @@ import re
 import json
 import hashlib
 import asyncio
+import time
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
@@ -267,6 +268,12 @@ class MyntraScraper(BasePlatformHandler):
                         f"  TIER 3 (DOM): {extraction_attempts['dom']}\n"
                         f"  TIER 4 (AI): {extraction_attempts['ai_healed']}"
                     )
+                    html_content = await page_obj.content()
+                    fallback_products = await self.universal_search_fallback(page_obj, html_content, limit=20)
+                    if fallback_products:
+                        products = fallback_products
+                        extraction_method = ExtractionMethod.REGEX_FALLBACK
+                        logger.info(f"✅ Universal fallback recovered {len(products)} Myntra products")
             
             # ✅ NEW: Validate products
             validated_products = []

@@ -7,8 +7,10 @@ Used by admin scraper testing dashboard to verify and fix broken selectors
 
 import logging
 import re
+import json
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,105 @@ logger = logging.getLogger(__name__)
 
 class SelectorValidator:
     """Validates selectors against HTML content"""
+
+    @staticmethod
+    def _parse_selector_mode(selector: str) -> Tuple[str, str]:
+        """Parse selector mode from prefix. Examples: css:.card, regex:₹([0-9,]+), json:props.pageProps.products"""
+        raw = (selector or "").strip()
+        if not raw:
+            return "css", ""
+
+        mode_match = re.match(r"^(css|regex|json|js)\s*:(.*)$", raw, flags=re.IGNORECASE | re.DOTALL)
+        if not mode_match:
+            return "css", raw
+
+        mode = mode_match.group(1).lower()
+        body = (mode_match.group(2) or "").strip()
+        return mode, body
+
+    @staticmethod
+    def _extract_embedded_json_blobs(html: str) -> List[Any]:
+        """Extract likely JSON blobs from script tags and return parsed objects."""
+        blobs: List[Any] = []
+        if not html:
+            return blobs
+
+        # Explicit Next.js data node first.
+        next_data_match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, flags=re.IGNORECASE | re.DOTALL)
+        if next_data_match:
+            try:
+                blobs.append(json.loads(next_data_match.group(1).strip()))
+            except Exception:
+                pass
+
+        script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html, flags=re.IGNORECASE | re.DOTALL)
+        for block in script_blocks[:120]:
+            text = (block or "").strip()
+            if not text:
+                continue
+
+            # Raw object/array JSON.
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    blobs.append(json.loads(text))
+                    continue
+                except Exception:
+                    pass
+
+            # JS assignment style e.g. window.__INITIAL_STATE__ = {...};
+            assign_match = re.search(r'([A-Za-z0-9_.$]+)\s*=\s*([\[{].*)\s*;?\s*$', text, flags=re.DOTALL)
+            if assign_match:
+                candidate = (assign_match.group(2) or "").strip().rstrip(";")
+                try:
+                    blobs.append(json.loads(candidate))
+                except Exception:
+                    continue
+
+        return blobs
+
+    @staticmethod
+    def _walk_path(obj: Any, path: str) -> List[Any]:
+        """Walk a simple dot/bracket path: props.pageProps.products[0].name"""
+        if obj is None or not path:
+            return []
+
+        tokens: List[str] = []
+        for part in re.split(r"\.", path.strip()):
+            if not part:
+                continue
+            idx_parts = re.split(r"\[", part)
+            if idx_parts[0]:
+                tokens.append(idx_parts[0])
+            for idx_part in idx_parts[1:]:
+                idx = idx_part.rstrip("]").strip()
+                if idx:
+                    tokens.append(idx)
+
+        nodes = [obj]
+        for token in tokens:
+            next_nodes: List[Any] = []
+            is_index = token.isdigit()
+            for node in nodes:
+                try:
+                    if is_index and isinstance(node, list):
+                        i = int(token)
+                        if 0 <= i < len(node):
+                            next_nodes.append(node[i])
+                    elif isinstance(node, dict) and token in node:
+                        next_nodes.append(node[token])
+                except Exception:
+                    continue
+            nodes = next_nodes
+            if not nodes:
+                break
+
+        flattened: List[Any] = []
+        for node in nodes:
+            if isinstance(node, list):
+                flattened.extend(node[:20])
+            else:
+                flattened.append(node)
+        return flattened[:50]
     
     @staticmethod
     def validate_selector_against_html(
@@ -49,19 +150,42 @@ class SelectorValidator:
                     "confidence": 0.0,
                     "error": "Empty selector"
                 }
-            
-            # Try to parse selector (simple regex-based validation)
-            if not SelectorValidator._is_valid_css_selector(selector):
+
+            mode, body = SelectorValidator._parse_selector_mode(selector)
+            if not body:
                 return {
                     "match_count": 0,
                     "is_valid": False,
                     "sample_matches": [],
                     "confidence": 0.0,
-                    "error": f"Invalid CSS selector syntax: {selector}"
+                    "error": "Selector body is empty"
                 }
-            
-            # Extract matches using regex (simplified CSS selector parsing)
-            matches = SelectorValidator._extract_matches(selector, html, max_sample_length)
+
+            if mode == "css":
+                if not SelectorValidator._is_valid_css_selector(body):
+                    return {
+                        "match_count": 0,
+                        "is_valid": False,
+                        "sample_matches": [],
+                        "confidence": 0.0,
+                        "error": f"Invalid CSS selector syntax: {body}"
+                    }
+                matches = SelectorValidator._extract_matches(body, html, max_sample_length)
+            elif mode == "regex":
+                matches = SelectorValidator._extract_by_regex(body, html, max_sample_length)
+            elif mode == "json":
+                matches = SelectorValidator._extract_by_json_path(body, html, max_sample_length)
+            elif mode == "js":
+                # "js:" is treated as data-path extraction from embedded JS/JSON blobs.
+                matches = SelectorValidator._extract_by_json_path(body, html, max_sample_length)
+            else:
+                return {
+                    "match_count": 0,
+                    "is_valid": False,
+                    "sample_matches": [],
+                    "confidence": 0.0,
+                    "error": f"Unsupported selector mode: {mode}"
+                }
             
             match_count = len(matches)
             confidence = 1.0 if match_count > 0 else 0.0
@@ -71,6 +195,7 @@ class SelectorValidator:
                 "is_valid": True,
                 "sample_matches": matches[:3],  # Return up to 3 samples
                 "confidence": confidence,
+                "selector_mode": mode,
                 "error": None
             }
             
@@ -125,26 +250,59 @@ class SelectorValidator:
         matches = []
         
         try:
-            # Handle basic selector types
-            if selector.startswith('#'):
-                # ID selector
-                matches = SelectorValidator._extract_by_id(selector, html, max_sample_length)
-            
-            elif selector.startswith('.'):
-                # Class selector
-                matches = SelectorValidator._extract_by_class(selector, html, max_sample_length)
-            
-            elif '[' in selector and ']' in selector:
-                # Attribute selector
-                matches = SelectorValidator._extract_by_attribute(selector, html, max_sample_length)
-            
-            else:
-                # Tag selector or combined
-                matches = SelectorValidator._extract_by_tag(selector, html, max_sample_length)
-            
+            soup = BeautifulSoup(html or "", "lxml")
+            selected = soup.select(selector)
+            for node in selected[:10]:
+                sample = node.get_text(" ", strip=True) or str(node.get("content") or "") or str(node.get("href") or "")
+                sample = (sample or "").strip()
+                if sample:
+                    matches.append(sample[:max_sample_length])
         except Exception as e:
             logger.debug(f"Error extracting matches for selector '{selector}': {e}")
         
+        return matches
+
+    @staticmethod
+    def _extract_by_regex(pattern: str, html: str, max_length: int) -> List[str]:
+        matches: List[str] = []
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
+            found = compiled.findall(html or "")
+            for item in found[:20]:
+                if isinstance(item, tuple):
+                    sample = " ".join(str(x) for x in item if x is not None)
+                else:
+                    sample = str(item)
+                sample = sample.strip()
+                if sample:
+                    matches.append(sample[:max_length])
+        except Exception as e:
+            logger.debug(f"Regex extraction failed: {e}")
+        return matches
+
+    @staticmethod
+    def _extract_by_json_path(path: str, html: str, max_length: int) -> List[str]:
+        matches: List[str] = []
+        clean_path = (path or "").strip()
+        if not clean_path:
+            return matches
+
+        # Remove common JS roots so admins can paste simple paths.
+        clean_path = re.sub(r"^(window\.)?(__NEXT_DATA__|__INITIAL_STATE__|__APOLLO_STATE__|__NUXT__|state|data)\.?", "", clean_path)
+        clean_path = clean_path.lstrip(".$")
+
+        for blob in SelectorValidator._extract_embedded_json_blobs(html):
+            values = SelectorValidator._walk_path(blob, clean_path)
+            for value in values:
+                if isinstance(value, (dict, list)):
+                    sample = json.dumps(value, ensure_ascii=False)[:max_length]
+                else:
+                    sample = str(value).strip()[:max_length]
+                if sample:
+                    matches.append(sample)
+                if len(matches) >= 10:
+                    return matches
+
         return matches
     
     @staticmethod

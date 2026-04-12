@@ -123,6 +123,18 @@ class MeeshoScraper(BasePlatformHandler):
 
         return u.startswith("http://") or u.startswith("https://")
 
+    @classmethod
+    def _is_valid_product_url(cls, url: Optional[str]) -> bool:
+        normalized = cls._normalize_image_url(url)
+        if not normalized:
+            return False
+
+        u = normalized.lower()
+        if any(token in u for token in ["wishlist.svg", "svgicons", "/icon/", "/icons/", "placeholder"]):
+            return False
+
+        return "/p/" in u or "/product/" in u or "/catalog/" in u
+
     def _collect_image_candidates(self, value: Any, candidates: List[str], depth: int = 0) -> None:
         """Collect potential image URL strings from nested API payloads."""
         if depth > 5 or value is None:
@@ -267,6 +279,52 @@ class MeeshoScraper(BasePlatformHandler):
 
         return None
 
+    def _sanitize_search_price(self, title: Optional[str], price: Optional[Any], context_text: Optional[str] = None) -> Optional[Decimal]:
+        if price is None:
+            return None
+
+        try:
+            current_price = Decimal(str(price))
+        except Exception:
+            return None
+
+        if current_price <= 0:
+            return None
+
+        title_text = " ".join(filter(None, [str(title or ""), str(context_text or "")]))
+        title_price_tokens: List[Decimal] = []
+
+        for match in re.finditer(r'₹\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)', title_text, re.IGNORECASE):
+            try:
+                token_value = Decimal(match.group(1).replace(',', ''))
+                if token_value > 0:
+                    title_price_tokens.append(token_value)
+            except Exception:
+                continue
+
+        if title_price_tokens:
+            candidate = min(title_price_tokens)
+            if candidate > 0 and (current_price > Decimal("100000") or candidate <= current_price):
+                return candidate
+
+        plain_price_tokens: List[Decimal] = []
+        for match in re.finditer(
+            r'(?<![A-Za-z0-9])([1-9][0-9,]{2,6})(?!\s*(?:%|off|gb|tb|mah|hz|mp|kg|g|inch|inches)\b)(?![A-Za-z])',
+            title_text,
+            re.IGNORECASE,
+        ):
+            try:
+                token_value = Decimal(match.group(1).replace(',', ''))
+                if Decimal("500") <= token_value <= Decimal("500000"):
+                    plain_price_tokens.append(token_value)
+            except Exception:
+                continue
+
+        if plain_price_tokens and current_price < Decimal("500"):
+            return min(plain_price_tokens)
+
+        return current_price
+
     def _is_valid_search_product(self, product: ProductData) -> bool:
         """Validate search product candidate before returning to seed/search pipelines."""
         if product is None:
@@ -276,12 +334,28 @@ class MeeshoScraper(BasePlatformHandler):
             return False
 
         try:
-            if float(product.current_price) <= 0:
+            current_price = float(product.current_price)
+            if current_price <= 0:
                 return False
         except Exception:
             return False
 
+        # Reject obvious discount-value captures for smartphone listings.
+        lowered_title = str(getattr(product, "title", "")).lower()
+        has_phone_hint = any(
+            token in lowered_title for token in [
+                "5g", "smartphone", "iphone", "vivo", "infinix", "samsung",
+                "realme", "redmi", "oneplus", "oppo", "nothing phone"
+            ]
+        )
+        has_ram_storage_hint = re.search(r'\b(?:[4-9]|[1-9][0-9]{1,3})\s*gb\b', lowered_title) is not None
+        if has_phone_hint and has_ram_storage_hint and current_price < 1000:
+            return False
+
         if not getattr(product, "product_url", None):
+            return False
+
+        if not self._is_valid_product_url(getattr(product, "product_url", None)):
             return False
 
         return True
@@ -427,6 +501,22 @@ class MeeshoScraper(BasePlatformHandler):
                     logger.warning("⚠️ Using DOM fallback")
                     products = await self._extract_search_dom(page_obj)
                     extraction_method = ExtractionMethod.DOM_JAVASCRIPT
+
+                if not products:
+                    logger.warning("⚠️ Meesho DOM fallback returned no products, trying universal fallback")
+                    html_content = await page_obj.content()
+                    fallback_products = await self.universal_search_fallback(page_obj, html_content, limit=20)
+                    if fallback_products:
+                        for product in fallback_products:
+                            raw_title = None
+                            if isinstance(getattr(product, "raw_data", None), dict):
+                                raw_title = product.raw_data.get("raw_title")
+                            sanitized_price = self._sanitize_search_price(product.title, product.current_price, context_text=raw_title)
+                            if sanitized_price is not None:
+                                product.current_price = sanitized_price
+                        products = fallback_products
+                        extraction_method = ExtractionMethod.REGEX_FALLBACK
+                        logger.info(f"✅ Universal fallback recovered {len(products)} Meesho products")
             
             # Filter low-quality results early so seed jobs do not treat junk cards as products.
             raw_product_count = len(products)
@@ -542,7 +632,7 @@ class MeeshoScraper(BasePlatformHandler):
                 item.get('product_name') or 
                 item.get('title') or ''
             )
-            title = re.sub(r'\s+', ' ', str(title)).strip()
+            title = self._clean_product_title(title) or re.sub(r'\s+', ' ', str(title)).strip()
             
             if not title or len(title) < 5 or self._is_low_quality_title(title):
                 return None
@@ -627,7 +717,7 @@ class MeeshoScraper(BasePlatformHandler):
             
             product = ProductData(
                 external_id=product_id,
-                title=title.strip()[:200],
+                title=self._clean_product_title(title) or title.strip()[:200],
                 current_price=Decimal(str(price)),
                 original_price=Decimal(str(original_price)) if original_price else None,
                 discount_percent=float(discount) if discount else None,
@@ -713,42 +803,57 @@ class MeeshoScraper(BasePlatformHandler):
                     try {
                         const text = (container.innerText || container.textContent || '').trim();
                         if (!text) continue;
-                        
-                        // Try multiple price patterns
-                        let price = null;
-                        const patterns = [/₹\\s*([0-9,]+)/, /Rs\\.?\\s*([0-9,]+)/i];
-                        for (const p of patterns) {
-                            const m = text.match(p);
-                            if (m) {
-                                const val = parseInt(m[1].replace(/,/g, ''));
-                                if (val > 50 && val < 10000000) {
-                                    price = val;
-                                    break;
+
+                        const pricePatterns = [
+                            /₹\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)/gi,
+                            /Rs\.?\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)/gi,
+                            /INR\s*([0-9][0-9,]*(?:\.\d+)?)(?![0-9,])\s*(?!off\b)/gi,
+                        ];
+                        const values = [];
+                        for (const pattern of pricePatterns) {
+                            for (const match of text.matchAll(pattern)) {
+                                const amount = Number.parseFloat((match[1] || '').replace(/,/g, ''));
+                                if (Number.isFinite(amount) && amount > 0) {
+                                    values.push(amount);
                                 }
                             }
                         }
-                        if (!price) continue;
-                        
-                        // Extract title from longest line without price/numbers
-                        const lines = text.split('\\n')
-                            .map(l => l.trim())
-                            .filter(l => l.length > 8 && l.length < 200);
-                        
-                        let title = null;
-                        for (const line of lines) {
-                            if (!line.includes('₹') && !/\\d{2,}/.test(line) && !line.includes('Add')) {
-                                title = line;
-                                break;
-                            }
+                        if (values.length === 0) continue;
+                        const price = Math.min(...values);
+
+                        const lines = text
+                            .split('\\n')
+                            .map((line) => line.trim())
+                            .filter((line) => line.length > 8 && line.length < 220);
+
+                        let title = lines.find(
+                            (line) => !/[₹$€£]/.test(line) && !/^(add|view|delivery|free delivery|\d+%\s*off)/i.test(line)
+                        ) || '';
+
+                        if (!title) {
+                            title = text.split(/₹|Rs\.?|INR/i)[0].trim();
                         }
-                        if (!title) continue;
+
+                        if (!title || title.length < 5) continue;
                         
-                        const img = container.querySelector('img');
+                        const imgs = container.querySelectorAll('img[src], img[data-src], img[data-srcset]');
+                        let image = null;
+                        for (const img of imgs) {
+                            const rawSrc = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-srcset') || '';
+                            const src = rawSrc.toLowerCase();
+                            if (!src) continue;
+                            if (src.includes('wishlist') || src.includes('svgicons') || src.includes('/icon/') || src.includes('/icons/')) continue;
+                            if (src.endsWith('.svg') || src.startsWith('data:image/svg')) continue;
+                            if (!src.includes('meesho') && !src.includes('/images') && !src.includes('cdn')) continue;
+                            image = rawSrc;
+                            break;
+                        }
+
                         products.push({
                             title: title,
                             price: String(price),
                             url: href,
-                            image: img ? (img.src || img.getAttribute('data-src')) : null
+                            image: image
                         });
                     } catch (e) {
                         console.log('Parse error:', e.message);
@@ -777,7 +882,7 @@ class MeeshoScraper(BasePlatformHandler):
                     
                     products.append(ProductData(
                         external_id=product_id,
-                        title=item.get('title', '')[:200],
+                        title=self._clean_product_title(item.get('title', '')) or item.get('title', '')[:200],
                         current_price=price,
                         product_url=self.build_affiliate_url(url),
                         platform_name="meesho",
@@ -841,7 +946,7 @@ class MeeshoScraper(BasePlatformHandler):
             logger.info("🤖 Meesho AI healing recovered a search result")
             return ProductData(
                 external_id=product_id,
-                title=str(title)[:200],
+                title=self._clean_product_title(title) or str(title)[:200],
                 current_price=price_value,
                 product_url=self.build_affiliate_url(url) if url else "",
                 platform_name="meesho",
@@ -1041,15 +1146,16 @@ class MeeshoScraper(BasePlatformHandler):
                 if (!result.image) {
                     const imgs = document.querySelectorAll('img[src], img[data-src], img[data-srcset]');
                     for (const img of imgs) {
-                        const src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
+                        const rawSrc = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-srcset') || '';
+                        const src = rawSrc.toLowerCase();
                         if (!src) continue;
                         if (src.includes('wishlist') || src.includes('svgicons') || src.includes('/icon/') || src.includes('/icons/')) continue;
-                        if (src.startsWith('data:image/svg')) continue;
+                        if (src.endsWith('.svg') || src.startsWith('data:image/svg')) continue;
                         const width = img.naturalWidth || 0;
-                        if (width < 160) continue;
-                        if (!src.includes('meesho') && !src.includes('/images')) continue;
+                        if (width > 0 && width < 120) continue;
+                        if (!src.includes('meesho') && !src.includes('/images') && !src.includes('cdn')) continue;
 
-                        result.image = img.currentSrc || img.src || img.getAttribute('data-src');
+                        result.image = rawSrc;
                         break;
                     }
                 }
@@ -1089,7 +1195,7 @@ class MeeshoScraper(BasePlatformHandler):
             
             return ProductData(
                 external_id=product_id,
-                title=product_data['title'][:200],
+                title=self._clean_product_title(product_data.get('title')) or product_data['title'][:200],
                 current_price=Decimal(product_data['price']),
                 product_url=self.build_affiliate_url(product_url),
                 platform_name="meesho",
