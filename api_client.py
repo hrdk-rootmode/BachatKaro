@@ -274,6 +274,9 @@ class AdminApiClient:
     def product_detail(self, token: str, product_id: str) -> Any:
         return self._data(self._request("GET", f"/admin/products/{product_id}", token=token))
 
+    def get_cross_platform_variants(self, token: str, product_id: str) -> Any:
+        return self._data(self._request("GET", f"/products/{product_id}/cross-platform-variants", token=token))
+
     def update_product(self, token: str, product_id: str, update_data: dict) -> Any:
         return self._data(self._request("PUT", f"/admin/products/{product_id}", token=token, json=update_data))
 
@@ -330,6 +333,14 @@ class AdminApiClient:
         }
         return self._data(self._request("POST", f"/admin/listings/{listing_id}/price-history", token=token, json=payload))
 
+    def delete_price_history_point(
+        self,
+        token: str,
+        listing_id: str,
+        history_id: str
+    ) -> Any:
+        return self._data(self._request("DELETE", f"/admin/listings/{listing_id}/price-history/{history_id}", token=token))
+
     def get_listing_performance(
         self,
         token: str,
@@ -367,3 +378,81 @@ class AdminApiClient:
 
     def get_database_stats(self, token: str) -> Any:
         return self._data(self._request("GET", "/admin/system/database-stats", token=token))
+
+    # Scraper Testing Endpoints
+    def get_scraper_status(self, token: str) -> Any:
+        """Get status of all platform scrapers"""
+        return self._data(self._request("GET", "/admin/scrapers/status", token=token))
+
+    def test_platform_scraper(self, token: str, platform: str, test_data: dict) -> Any:
+        """Test a specific platform scraper"""
+        return self._data(self._request("POST", f"/admin/scrapers/test/{platform}", token=token, json=test_data))
+
+    def test_all_scrapers(self, token: str, test_data: dict) -> Any:
+        """Test all platform scrapers"""
+        return self._data(self._request("POST", "/admin/scrapers/test/all", token=token, json=test_data))
+
+    def validate_selector(
+        self,
+        token: str,
+        platform: str,
+        selector: str,
+        field_name: str,
+        category: str | None = None,
+        html_content: str | None = None,
+        page_url: str | None = None,
+    ) -> Any:
+        """Validate a selector against platform's current HTML"""
+        payload = {
+            "selector": selector,
+            "field_name": field_name,
+        }
+        if category:
+            payload["category"] = category
+        if html_content:
+            payload["html_content"] = html_content
+        if page_url:
+            payload["page_url"] = page_url
+        return self._data(self._request("POST", f"/admin/scrapers/validate-selector/{platform}", token=token, json=payload))
+
+    def inspect_scraper_page(self, token: str, platform: str, inspect_data: dict, category: str | None = None) -> Any:
+        """Fetch a live page, outline its HTML, and inspect selectors against it."""
+        payload = dict(inspect_data or {})
+        if category:
+            payload["category"] = category
+        
+        return self._data(self._request("POST", f"/admin/scrapers/inspect/{platform}", token=token, json=payload))
+
+    def get_platform_selectors(self, token: str, platform: str, category: str | None = None) -> Any:
+        """Get all raw selectors currently stored in DB for a platform."""
+        params = {"category": category} if category else None
+        return self._data(self._request("GET", f"/admin/scrapers/selectors/{platform}", token=token, params=params))
+
+    def update_scraper_selector(self, token: str, platform: str, field_name: str, selector: str, category: str | None = None) -> Any:
+        """Persist a selector update for a platform."""
+        payload = {
+            "field_name": field_name,
+            "selector": selector,
+        }
+        if category:
+            payload["category"] = category
+        return self._data(self._request("PUT", f"/admin/scrapers/selectors/{platform}", token=token, json=payload))
+
+    def fix_platform_scraper(self, token: str, platform: str, fix_data: dict) -> Any:
+        """Fix a platform scraper"""
+        return self._data(self._request("POST", f"/admin/scrapers/fix/{platform}", token=token, json=fix_data))
+
+    def get_scraper_results(self, token: str, platform: str, days: int = 7) -> Any:
+        """Get recent test results for a platform"""
+        params = {"days": days}
+        return self._data(self._request("GET", f"/admin/scrapers/results/{platform}", token=token, params=params))
+
+    def test_groq_key(self, token: str, api_key: str) -> Any:
+        """Test a Groq API key with a real minimal call."""
+        return self._data(
+            self._request("POST", "/admin/scrapers/groq/test-key", token=token, json={"api_key": api_key})
+        )
+
+    def check_playwright(self, token: str) -> Any:
+        """Check if Playwright + Chromium are available on the server."""
+        return self._data(self._request("GET", "/admin/scrapers/playwright/check", token=token))

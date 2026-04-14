@@ -372,6 +372,19 @@ def _display_table_value(value) -> str:
         return str(value)
     return str(value)
 
+
+def _append_match_review(existing_stats: dict | None, review_event: dict) -> dict:
+    """Append a compact admin match-review event to product stats."""
+    stats = dict(existing_stats) if isinstance(existing_stats, dict) else {}
+    reviews = stats.get("admin_match_reviews", [])
+    if not isinstance(reviews, list):
+        reviews = []
+
+    normalized_reviews = [row for row in reviews if isinstance(row, dict)]
+    normalized_reviews.append(review_event)
+    stats["admin_match_reviews"] = normalized_reviews[-30:]
+    return stats
+
 # -----------------------------------------------------------------------------
 # MAIN LIST VIEW
 # -----------------------------------------------------------------------------
@@ -830,6 +843,15 @@ else:
         
         with tab2:
             st.markdown("### 🔗 Side-by-Side Comparison: DB vs Website")
+
+            cross_platform_data = None
+            cross_platform_error = None
+            try:
+                cross_platform_data = api.get_cross_platform_variants(token, product_id)
+            except ApiError as e:
+                cross_platform_error = str(e)
+            except Exception as e:
+                cross_platform_error = str(e)
             
             if listings:
                 # Display all listings in a row-wise table format (like the website)
@@ -837,8 +859,18 @@ else:
                 
                 # Create a table-like display using columns for each listing
                 if listings:
+                    cross_counts_by_platform = {}
+                    variants = (cross_platform_data or {}).get("variants", []) if isinstance(cross_platform_data, dict) else []
+                    for variant in variants:
+                        for platform_row in variant.get("platforms", []):
+                            candidate_product_id = str(platform_row.get("product_id", ""))
+                            candidate_platform = str(platform_row.get("platform", "")).strip().lower()
+                            if not candidate_platform or candidate_product_id == str(product_id):
+                                continue
+                            cross_counts_by_platform[candidate_platform] = cross_counts_by_platform.get(candidate_platform, 0) + 1
+
                     # Header row
-                    header_cols = st.columns([2, 2, 2, 2, 2, 1])
+                    header_cols = st.columns([2, 2, 2, 2, 2, 1.3, 1])
                     with header_cols[0]:
                         st.markdown("**Platform**")
                     with header_cols[1]:
@@ -850,13 +882,15 @@ else:
                     with header_cols[4]:
                         st.markdown("**Status**")
                     with header_cols[5]:
+                        st.markdown("**Cross Match**")
+                    with header_cols[6]:
                         st.markdown("**Action**")
                     
                     st.divider()
                     
                     # Data rows - each listing as a row
                     for listing in listings:
-                        row_cols = st.columns([2, 2, 2, 2, 2, 1])
+                        row_cols = st.columns([2, 2, 2, 2, 2, 1.3, 1])
                         
                         platform_name = listing.get('platform_name', 'Unknown')
                         current_price = listing.get('current_price') or 0
@@ -900,6 +934,16 @@ else:
                             st.caption(f"Updated: {last_scraped}")
                         
                         with row_cols[5]:
+                            platform_key = str(platform_name).strip().lower()
+                            match_count = cross_counts_by_platform.get(platform_key, 0)
+                            if match_count > 0:
+                                st.success(f"{match_count} found")
+                                if st.button("Review", key=f"review_match_{listing.get('id')}", use_container_width=True):
+                                    st.session_state["pm_match_review_focus"] = platform_key
+                            else:
+                                st.caption("No candidates")
+
+                        with row_cols[6]:
                             preview_url = _admin_preview_url(product_url, platform_name)
                             if preview_url:
                                 st.link_button("🔗", preview_url, use_container_width=True)
@@ -952,9 +996,169 @@ else:
                             st.write(selected_listing.get('last_scraped', 'Never')[:10] if selected_listing.get('last_scraped') else 'Never')
                     
                     st.divider()
-                    
-                    # Row 2: Live Website Data (full width, below DB data)
-                    st.markdown("#### 🌐 Row 2: Live Website Data")
+
+                    # Row 2: Cross-platform matched product review
+                    st.markdown("#### 🔁 Row 2: Cross-Platform Match Review")
+                    with st.container(border=True):
+                        selected_platform_key = str(selected_listing.get('platform_name', '')).strip().lower()
+                        focused_platform = st.session_state.get("pm_match_review_focus")
+
+                        candidate_rows = []
+                        variants = (cross_platform_data or {}).get("variants", []) if isinstance(cross_platform_data, dict) else []
+                        for variant in variants:
+                            variant_fp = variant.get("variant_fingerprint", "standard")
+                            for platform_row in variant.get("platforms", []):
+                                candidate_product_id = str(platform_row.get("product_id", ""))
+                                candidate_platform = str(platform_row.get("platform", "")).strip().lower()
+                                if not candidate_product_id or candidate_product_id == str(product_id):
+                                    continue
+                                if selected_platform_key and candidate_platform == selected_platform_key:
+                                    continue
+                                candidate_rows.append({
+                                    "variant_fingerprint": variant_fp,
+                                    "product_id": candidate_product_id,
+                                    "platform": candidate_platform,
+                                    "title": platform_row.get("title", ""),
+                                    "price": float(platform_row.get("price") or 0),
+                                    "url": platform_row.get("url", ""),
+                                    "in_stock": platform_row.get("in_stock"),
+                                    "last_scraped": platform_row.get("last_scraped"),
+                                })
+
+                        if focused_platform:
+                            focused_candidates = [c for c in candidate_rows if c["platform"] == focused_platform]
+                            if focused_candidates:
+                                candidate_rows = focused_candidates
+
+                        if cross_platform_error:
+                            st.warning(f"Cross-platform lookup unavailable: {cross_platform_error}")
+                        elif not candidate_rows:
+                            st.info("No cross-platform matched candidates available for this listing.")
+                        else:
+                            candidate_rows.sort(key=lambda row: (row.get("price", 0), row.get("platform", "")))
+
+                            selected_candidate = st.selectbox(
+                                "Select matched product candidate:",
+                                options=candidate_rows,
+                                format_func=lambda row: (
+                                    f"{str(row.get('platform', '')).capitalize()} | ₹{float(row.get('price') or 0):,.2f} | "
+                                    f"{str(row.get('title') or 'Untitled')[:60]}"
+                                ),
+                                key=f"pm_cross_candidate_{selected_listing.get('id')}"
+                            )
+
+                            candidate_detail = None
+                            candidate_product = {}
+                            if selected_candidate:
+                                try:
+                                    candidate_detail = api.product_detail(token, selected_candidate.get("product_id"))
+                                    candidate_product = candidate_detail.get("product", {}) if isinstance(candidate_detail, dict) else {}
+                                except ApiError as e:
+                                    st.error(f"Failed to load matched product details: {e}")
+                                except Exception as e:
+                                    st.error(f"Failed to load matched product details: {e}")
+
+                            side_col1, side_col2 = st.columns(2)
+                            with side_col1:
+                                st.markdown("**Source Product**")
+                                st.write(f"**{product.get('title', 'N/A')}**")
+                                st.caption(f"Platform: {selected_listing.get('platform_name', 'Unknown')}")
+                                st.caption(f"Product ID: {str(product.get('id', ''))[:12]}")
+                                st.caption(f"Variant: {product.get('variant_type') or product.get('variant_fingerprint') or '-'}")
+                                st.metric("Current Price", f"₹{current_price_value:,.2f}")
+
+                            with side_col2:
+                                st.markdown("**Matched Candidate**")
+                                if selected_candidate:
+                                    st.write(f"**{candidate_product.get('title') or selected_candidate.get('title') or 'N/A'}**")
+                                    st.caption(f"Platform: {str(selected_candidate.get('platform', '')).capitalize()}")
+                                    st.caption(f"Product ID: {str(selected_candidate.get('product_id', ''))[:12]}")
+                                    st.caption(f"Variant: {selected_candidate.get('variant_fingerprint') or candidate_product.get('variant_type') or '-'}")
+                                    st.metric("Current Price", f"₹{float(selected_candidate.get('price') or 0):,.2f}")
+                                else:
+                                    st.info("Select a candidate to review.")
+
+                            if selected_candidate:
+                                action_col1, action_col2, action_col3 = st.columns(3)
+
+                                review_base = {
+                                    "reviewed_at": datetime.utcnow().isoformat(),
+                                    "source_product_id": str(product.get("id")),
+                                    "candidate_product_id": str(selected_candidate.get("product_id")),
+                                    "source_platform": str(selected_listing.get("platform_name", "")).lower(),
+                                    "candidate_platform": str(selected_candidate.get("platform", "")).lower(),
+                                    "variant_fingerprint": selected_candidate.get("variant_fingerprint"),
+                                }
+
+                                with action_col1:
+                                    if st.button("✅ Match Is Correct", key=f"pm_match_ok_{selected_listing.get('id')}", use_container_width=True):
+                                        try:
+                                            source_stats = _append_match_review(product.get("stats"), {
+                                                **review_base,
+                                                "action": "approved",
+                                            })
+                                            api.update_product(token, product_id, {"stats": source_stats})
+                                            st.success("Saved as approved match.")
+                                            st.rerun()
+                                        except ApiError as e:
+                                            st.error(f"Failed to save approval: {e}")
+
+                                with action_col2:
+                                    if st.button("❌ Mark Unmatched", key=f"pm_match_bad_{selected_listing.get('id')}", use_container_width=True):
+                                        try:
+                                            source_stats = _append_match_review(product.get("stats"), {
+                                                **review_base,
+                                                "action": "unmatched",
+                                            })
+                                            api.update_product(token, product_id, {"stats": source_stats})
+                                            st.warning("Marked unmatched for admin review.")
+                                            st.rerun()
+                                        except ApiError as e:
+                                            st.error(f"Failed to mark unmatched: {e}")
+
+                                with action_col3:
+                                    if st.button("🔌 Disconnect Both", key=f"pm_disconnect_both_{selected_listing.get('id')}", use_container_width=True):
+                                        try:
+                                            ts_token = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                                            source_short = str(product_id)[:8]
+                                            target_short = str(selected_candidate.get("product_id", ""))[:8]
+
+                                            source_update = {
+                                                "base_fingerprint": f"manual_unlinked_base_{source_short}_{ts_token}",
+                                                "variant_fingerprint": f"manual_unlinked_variant_{source_short}_{ts_token}",
+                                                "stats": _append_match_review(product.get("stats"), {
+                                                    **review_base,
+                                                    "action": "disconnected",
+                                                }),
+                                            }
+                                            if product.get("fingerprint"):
+                                                source_update["fingerprint"] = f"manual_unlinked_fp_{source_short}_{ts_token}"
+
+                                            candidate_stats = candidate_product.get("stats") if isinstance(candidate_product, dict) else None
+                                            candidate_update = {
+                                                "base_fingerprint": f"manual_unlinked_base_{target_short}_{ts_token}",
+                                                "variant_fingerprint": f"manual_unlinked_variant_{target_short}_{ts_token}",
+                                                "stats": _append_match_review(candidate_stats, {
+                                                    **review_base,
+                                                    "action": "disconnected_target",
+                                                }),
+                                            }
+                                            if candidate_product.get("fingerprint"):
+                                                candidate_update["fingerprint"] = f"manual_unlinked_fp_{target_short}_{ts_token}"
+
+                                            api.update_product(token, str(product_id), source_update)
+                                            api.update_product(token, str(selected_candidate.get("product_id")), candidate_update)
+                                            _clear_product_cache(str(product_id))
+                                            _clear_product_cache(str(selected_candidate.get("product_id")))
+                                            st.success("Disconnected both products from the current match family.")
+                                            st.rerun()
+                                        except ApiError as e:
+                                            st.error(f"Failed to disconnect products: {e}")
+
+                    st.divider()
+
+                    # Row 3: Live Website Data (full width, below DB and match-review rows)
+                    st.markdown("#### 🌐 Row 3: Live Website Data")
                     with st.container(border=True):
                         product_url = selected_listing.get('product_url', '')
                         preview_url = _admin_preview_url(product_url, selected_listing.get('platform_name'))
@@ -1140,7 +1344,7 @@ else:
                 st.info("ℹ️ No platform listings available for comparison")
         
         with tab3:
-            st.markdown("### 📊 Price History & Performance")
+            st.markdown("### 📊 Price History & Management")
             
             if listings:
                 selected_history_listing = st.selectbox(
@@ -1173,7 +1377,7 @@ else:
                                 st.metric("Data Points", performance.get('total_price_points', 0))
                                 st.caption("More data = better insights")
                         
-                        # Price history
+                        # Price history charts
                         history = api.get_price_history(token, selected_history_listing.get('id'))
                         
                         if history and history.get("history"):
@@ -1181,6 +1385,68 @@ else:
                             if hist_data:
                                 df_hist = _prepare_history_dataframe(hist_data)
                                 _render_history_charts(df_hist)
+                        
+                        # Price History Table with Delete Functionality
+                        st.divider()
+                        st.markdown("### 🔗 Compare with Website - Price History Management")
+                        st.caption("View all price history points, compare with website, and delete incorrect entries for debugging")
+                        
+                        if history and history.get("history"):
+                            hist_data = history.get("history", [])
+                            
+                            # Create a table with all history points
+                            history_table = []
+                            for point in hist_data:
+                                history_table.append({
+                                    "History ID": point.get('id', 'N/A')[:12] + '...' if len(point.get('id', '')) > 12 else point.get('id', 'N/A'),
+                                    "Price (₹)": f"{float(point.get('price', 0)):,.2f}",
+                                    "In Stock": "✅ Yes" if point.get('in_stock') else "❌ No",
+                                    "Recorded At": point.get('recorded_at', 'N/A'),
+                                })
+                            
+                            if history_table:
+                                st.markdown("#### 📋 Price History Points")
+                                st.dataframe(
+                                    pd.DataFrame(history_table),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    column_config={
+                                        "History ID": st.column_config.TextColumn(width="medium"),
+                                        "Price (₹)": st.column_config.TextColumn(width="small"),
+                                        "In Stock": st.column_config.TextColumn(width="small"),
+                                        "Recorded At": st.column_config.TextColumn(width="large"),
+                                    }
+                                )
+                                
+                                # Delete by history ID
+                                st.markdown("#### 🗑️ Delete Price History Point")
+                                st.caption("Select a history point ID to delete (for debugging incorrect data)")
+                                
+                                history_id_options = [point.get('id') for point in hist_data]
+                                if history_id_options:
+                                    delete_col1, delete_col2 = st.columns([2, 1])
+                                    with delete_col1:
+                                        selected_history_id = st.selectbox(
+                                            "Select History Point to Delete",
+                                            options=history_id_options,
+                                            format_func=lambda x: f"{x[:12]}... (₹{float(next((p.get('price', 0) for p in hist_data if p.get('id') == x), 0)):,.2f})"
+                                        )
+                                    
+                                    with delete_col2:
+                                        if st.button("🗑️ Delete Selected Point", use_container_width=True, type="secondary"):
+                                            try:
+                                                result = api.delete_price_history_point(
+                                                    token=token,
+                                                    listing_id=selected_history_listing.get('id'),
+                                                    history_id=selected_history_id
+                                                )
+                                                if result.get("success"):
+                                                    st.success("✅ Price history point deleted!")
+                                                    st.rerun()
+                                                else:
+                                                    st.error("❌ Failed to delete price history point")
+                                            except ApiError as e:
+                                                st.error(f"❌ Error: {e}")
                                 
                                 # Add new price point
                                 st.markdown("#### ➕ Add Manual Price Point")
@@ -1214,6 +1480,10 @@ else:
                                     with add_col2:
                                         if st.form_submit_button("🔄 Refresh History", use_container_width=True):
                                             st.rerun()
+                            else:
+                                st.info("No price history data available")
+                        else:
+                            st.info("No price history data available for this listing")
                     
                     except ApiError as e:
                         st.error(f"❌ Failed to load performance data: {e}")

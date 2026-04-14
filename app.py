@@ -42,7 +42,7 @@ def render_connection_panel(token: str | None = None) -> None:
         if st.button("Check Admin Access", disabled=not token):
             try:
                 result = api.admin_health(token or "")
-                status = result.data.get("status", "unknown") if isinstance(result.data, dict) else "ok"
+                status = result.get("status", "unknown") if isinstance(result, dict) else "ok"
                 st.success(f"Admin access OK. System status: {status}")
             except ApiError as exc:
                 st.error(f"Admin endpoint failed: {exc}")
