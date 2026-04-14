@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   RefreshControl,
   Dimensions,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -116,7 +117,28 @@ const NotificationsScreen = () => {
       is_system: true,
     }));
 
-    return [...systemItems, ...notifications];
+    // Filter price-related notifications to only show those with actual price changes
+    const filteredNotifications = notifications.filter(notif => {
+      // Keep system alerts and non-price notifications
+      if (notif.is_system || notif.type !== 'price_drop') {
+        return true;
+      }
+
+      // For price notifications, check if there's an actual price change
+      const notifData = notif.data || {};
+      const currentPrice = notifData.price;
+      const previousPrice = notifData.previous_price;
+
+      // Only show if we have both prices and they're different
+      if (typeof currentPrice === 'number' && typeof previousPrice === 'number') {
+        return Math.abs(currentPrice - previousPrice) > 0.01;
+      }
+
+      // If we don't have previous price, show the notification (new price alert)
+      return true;
+    });
+
+    return [...systemItems, ...filteredNotifications];
   }, [actionAlerts, notifications]);
 
   // Fetch notifications on mount
@@ -233,15 +255,33 @@ const NotificationsScreen = () => {
     const notifData = item.data || {};
     const isSystemAlert = Boolean(item.is_system);
     const productTitle = notifData.product_title || notifData.title;
+    const productImageUrl = notifData.product_image_url;
     const hasPrice = typeof notifData.price === 'number';
     const hasTarget = typeof notifData.target_price === 'number';
     const showWatchlistMeta = !isSystemAlert && (item.type === 'price_drop' || item.type === 'back_in_stock');
+
+    // Determine price change direction for background color
+    const currentPrice = notifData.price;
+    const previousPrice = notifData.previous_price;
+    let priceChangeType = null;
+    let cardBackgroundColor = isUnread ? themePalette.accent || '#f3f4f6' : themePalette.surface || '#ffffff';
+    
+    if (!isSystemAlert && item.type === 'price_drop' && typeof currentPrice === 'number' && typeof previousPrice === 'number') {
+      if (currentPrice < previousPrice) {
+        priceChangeType = 'drop';
+        cardBackgroundColor = isUnread ? '#dcfce7' : '#f0fdf4'; // Green background
+      } else if (currentPrice > previousPrice) {
+        priceChangeType = 'rise';
+        cardBackgroundColor = isUnread ? '#fee2e2' : '#fef2f2'; // Red background
+      }
+    }
 
     const watchlistMeta = showWatchlistMeta
       ? [
           productTitle ? `Product: ${productTitle}` : null,
           hasPrice ? `Now: INR ${formatPrice(notifData.price)}` : null,
           hasTarget ? `Target: INR ${formatPrice(notifData.target_price)}` : null,
+          previousPrice ? `Previous: INR ${formatPrice(previousPrice)}` : null,
         ]
           .filter(Boolean)
           .join(' • ')
@@ -252,7 +292,7 @@ const NotificationsScreen = () => {
         style={[
           styles.notificationCard,
           {
-            backgroundColor: isUnread ? themePalette.accent || '#f3f4f6' : themePalette.surface || '#ffffff',
+            backgroundColor: cardBackgroundColor,
             borderLeftColor: isUnread ? '#3b82f6' : 'transparent',
           },
         ]}
@@ -264,8 +304,18 @@ const NotificationsScreen = () => {
         activeOpacity={0.7}
       >
         <View style={styles.notificationContent}>
-          <View style={styles.iconContainer}>
-            {renderNotificationIcon(item.type)}
+          <View style={styles.thumbnailContainer}>
+            {productImageUrl ? (
+              <Image
+                source={{ uri: productImageUrl }}
+                style={styles.productImage}
+                resizeMode="cover"
+              />
+            ) : (
+              <View style={styles.iconContainer}>
+                {renderNotificationIcon(item.type)}
+              </View>
+            )}
             {isUnread && <View style={styles.unreadDot} />}
           </View>
 
@@ -606,6 +656,21 @@ const styles = StyleSheet.create({
     padding: 12,
     alignItems: 'flex-start',
     gap: 12,
+  },
+
+  thumbnailContainer: {
+    position: 'relative',
+    width: 60,
+    height: 60,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  productImage: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+    backgroundColor: '#f3f4f6',
   },
 
   iconContainer: {
