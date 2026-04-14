@@ -34,7 +34,7 @@ To switch flows:
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import secrets
 import string
@@ -79,6 +79,16 @@ def _safe_int(value, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_str(value, default: Optional[str] = None) -> Optional[str]:
+    if value is None:
+        return default
+    try:
+        cleaned = str(value).strip()
+    except Exception:
+        return default
+    return cleaned if cleaned else default
 
 
 def _normalized_user_plan(value) -> str:
@@ -249,7 +259,7 @@ async def public_signup(
             'streak_reminder': True,
             'subscription_expiry': True
         },
-        last_active=datetime.utcnow()
+        last_active=datetime.now(timezone.utc)
     )
     
     db.add(new_user)
@@ -364,7 +374,7 @@ async def signup(
             'streak_reminder': True,
             'subscription_expiry': True
         },
-        last_active=datetime.utcnow()
+        last_active=datetime.now(timezone.utc)
     )
     
     db.add(new_user)
@@ -443,7 +453,7 @@ async def refresh_token(
     user = result.scalar_one_or_none()
     
     if user and not user.is_blocked:
-        user.last_active = datetime.utcnow()
+        user.last_active = datetime.now(timezone.utc)
         await db.commit()
     
     # Return info
@@ -607,7 +617,8 @@ async def debug_token_check(request: Request):
 
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_profile(
-    user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Get Current User Profile
@@ -618,8 +629,20 @@ async def get_current_user_profile(
     - Notification preferences
     - Streak information
     """
-    # Transform User object to UserResponse with computed fields
+    # Keep this value fresh based on real app profile fetches.
+    user.last_active = datetime.now(timezone.utc)
+    db.add(user)
+    await db.commit()
+
     usage_stats = _safe_dict(user.usage_stats)
+    phone_number = _safe_str(
+        usage_stats.get("phone_number", usage_stats.get("phone")),
+        None,
+    )
+    city = _safe_str(
+        usage_stats.get("city", usage_stats.get("location")),
+        None,
+    )
     streak_data = _safe_dict(user.streak_data)
     watchlist = _safe_list(user.watchlist)
     normalized_plan = _normalized_user_plan(user.plan)
@@ -641,6 +664,8 @@ async def get_current_user_profile(
         firebase_uid=user.firebase_uid,
         email=user.email,
         display_name=user.display_name,
+        phone_number=phone_number,
+        city=city,
         plan=normalized_plan,
         plan_expires_at=user.plan_expires_at,
         referral_code=user.referral_code or "",
@@ -686,8 +711,12 @@ async def get_user_stats(
     searches_today = await redis_client.get(cache_key)
     searches_today = int(searches_today) if searches_today else 0
     
-    # Add bonus searches
-    bonus_searches = _safe_int(usage_stats.get('bonus_searches'), 0)
+    # Add bonus searches.
+    # Legacy users may still have rewards under daily_search_bonus only.
+    bonus_searches = max(
+        _safe_int(usage_stats.get('bonus_searches'), 0),
+        _safe_int(usage_stats.get('daily_search_bonus'), 0),
+    )
     
     if daily_limit == -1:
         searches_remaining = -1  # Unlimited
@@ -747,17 +776,82 @@ async def update_profile(
     
     # Update only provided fields
     update_data = updates.model_dump(exclude_unset=True)
+
+    incoming_phone = update_data.pop("phone_number", None) if "phone_number" in update_data else None
+    incoming_city = update_data.pop("city", None) if "city" in update_data else None
     
     for field, value in update_data.items():
         if hasattr(user, field):
             setattr(user, field, value)
+
+    usage_stats = _safe_dict(user.usage_stats)
+
+    if "phone_number" in updates.model_fields_set:
+        clean_phone = _safe_str(incoming_phone, None)
+        if clean_phone:
+            usage_stats["phone_number"] = clean_phone
+        else:
+            usage_stats.pop("phone_number", None)
+
+    if "city" in updates.model_fields_set:
+        clean_city = _safe_str(incoming_city, None)
+        if clean_city:
+            usage_stats["city"] = clean_city
+        else:
+            usage_stats.pop("city", None)
+
+    user.usage_stats = usage_stats
     
     await db.commit()
     await db.refresh(user)
     
     logger.info(f"Profile updated: User {user.id} | Fields: {list(update_data.keys())}")
-    
-    return user
+
+    usage_stats = _safe_dict(user.usage_stats)
+    streak_data = _safe_dict(user.streak_data)
+    watchlist = _safe_list(user.watchlist)
+    normalized_plan = _normalized_user_plan(user.plan)
+    phone_number = _safe_str(
+        usage_stats.get("phone_number", usage_stats.get("phone")),
+        None,
+    )
+    city = _safe_str(
+        usage_stats.get("city", usage_stats.get("location")),
+        None,
+    )
+
+    total_searches = _safe_int(usage_stats.get("total_searches"), 0)
+    searches_today = _safe_int(
+        usage_stats.get("searches_today", usage_stats.get("daily_searches")),
+        0,
+    )
+    current_streak = _safe_int(streak_data.get("current_streak"), 0)
+    longest_streak = _safe_int(
+        streak_data.get("max_streak", streak_data.get("longest_streak")),
+        0,
+    )
+    freeze_count = _safe_int(streak_data.get("freeze_count"), 0)
+
+    return UserResponse(
+        id=str(user.id),
+        firebase_uid=user.firebase_uid,
+        email=user.email,
+        display_name=user.display_name,
+        phone_number=phone_number,
+        city=city,
+        plan=normalized_plan,
+        plan_expires_at=user.plan_expires_at,
+        referral_code=user.referral_code or "",
+        total_searches=total_searches,
+        searches_today=searches_today,
+        watchlist_count=len(watchlist),
+        current_streak=current_streak,
+        max_streak=longest_streak,
+        freeze_count=freeze_count,
+        is_blocked=user.is_blocked,
+        created_at=user.created_at or datetime.utcnow(),
+        last_active=user.last_active,
+    )
 
 
 @router.delete("/me")
@@ -784,7 +878,7 @@ async def delete_account(
     # Soft delete
     user.is_blocked = True
     user.fcm_token = None
-    user.last_active = datetime.utcnow()
+    user.last_active = datetime.now(timezone.utc)
     
     # Add deletion metadata
     if user.usage_stats is None:

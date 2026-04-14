@@ -23,3 +23,6 @@ tmp_db_check.py
 cache/
 cache/healed_selectors.json
 cache/healed_selectors_backup.json
+
+*.drawio
+*.drawio.png

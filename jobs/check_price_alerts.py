@@ -20,12 +20,63 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.core.config import settings
 from app.core.database import async_session_maker
-from app.models import Product, ProductListing, SystemLog, UserWatchlist
+from app.models import Notification, Product, ProductListing, SystemLog, UserWatchlist
 
 logger = logging.getLogger(__name__)
 
 MAX_ALERT_HISTORY = 50
 TARGET_COOLDOWN_HOURS = 24
+
+
+def _is_notification_enabled(user, reason: str) -> bool:
+    prefs = user.notification_preferences or {}
+
+    if reason == "target_reached":
+        return bool(prefs.get("price_drop", prefs.get("price_alerts", True)))
+
+    if reason == "price_drop":
+        return bool(prefs.get("price_drop", prefs.get("price_alerts", True)))
+
+    return True
+
+
+def _build_alert_message(title: str, current_price: float, target_price: Optional[float], reason: str) -> str:
+    if reason == "target_reached" and target_price is not None:
+        return f"{title} reached your target. Now at INR {current_price:.0f} (target INR {target_price:.0f})."
+    return f"{title} dropped in price. Current best price is INR {current_price:.0f}."
+
+
+async def _send_price_push_notification(user, title: str, body: str, reason: str, payload: Dict[str, Any]) -> bool:
+    if not user.fcm_token:
+        return False
+
+    if not settings.ENABLE_PUSH_NOTIFICATIONS:
+        return False
+
+    # In development, avoid failing job due to missing Firebase setup.
+    if settings.DEBUG or settings.ENVIRONMENT == "development":
+        logger.info("📱 [MOCK] Price push: %s | %s", title, body)
+        return True
+
+    try:
+        from firebase_admin import messaging
+
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            data={
+                "type": "price_drop",
+                "reason": reason,
+                "product_id": str(payload.get("product_id", "")),
+                "platform": str(payload.get("platform", "")),
+            },
+            token=user.fcm_token,
+        )
+
+        messaging.send(message)
+        return True
+    except Exception as e:
+        logger.warning("Price push send failed for user %s: %s", getattr(user, "id", "unknown"), e)
+        return False
 
 
 def _is_listing_eligible(listing: ProductListing) -> bool:
@@ -132,6 +183,8 @@ async def run_check_price_alerts() -> Dict[str, Any]:
         "target_price_alerts": 0,
         "drop_alerts": 0,
         "users_notified": 0,
+        "push_sent": 0,
+        "in_app_notifications_created": 0,
         "errors": 0,
         "duration_seconds": 0.0,
     }
@@ -188,6 +241,9 @@ async def run_check_price_alerts() -> Dict[str, Any]:
                     if _is_recent_duplicate(last_alert, reason, current_price):
                         continue
 
+                    if not _is_notification_enabled(item.user, reason):
+                        continue
+
                     alert_entry = {
                         "timestamp": datetime.utcnow().isoformat(),
                         "product_id": product_id,
@@ -202,6 +258,38 @@ async def run_check_price_alerts() -> Dict[str, Any]:
                     if len(history) > MAX_ALERT_HISTORY:
                         history = history[-MAX_ALERT_HISTORY:]
                     item.user.alert_history = history
+
+                    notif_type = "price_drop"
+                    notif_title = "Target Price Reached" if reason == "target_reached" else "Price Dropped"
+                    notif_message = _build_alert_message(product.title, current_price, target_price, reason)
+
+                    notification = Notification(
+                        user_id=item.user_id,
+                        type=notif_type,
+                        title=notif_title,
+                        message=notif_message,
+                        data={
+                            "product_id": product_id,
+                            "product_title": product.title,
+                            "platform": listing.platform.name.lower() if listing.platform else "unknown",
+                            "price": current_price,
+                            "target_price": target_price,
+                            "reason": reason,
+                        },
+                        is_read=False,
+                    )
+                    db.add(notification)
+                    stats["in_app_notifications_created"] += 1
+
+                    push_ok = await _send_price_push_notification(
+                        user=item.user,
+                        title=notif_title,
+                        body=notif_message,
+                        reason=reason,
+                        payload=notification.data,
+                    )
+                    if push_ok:
+                        stats["push_sent"] += 1
 
                     stats["alerts_triggered"] += 1
                     if reason == "target_reached":

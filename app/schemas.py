@@ -80,6 +80,8 @@ class UserResponse(BaseModel):
     firebase_uid: str
     email: str
     display_name: Optional[str]
+    phone_number: Optional[str] = None
+    city: Optional[str] = None
     plan: UserPlan
     plan_expires_at: Optional[datetime]
     referral_code: str
@@ -97,6 +99,8 @@ class UserResponse(BaseModel):
 class UserProfileUpdate(BaseModel):
     """Request schema for profile updates"""
     display_name: Optional[str] = Field(None, max_length=100)
+    phone_number: Optional[str] = Field(None, max_length=25)
+    city: Optional[str] = Field(None, max_length=100)
     fcm_token: Optional[str] = Field(None, max_length=512)
     notification_preferences: Optional[Dict[str, bool]] = None
 
@@ -652,6 +656,14 @@ class NotificationResponse(BaseModel):
     data: Dict[str, Any]
     is_read: bool
     created_at: datetime
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def normalize_notification_id(cls, v: Any) -> str:
+        """Allow ORM UUID values while keeping API response type as string."""
+        if isinstance(v, UUID):
+            return str(v)
+        return v
 
 
 # ==================== HEALTH CHECK SCHEMA ====================

@@ -12,8 +12,9 @@ from decimal import Decimal
 import logging
 
 from app.core.database import get_db
+from app.core.config import settings
 from app.core.redis_client import RedisClient, get_redis
-from app.models import User, StreakMilestone
+from app.models import User, StreakMilestone, Notification
 from app.schemas import (
     StreakCheckInResponse,
     StreakMilestoneSchema,
@@ -40,7 +41,7 @@ FREEZE_LIMITS = {
 DEFAULT_MILESTONES = [
     # Early milestones - Quick wins
     {"days": 3, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🔥", "badge_name": "Fire Starter", "description": "+5 bonus searches"},
-    {"days": 5, "reward_type": "premium_days", "reward_value": 7, "badge_emoji": "🏆", "badge_name": "5-Day Warrior", "description": "+7 days free trial"},
+    {"days": 5, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🏆", "badge_name": "5-Day Warrior", "description": "+5 daily extra searches"},
     {"days": 7, "reward_type": "watchlist_slots", "reward_value": 1, "badge_emoji": "⭐", "badge_name": "Week Warrior", "description": "+1 watchlist slot"},
     {"days": 10, "reward_type": "watchlist_slots", "reward_value": 2, "badge_emoji": "🌟", "badge_name": "10-Day Legend", "description": "+2 watchlist slots"},
     
@@ -100,6 +101,17 @@ def is_streak_broken(last_check_in: Optional[str]) -> bool:
     return last_date < yesterday
 
 
+def create_streak_notification(user_id, title: str, message: str, data: Optional[dict] = None) -> Notification:
+    return Notification(
+        user_id=user_id,
+        type="streak_reminder",
+        title=title,
+        message=message,
+        data=data or {},
+        is_read=False,
+    )
+
+
 def get_next_milestone(current_streak: int, claimed_milestones: List[int]) -> Optional[int]:
     """Get next unclaimed milestone"""
     for milestone in DEFAULT_MILESTONES:
@@ -111,6 +123,12 @@ def get_next_milestone(current_streak: int, claimed_milestones: List[int]) -> Op
 async def get_milestones_from_db(db: AsyncSession) -> List[dict]:
     """Get milestones from database or use defaults"""
     normalized_overrides = {
+        5: {
+            "reward_type": "searches",
+            "reward_value": 5,
+            "badge_emoji": "🏆",
+            "badge_name": "5-Day Warrior",
+        },
         7: {
             "reward_type": "watchlist_slots",
             "reward_value": 1,
@@ -158,11 +176,12 @@ async def apply_milestone_reward(
     reward_value = milestone["reward_value"]
     
     if reward_type == "searches":
-        # Add bonus searches
+        # Add bonus searches (aligned with auth/stats usage key)
         usage_stats = dict(user.usage_stats or {})
-        usage_stats["daily_search_bonus"] = usage_stats.get("daily_search_bonus", 0) + reward_value
+        usage_stats["bonus_searches"] = int(usage_stats.get("bonus_searches", 0) or 0) + reward_value
+        usage_stats["daily_search_bonus"] = int(usage_stats.get("daily_search_bonus", 0) or 0) + reward_value
         user.usage_stats = usage_stats
-        return f"+{reward_value} bonus searches"
+        return f"+{reward_value} daily extra searches"
     
     elif reward_type == "watchlist_slots":
         # Add bonus watchlist slots
@@ -254,7 +273,13 @@ async def daily_check_in(
     current_streak = streak_data.get("current_streak", 0)
     longest_streak = streak_data.get("longest_streak", 0)
     total_check_ins = streak_data.get("total_check_ins", 0)
-    claimed_milestones = streak_data.get("streak_rewards_claimed", [])
+    claimed_milestones_raw = streak_data.get("streak_rewards_claimed", [])
+    claimed_milestones = []
+    for item in claimed_milestones_raw:
+        try:
+            claimed_milestones.append(int(item))
+        except (TypeError, ValueError):
+            continue
     
     # Check if already checked in today
     if not can_check_in_today(last_check_in):
@@ -288,34 +313,11 @@ async def daily_check_in(
     confetti = False
     milestones = await get_milestones_from_db(db)
     
-    # Special 5-day activation logic
-    if current_streak == 5 and 5 not in claimed_milestones:
-        # Auto-activate 5-day streak completion
-        if user.plan == "free" and user.plan_expires_at and user.plan_expires_at <= datetime.utcnow():
-            # Extend free trial by 7 days for 5-day streak
-            user.plan_expires_at = datetime.utcnow() + timedelta(days=7)
-            reward_description = "🎉 5-day streak! +7 days free trial activated!"
-            
-            reward_unlocked = {
-                "milestone_days": 5,
-                "reward_type": "premium_days",
-                "reward_value": 7,
-                "badge_emoji": "🔥",
-                "badge_name": "5-Day Warrior",
-                "description": reward_description
-            }
-            claimed_milestones.append(5)
-            message = reward_description
-            confetti = True
-            logger.info(f"5-day streak reward activated | User: {user.id} | Trial extended 7 days")
-    
-    # Check other milestones
+    # Check milestones.
+    # For existing users, allow catch-up reward when current streak already passed
+    # an unclaimed milestone due to earlier inconsistencies.
     for milestone in milestones:
-        if milestone["days"] == current_streak and milestone["days"] not in claimed_milestones:
-            # Skip 5-day as it's handled above
-            if milestone["days"] == 5:
-                continue
-                
+        if milestone["days"] <= current_streak and milestone["days"] not in claimed_milestones:
             # Unlock reward!
             reward_description = await apply_milestone_reward(user, milestone, db)
             claimed_milestones.append(milestone["days"])
@@ -342,6 +344,20 @@ async def daily_check_in(
         "streak_rewards_claimed": claimed_milestones,
         "freeze_count": streak_data.get("freeze_count", get_freeze_limit(user.plan))
     }
+
+    if reward_unlocked:
+        db.add(
+            create_streak_notification(
+                user_id=user.id,
+                title=f"{reward_unlocked['milestone_days']}-day streak milestone unlocked",
+                message=reward_unlocked.get("description") or "Your streak reward is ready.",
+                data={
+                    "milestone_days": reward_unlocked.get("milestone_days"),
+                    "reward_type": reward_unlocked.get("reward_type"),
+                    "reward_value": reward_unlocked.get("reward_value"),
+                },
+            )
+        )
     
     await db.commit()
     
@@ -618,3 +634,58 @@ async def get_streak_leaderboard(
     await redis.set_json(cache_key, leaderboard, ttl=900)
     
     return leaderboard
+
+
+@router.post("/debug/reset")
+async def debug_reset_streak(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_redis)
+):
+    """
+    Development-only helper:
+    Fully reset streak progress and streak reward side-effects.
+    """
+    if settings.ENVIRONMENT.lower() == "production" and not settings.DEBUG:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Debug streak reset is disabled in production"
+        )
+
+    now_iso = datetime.utcnow().isoformat()
+
+    user.streak_data = {
+        "current_streak": 0,
+        "longest_streak": 0,
+        # Keep last_check_in as now so app launch won't auto-check-in immediately.
+        "last_check_in": now_iso,
+        "total_check_ins": 0,
+        "streak_rewards_claimed": [],
+        "freeze_count": get_freeze_limit(user.plan),
+    }
+
+    usage_stats = dict(user.usage_stats or {})
+    usage_stats["watchlist_bonus"] = 0
+    usage_stats["bonus_searches"] = 0
+    usage_stats["daily_search_bonus"] = 0
+    usage_stats.pop("unlimited_search_until", None)
+    user.usage_stats = usage_stats
+
+    await db.commit()
+
+    today = datetime.utcnow().date().isoformat()
+    await redis.delete(f"streak:{user.id}")
+    await redis.delete(f"watchlist:{user.id}")
+    await redis.delete(f"user_quota:{user.id}:{today}")
+
+    return {
+        "success": True,
+        "message": "Streak and streak rewards fully reset",
+        "data": {
+            "current_streak": 0,
+            "longest_streak": 0,
+            "last_check_in": now_iso,
+            "watchlist_bonus": 0,
+            "bonus_searches": 0,
+        },
+    }

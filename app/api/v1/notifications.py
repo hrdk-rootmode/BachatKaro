@@ -6,16 +6,76 @@ Handles user notifications for watchlist price drops, stock updates, and events
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy import and_, desc, select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import Any
 from uuid import UUID
 from datetime import datetime
 
 from app.core.database import get_db
 from app.api.deps import get_current_user
-from app.models import Notification, User
-from app.schemas import NotificationResponse
-
+from app.models import Notification, Product, User
 router = APIRouter()
+
+
+def _safe_notification_data(raw_data) -> dict:
+    """Normalize notification data to a dict for schema safety."""
+    return raw_data if isinstance(raw_data, dict) else {}
+
+
+async def _get_product_map_for_notifications(
+    db: AsyncSession,
+    notifications: list[Notification],
+) -> dict[str, Product]:
+    """Fetch product metadata for notification payload enrichment in one query."""
+    product_ids: list[UUID] = []
+
+    for notification in notifications:
+        data = _safe_notification_data(notification.data)
+        product_id = data.get("product_id")
+        if not product_id:
+            continue
+        try:
+            product_ids.append(UUID(str(product_id)))
+        except (ValueError, TypeError):
+            continue
+
+    if not product_ids:
+        return {}
+
+    try:
+        stmt = select(Product).filter(Product.id.in_(set(product_ids)))
+        result = await db.execute(stmt)
+        products = result.scalars().all()
+        return {str(product.id): product for product in products}
+    except Exception:
+        return {}
+
+
+def _normalize_notification_type(raw_type: Any) -> str:
+    allowed = {"price_drop", "back_in_stock", "streak_reminder", "subscription_expiry"}
+    normalized = str(raw_type or "streak_reminder").strip().lower()
+    return normalized if normalized in allowed else "streak_reminder"
+
+
+def _serialize_notification(notification: Notification, product_map: dict[str, Product]) -> dict:
+    """Build stable API response payload from ORM model and optional product enrichment."""
+    data = dict(_safe_notification_data(notification.data))
+
+    product_id = data.get("product_id")
+    if product_id:
+        product = product_map.get(str(product_id))
+        if product:
+            data.setdefault("product_title", product.title)
+            data.setdefault("product_image_url", product.image_url)
+
+    return {
+        "id": str(notification.id),
+        "type": _normalize_notification_type(notification.type),
+        "title": str(notification.title or "Notification"),
+        "message": str(notification.message or ""),
+        "data": data,
+        "is_read": bool(notification.is_read),
+        "created_at": notification.created_at,
+    }
 
 
 # =============================================================================
@@ -81,11 +141,12 @@ async def list_notifications(
         
         result = await db.execute(stmt)
         notifications = result.scalars().all()
+        product_map = await _get_product_map_for_notifications(db, notifications)
         
         return {
             "success": True,
             "count": len(notifications),
-            "data": [NotificationResponse.from_orm(n) for n in notifications]
+            "data": [_serialize_notification(n, product_map) for n in notifications]
         }
     except Exception as e:
         print(f"❌ Error listing notifications: {str(e)}")
@@ -95,7 +156,7 @@ async def list_notifications(
         )
 
 
-@router.patch("/{notification_id}/read", tags=["Notifications"])
+@router.put("/{notification_id}/read", tags=["Notifications"])
 async def mark_notification_read(
     notification_id: str,
     db: AsyncSession = Depends(get_db),
@@ -136,10 +197,12 @@ async def mark_notification_read(
         notification.is_read = True
         notification.read_at = datetime.utcnow()
         await db.commit()
+
+        product_map = await _get_product_map_for_notifications(db, [notification])
         
         return {
             "success": True,
-            "data": NotificationResponse.from_orm(notification)
+            "data": _serialize_notification(notification, product_map)
         }
     except HTTPException:
         raise
@@ -152,7 +215,7 @@ async def mark_notification_read(
         )
 
 
-@router.patch("/mark-all-read", tags=["Notifications"])
+@router.put("/mark-all-read", tags=["Notifications"])
 async def mark_all_notifications_read(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
