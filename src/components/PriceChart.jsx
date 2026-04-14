@@ -13,12 +13,8 @@ import {
 import {
   VictoryChart,
   VictoryLine,
-  VictoryArea,
   VictoryAxis,
   VictoryScatter,
-  VictoryTheme,
-  VictoryVoronoiContainer,
-  VictoryTooltip,
 } from 'victory-native';
 
 import { COLORS } from '../utils/constants';
@@ -41,7 +37,7 @@ const CHART_PADDING = { top: 20, bottom: 40, left: 50, right: 20 };
  * @param {string} platform - Current platform name
  */
 const PriceChart = ({ priceHistory, isLoading, platform }) => {
-  const history = priceHistory?.history || [];
+  const history = Array.isArray(priceHistory?.history) ? priceHistory.history : [];
 
   // Process chart data
   const chartData = useMemo(() => {
@@ -50,13 +46,27 @@ const PriceChart = ({ priceHistory, isLoading, platform }) => {
       return null;
     }
 
-    // Convert to Victory format
-    const data = history.map((point, index) => ({
-      x: index,
-      y: parsePrice(point.price),
-      date: point.date,
-      label: `${formatShortDate(point.date)}\n${formatPrice(point.price)}`,
-    }));
+    // Convert to Victory format and drop malformed points.
+    const data = history
+      .map((point) => {
+        const safePoint = point || {};
+        const price = parsePrice(safePoint.price);
+        if (!Number.isFinite(price)) return null;
+        return {
+          y: price,
+          date: safePoint.date,
+          label: `${formatShortDate(safePoint.date)}\n${formatPrice(price)}`,
+        };
+      })
+      .filter(Boolean)
+      .map((point, index) => ({
+          ...point,
+          x: index,
+      }));
+
+    if (data.length === 0) {
+      return null;
+    }
 
     // Calculate stats
     const prices = data.map(d => d.y);
@@ -88,6 +98,9 @@ const PriceChart = ({ priceHistory, isLoading, platform }) => {
         .map(d => d.x),
     };
   }, [history]);
+
+  const minMarkerData = chartData?.data?.[chartData?.minIndex] ? [chartData.data[chartData.minIndex]] : [];
+  const maxMarkerData = chartData?.data?.[chartData?.maxIndex] ? [chartData.data[chartData.maxIndex]] : [];
 
   // Loading state
   if (isLoading) {
@@ -170,20 +183,6 @@ if (history.length === 1) {
           height={CHART_HEIGHT}
           padding={CHART_PADDING}
           domain={chartData.domain}
-          containerComponent={
-            <VictoryVoronoiContainer
-              voronoiDimension="x"
-              labels={({ datum }) => datum.label}
-              labelComponent={
-                <VictoryTooltip
-                  flyoutStyle={styles.tooltipFlyout}
-                  style={styles.tooltipText}
-                  cornerRadius={8}
-                  flyoutPadding={{ top: 8, bottom: 8, left: 12, right: 12 }}
-                />
-              }
-            />
-          }
         >
           {/* X Axis */}
           <VictoryAxis
@@ -220,18 +219,6 @@ if (history.length === 1) {
             }}
           />
 
-          {/* Area Fill */}
-          <VictoryArea
-            data={chartData.data}
-            style={{
-              data: {
-                fill: COLORS.primary + '20',
-                stroke: 'transparent',
-              },
-            }}
-            interpolation="monotoneX"
-          />
-
           {/* Line */}
           <VictoryLine
             data={chartData.data}
@@ -256,30 +243,34 @@ if (history.length === 1) {
           />
 
           {/* Min Point Marker */}
-          <VictoryScatter
-            data={[chartData.data[chartData.minIndex]]}
-            size={6}
-            style={{
-              data: {
-                fill: COLORS.success,
-                stroke: COLORS.white,
-                strokeWidth: 2,
-              },
-            }}
-          />
+          {minMarkerData.length > 0 ? (
+            <VictoryScatter
+              data={minMarkerData}
+              size={6}
+              style={{
+                data: {
+                  fill: COLORS.success,
+                  stroke: COLORS.white,
+                  strokeWidth: 2,
+                },
+              }}
+            />
+          ) : null}
 
           {/* Max Point Marker */}
-          <VictoryScatter
-            data={[chartData.data[chartData.maxIndex]]}
-            size={6}
-            style={{
-              data: {
-                fill: COLORS.error,
-                stroke: COLORS.white,
-                strokeWidth: 2,
-              },
-            }}
-          />
+          {maxMarkerData.length > 0 ? (
+            <VictoryScatter
+              data={maxMarkerData}
+              size={6}
+              style={{
+                data: {
+                  fill: COLORS.error,
+                  stroke: COLORS.white,
+                  strokeWidth: 2,
+                },
+              }}
+            />
+          ) : null}
         </VictoryChart>
       </View>
 
@@ -367,17 +358,6 @@ const styles = StyleSheet.create({
   chartWrapper: {
     alignItems: 'center',
     paddingTop: 8,
-  },
-
-  tooltipFlyout: {
-    fill: COLORS.gray800,
-    stroke: COLORS.gray800,
-  },
-
-  tooltipText: {
-    fill: COLORS.white,
-    fontSize: 11,
-    fontWeight: '600',
   },
 
   statsContainer: {

@@ -17,6 +17,11 @@ import {
   selectWatchlistItems,
   selectWatchlistCount,
   selectWatchlistLimit,
+  selectWatchlistGracePeriod,
+  selectWatchlistGraceDaysRemaining,
+  selectWatchlistOverLimitCount,
+  selectWatchlistWarningMessage,
+  selectWatchlistPrunedCount,
   selectIsWatchlistLoading,
   selectIsWatchlistRefreshing,
   selectWatchlistError,
@@ -25,6 +30,9 @@ import {
   selectIsAddingToWatchlist,
   selectIsRemovingFromWatchlist,
 } from '../store/watchlistSlice';
+import {
+  selectWatchlistBonusForCurrentStreak,
+} from '../store/streakSlice';
 
 const isNotFoundLikeError = (err) => {
   const msg = String(err?.error || err?.message || err || '').toLowerCase();
@@ -71,11 +79,19 @@ export const useWatchlist = () => {
   // Selectors
   const items = useSelector(selectWatchlistItems);
   const totalCount = useSelector(selectWatchlistCount);
-  const limit = useSelector(selectWatchlistLimit);
+  const baseLimit = useSelector(selectWatchlistLimit);
+  const streakBonus = useSelector(selectWatchlistBonusForCurrentStreak);
+  const isGracePeriod = useSelector(selectWatchlistGracePeriod);
+  const graceDaysRemaining = useSelector(selectWatchlistGraceDaysRemaining);
+  const overLimitCount = useSelector(selectWatchlistOverLimitCount);
+  const warningMessage = useSelector(selectWatchlistWarningMessage);
+  const prunedCount = useSelector(selectWatchlistPrunedCount);
   const isLoading = useSelector(selectIsWatchlistLoading);
   const isRefreshing = useSelector(selectIsWatchlistRefreshing);
   const error = useSelector(selectWatchlistError);
   const checkCache = useSelector(selectCheckCache);
+
+  const limit = useMemo(() => Number(baseLimit || 0), [baseLimit]);
   
   // Derived state
   const isAtLimit = useMemo(() => totalCount >= limit, [totalCount, limit]);
@@ -264,6 +280,11 @@ export const useWatchlist = () => {
     items,
     totalCount,
     limit,
+    isGracePeriod,
+    graceDaysRemaining,
+    overLimitCount,
+    warningMessage,
+    prunedCount,
     isLoading,
     isRefreshing,
     error,
@@ -272,6 +293,8 @@ export const useWatchlist = () => {
     // Derived state
     isAtLimit,
     remainingSlots,
+    baseLimit,
+    streakBonus,
     isEmpty: items.length === 0,
     
     // Actions

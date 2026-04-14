@@ -69,7 +69,8 @@ const MainTabs = () => {
   const shouldShowStreakTab = currentStreak >= 5;
   
   return (
-    <Tab.Navigator
+    <View style={styles.root}>
+      <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
         tabBarIcon: ({ focused, color, size }) => {
@@ -120,35 +121,36 @@ const MainTabs = () => {
           backgroundColor: themePalette.surface || COLORS.white,
         },
       })}
-    >
-      <Tab.Screen 
-        name="HomeTab" 
-        component={HomeStack}
-        options={{ tabBarLabel: 'Home' }}
-      />
-      <Tab.Screen 
-        name="SearchTab" 
-        component={SearchStack}
-        options={{ tabBarLabel: 'Search' }}
-      />
-      <Tab.Screen 
-        name="WatchlistTab" 
-        component={WatchlistStack}
-        options={{ tabBarLabel: 'Watchlist' }}
-      />
-      {shouldShowStreakTab && (
-        <Tab.Screen
-          name="StreakTab"
-          component={StreakScreen}
-          options={{ tabBarLabel: 'Streak' }}
+      >
+        <Tab.Screen 
+          name="HomeTab" 
+          component={HomeStack}
+          options={{ tabBarLabel: 'Home' }}
         />
-      )}
-      <Tab.Screen 
-        name="ProfileTab" 
-        component={ProfileScreen}
-        options={{ tabBarLabel: 'Profile' }}
-      />
-    </Tab.Navigator>
+        <Tab.Screen 
+          name="SearchTab" 
+          component={SearchStack}
+          options={{ tabBarLabel: 'Search' }}
+        />
+        <Tab.Screen 
+          name="WatchlistTab" 
+          component={WatchlistStack}
+          options={{ tabBarLabel: 'Watchlist' }}
+        />
+        {shouldShowStreakTab && (
+          <Tab.Screen
+            name="StreakTab"
+            component={StreakScreen}
+            options={{ tabBarLabel: 'Streak' }}
+          />
+        )}
+        <Tab.Screen
+          name="ProfileTab" 
+          component={ProfileScreen}
+          options={{ tabBarLabel: 'Profile' }}
+        />
+      </Tab.Navigator>
+    </View>
   );
 };
 
@@ -157,6 +159,9 @@ const MainTabs = () => {
 // --------------------------------------------
 
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
   iconContainer: {
     position: 'relative',
     width: 28,

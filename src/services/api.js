@@ -352,6 +352,13 @@ export const authAPI = {
   getMe: async () => {
     return await get(API.ENDPOINTS.ME);
   },
+
+  /**
+   * Update current user profile fields
+   */
+  updateMe: async (payload = {}) => {
+    return await put(API.ENDPOINTS.ME, payload);
+  },
   
   /**
    * Get user statistics

@@ -45,6 +45,16 @@ const initialState = {
     attemptsCount: 0,
   },
   
+  // Payment success modal state (for subscription purchase celebration)
+  paymentStatus: {
+    success: false,
+    dismissed: false,
+    planType: null,
+    durationMonths: 1,
+    amount: 0,
+    transactionId: null,
+  },
+  
   // UI state for upgrade prompts
   showUpgradePrompt: false,
   upgradeReason: null,
@@ -372,11 +382,31 @@ export const subscribeToPlan = createAsyncThunk(
       
       // Step 2: Verify payment with backend
       const verifyResult = await dispatch(verifyPayment(orderResult)).unwrap();
+
+      const planNameMap = {
+        pro: APP.PLANS.PRO.name,
+        premium: APP.PLANS.PREMIUM.name,
+      };
+      const planPriceMap = {
+        pro: APP.PLANS.PRO.price,
+        premium: APP.PLANS.PREMIUM.price,
+      };
+
+      const normalizedPlanId = String(planId || '').toLowerCase();
       
       return {
         success: true,
         planId,
         subscription: verifyResult,
+        paymentStatus: {
+          planType: planNameMap[normalizedPlanId] || normalizedPlanId || 'Pro',
+          durationMonths: 1,
+          amount: Number(planPriceMap[normalizedPlanId] || 0),
+          transactionId:
+            verifyResult?.transaction_id ||
+            orderResult?.payment?.razorpay_payment_id ||
+            null,
+        },
       };
     } catch (error) {
       console.error('[SubscriptionSlice] subscribeToPlan error:', error);
@@ -394,6 +424,36 @@ const subscriptionSlice = createSlice({
   initialState,
   
   reducers: {
+    // Set payment success modal state (for subscription purchase celebration)
+    setPaymentSuccess: (state, action) => {
+      const { planType, durationMonths, amount, transactionId } = action.payload;
+      state.paymentStatus = {
+        success: true,
+        dismissed: false,
+        planType: planType || 'pro',
+        durationMonths: durationMonths || 1,
+        amount: amount || 0,
+        transactionId: transactionId || null,
+      };
+    },
+
+    // Clear payment success modal state
+    clearPaymentStatus: (state) => {
+      state.paymentStatus = {
+        success: false,
+        dismissed: true,
+        planType: null,
+        durationMonths: 1,
+        amount: 0,
+        transactionId: null,
+      };
+    },
+
+    // Dismiss payment success modal (mark as dismissed but keep data)
+    dismissPaymentSuccess: (state) => {
+      state.paymentStatus.dismissed = true;
+    },
+
     // Clear error states
     clearError: (state) => {
       state.error = null;
@@ -636,10 +696,20 @@ const subscriptionSlice = createSlice({
       state.paymentError = null;
     });
     
-    builder.addCase(subscribeToPlan.fulfilled, (state) => {
+    builder.addCase(subscribeToPlan.fulfilled, (state, action) => {
       state.paymentInProgress = false;
       state.showUpgradePrompt = false;
       state.upgradeReason = null;
+
+      const paymentStatus = action.payload?.paymentStatus || {};
+      state.paymentStatus = {
+        success: true,
+        dismissed: false,
+        planType: paymentStatus.planType || 'Pro',
+        durationMonths: paymentStatus.durationMonths || 1,
+        amount: Number(paymentStatus.amount || 0),
+        transactionId: paymentStatus.transactionId || null,
+      };
     });
     
     builder.addCase(subscribeToPlan.rejected, (state, action) => {
@@ -673,6 +743,9 @@ const subscriptionSlice = createSlice({
 // --------------------------------------------
 
 export const {
+  setPaymentSuccess,
+  clearPaymentStatus,
+  dismissPaymentSuccess,
   clearError,
   clearPaymentDetails,
   clearHistoryActionError,
@@ -699,6 +772,7 @@ export const selectIsCancelling = (state) => state.subscription.isCancelling;
 export const selectPaymentInProgress = (state) => state.subscription.paymentInProgress;
 export const selectError = (state) => state.subscription.error;
 export const selectPaymentError = (state) => state.subscription.paymentError;
+export const selectPaymentStatus = (state) => state.subscription.paymentStatus;
 export const selectShowUpgradePrompt = (state) => state.subscription.showUpgradePrompt;
 export const selectUpgradeReason = (state) => state.subscription.upgradeReason;
 export const selectSelectedPlanId = (state) => state.subscription.selectedPlanId;

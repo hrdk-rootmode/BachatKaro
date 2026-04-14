@@ -1,6 +1,6 @@
 // ============================================
 // DEALHUNT APP - REWARD MODAL COMPONENT
-// Part 4: Streak Reward Notification
+// Clean, simple - defaults to hidden
 // ============================================
 
 import React, { useEffect, useRef } from 'react';
@@ -10,8 +10,11 @@ import {
   StyleSheet,
   Modal,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   Animated,
   Dimensions,
+  ScrollView,
+  AppState,
 } from 'react-native';
 import { useSelector, useDispatch } from 'react-redux';
 import { Ionicons } from '@expo/vector-icons';
@@ -21,28 +24,23 @@ import {
   selectUnlockedReward,
   selectIsRewardModalVisible,
   claimStreakReward,
+  hideRewardModal,
 } from '../store/streakSlice';
 import { COLORS } from '../utils/constants';
 
-const { width } = Dimensions.get('window');
-
-// --------------------------------------------
-// REWARD MODAL COMPONENT
-// --------------------------------------------
+const { width, height } = Dimensions.get('window');
 
 const RewardModal = () => {
   const dispatch = useDispatch();
   const reward = useSelector(selectUnlockedReward);
   const isVisible = useSelector(selectIsRewardModalVisible);
 
-  // Animations
-  const scaleAnim = useRef(new Animated.Value(0)).current;
-  const fadeAnim = useRef(new Animated.Value(0)).current;
-  const confettiAnim = useRef(new Animated.Value(0)).current;
+  const scaleAnim = useRef(new Animated.Value(isVisible ? 1 : 0)).current;
+  const fadeAnim = useRef(new Animated.Value(isVisible ? 1 : 0)).current;
+  const confettiAnim = useRef(new Animated.Value(isVisible ? 1 : 0)).current;
 
   useEffect(() => {
     if (isVisible) {
-      // Entrance animation
       Animated.parallel([
         Animated.spring(scaleAnim, {
           toValue: 1,
@@ -62,12 +60,30 @@ const RewardModal = () => {
         }),
       ]).start();
     } else {
-      // Reset animations
       scaleAnim.setValue(0);
       fadeAnim.setValue(0);
       confettiAnim.setValue(0);
     }
   }, [confettiAnim, fadeAnim, isVisible, scaleAnim]);
+
+  useEffect(() => {
+    if (!isVisible) return undefined;
+
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'inactive' || nextState === 'background') {
+        dispatch(hideRewardModal());
+      }
+    });
+
+    const failsafe = setTimeout(() => {
+      dispatch(hideRewardModal());
+    }, 30000);
+
+    return () => {
+      sub?.remove();
+      clearTimeout(failsafe);
+    };
+  }, [dispatch, isVisible]);
 
   const handleClaim = () => {
     if (reward) {
@@ -75,29 +91,59 @@ const RewardModal = () => {
     }
   };
 
+  const handleDismiss = () => {
+    dispatch(hideRewardModal());
+  };
+
+  // Don't render modal if no reward or not visible
   if (!isVisible || !reward) return null;
 
   const rewardDetails = reward.details || {};
-  const durationHours = rewardDetails.duration_hours || 24;
-  const message = rewardDetails.message || "You've unlocked a reward!";
+  const rewardType = reward.reward_type || reward.rewardType || reward.type || rewardDetails.reward_type || null;
+  const rewardValue = Number(reward.reward_value || reward.rewardValue || rewardDetails.reward_value || 0);
+  const durationHours = rewardDetails.duration_hours || (rewardType === 'premium_days' ? rewardValue * 24 : rewardValue);
+  const message = rewardDetails.message || reward.description || rewardDetails.description || "You've unlocked a reward!";
   const milestone = reward.milestone || 7;
+
+  let rewardHeadline = 'Reward Unlocked';
+  let rewardSubtitle = 'Keep your streak alive to unlock more rewards.';
+
+  if (rewardType === 'watchlist_slots') {
+    rewardHeadline = `+${rewardValue || 1} Watchlist Slot${(rewardValue || 1) > 1 ? 's' : ''}`;
+    rewardSubtitle = 'Your watchlist limit has been increased for this account.';
+  } else if (rewardType === 'searches') {
+    rewardHeadline = `+${rewardValue || 1} Daily Search Bonus`;
+    rewardSubtitle = 'You can run more searches each day with this streak reward.';
+  } else if (rewardType === 'unlimited_search_hours') {
+    rewardHeadline = `${durationHours || rewardValue || 1} Hour${(durationHours || rewardValue || 1) > 1 ? 's' : ''} Unlimited Search`;
+    rewardSubtitle = 'Search without daily limits during this reward window.';
+  } else if (rewardType === 'premium_days') {
+    rewardHeadline = `${rewardValue || 1} Premium Day${(rewardValue || 1) > 1 ? 's' : ''}`;
+    rewardSubtitle = 'Premium features are activated for your account.';
+  } else if (rewardType === 'free_month') {
+    rewardHeadline = `${rewardValue || 1} Free Month${(rewardValue || 1) > 1 ? 's' : ''}`;
+    rewardSubtitle = 'You have unlocked a free subscription period.';
+  }
 
   return (
     <Modal
       visible={isVisible}
-      transparent
+      transparent={true}
       animationType="none"
-      statusBarTranslucent
+      statusBarTranslucent={true}
+      onRequestClose={handleDismiss}
     >
       <View style={styles.overlay}>
-        <Animated.View
-          style={[
-            styles.backdrop,
-            {
-              opacity: fadeAnim,
-            },
-          ]}
-        />
+        <TouchableWithoutFeedback onPress={handleDismiss}>
+          <Animated.View
+            style={[
+              styles.backdrop,
+              {
+                opacity: fadeAnim,
+              },
+            ]}
+          />
+        </TouchableWithoutFeedback>
 
         <Animated.View
           style={[
@@ -114,95 +160,99 @@ const RewardModal = () => {
             end={{ x: 1, y: 1 }}
             style={styles.gradient}
           >
-            {/* Confetti/Sparkles */}
-            <View style={styles.confettiContainer}>
-              {[...Array(8)].map((_, i) => (
-                <Animated.View
-                  key={i}
-                  style={[
-                    styles.confetti,
-                    {
-                      left: `${(i + 1) * 12}%`,
-                      opacity: confettiAnim,
-                      transform: [
-                        {
-                          translateY: confettiAnim.interpolate({
-                            inputRange: [0, 1],
-                            outputRange: [0, 100 + Math.random() * 50],
-                          }),
-                        },
-                        {
-                          rotate: confettiAnim.interpolate({
-                            inputRange: [0, 1],
-                            outputRange: ['0deg', `${Math.random() * 360}deg`],
-                          }),
-                        },
-                      ],
-                    },
-                  ]}
-                >
-                  <Text style={styles.confettiEmoji}>
-                    {['🎉', '✨', '🎊', '⭐'][i % 4]}
-                  </Text>
-                </Animated.View>
-              ))}
-            </View>
+            <TouchableOpacity
+              style={styles.closeButton}
+              onPress={handleDismiss}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              <Ionicons name="close" size={22} color={COLORS.white} />
+            </TouchableOpacity>
 
-            {/* Icon */}
-            <View style={styles.iconContainer}>
-              <View style={styles.iconCircle}>
-                <Ionicons name="trophy" size={48} color="#FFD700" />
-              </View>
-            </View>
-
-            {/* Content */}
-            <View style={styles.content}>
-              <Text style={styles.title}>Congratulations! 🎉</Text>
-              <Text style={styles.milestone}>
-                {milestone}-Day Streak Milestone!
-              </Text>
-
-              <View style={styles.rewardBox}>
-                <Ionicons name="gift" size={24} color={COLORS.white} />
-                <Text style={styles.rewardTitle}>You've Unlocked:</Text>
-                <Text style={styles.rewardValue}>
-                  {durationHours} Hour{durationHours > 1 ? 's' : ''} of PRO Access
-                </Text>
-                <Text style={styles.rewardSubtitle}>
-                  Unlimited searches • Full watchlist • Ad-free
-                </Text>
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={styles.modalScrollContent}
+            >
+              {/* Confetti */}
+              <View style={styles.confettiContainer}>
+                {[...Array(8)].map((_, i) => (
+                  <Animated.View
+                    key={i}
+                    style={[
+                      styles.confetti,
+                      {
+                        left: `${(i + 1) * 12}%`,
+                        opacity: confettiAnim,
+                        transform: [
+                          {
+                            translateY: confettiAnim.interpolate({
+                              inputRange: [0, 1],
+                              outputRange: [0, 100 + Math.random() * 50],
+                            }),
+                          },
+                          {
+                            rotate: confettiAnim.interpolate({
+                              inputRange: [0, 1],
+                              outputRange: ['0deg', `${Math.random() * 360}deg`],
+                            }),
+                          },
+                        ],
+                      },
+                    ]}
+                  >
+                    <Text style={styles.confettiEmoji}>
+                      {['🎉', '✨', '🎊', '⭐'][i % 4]}
+                    </Text>
+                  </Animated.View>
+                ))}
               </View>
 
-              <Text style={styles.message}>{message}</Text>
+              {/* Icon */}
+              <View style={styles.iconContainer}>
+                <View style={styles.iconCircle}>
+                  <Ionicons name="trophy" size={48} color="#FFD700" />
+                </View>
+              </View>
 
-              {/* Claim Button */}
-              <TouchableOpacity
-                style={styles.claimButton}
-                onPress={handleClaim}
-                activeOpacity={0.9}
-              >
-                <LinearGradient
-                  colors={['#FFFFFF', '#F0F0F0']}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 1 }}
-                  style={styles.claimGradient}
+              {/* Content */}
+              <View style={styles.content}>
+                <Text style={styles.title}>Congratulations! 🎉</Text>
+                <Text style={styles.milestone}>
+                  {milestone}-Day Streak Milestone!
+                </Text>
+
+                <View style={styles.rewardBox}>
+                  <Ionicons name="gift" size={24} color={COLORS.white} />
+                  <Text style={styles.rewardTitle}>You've Unlocked:</Text>
+                  <Text style={styles.rewardValue}>{rewardHeadline}</Text>
+                  <Text style={styles.rewardSubtitle}>{rewardSubtitle}</Text>
+                </View>
+
+                <Text style={styles.message}>{message}</Text>
+
+                <TouchableOpacity
+                  style={styles.claimButton}
+                  onPress={handleClaim}
+                  activeOpacity={0.9}
                 >
-                  <Ionicons name="star" size={20} color={COLORS.primary} />
-                  <Text style={styles.claimText}>Claim My Reward</Text>
-                  <Ionicons name="arrow-forward" size={20} color={COLORS.primary} />
-                </LinearGradient>
-              </TouchableOpacity>
-            </View>
+                  <LinearGradient
+                    colors={['#FFFFFF', '#F0F0F0']}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 1 }}
+                    style={styles.claimGradient}
+                  >
+                    <Ionicons name="star" size={20} color={COLORS.primary} />
+                    <Text style={styles.claimText}>Awesome!</Text>
+                    <Ionicons name="arrow-forward" size={20} color={COLORS.primary} />
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
           </LinearGradient>
         </Animated.View>
       </View>
     </Modal>
   );
 };
-
-// --------------------------------------------
-// STYLES
-// --------------------------------------------
 
 const styles = StyleSheet.create({
   overlay: {
@@ -217,6 +267,7 @@ const styles = StyleSheet.create({
   container: {
     width: width - 48,
     maxWidth: 400,
+    maxHeight: height * 0.88,
     borderRadius: 24,
     overflow: 'hidden',
     shadowColor: '#FF6B35',
@@ -226,6 +277,21 @@ const styles = StyleSheet.create({
     elevation: 12,
   },
   gradient: {
+    flex: 1,
+  },
+  closeButton: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    zIndex: 3,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalScrollContent: {
     paddingTop: 40,
     paddingBottom: 32,
     paddingHorizontal: 24,
@@ -285,6 +351,7 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: 'rgba(255,255,255,0.3)',
     marginBottom: 20,
+    gap: 8,
   },
   rewardTitle: {
     fontSize: 14,
@@ -340,3 +407,5 @@ const styles = StyleSheet.create({
 });
 
 export default RewardModal;
+
+

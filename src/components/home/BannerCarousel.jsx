@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect, memo } from 'react';
+import React, { useRef, useState, useEffect, useMemo, memo } from 'react';
 import {
   View, Text, StyleSheet, FlatList, Dimensions, TouchableOpacity, ActivityIndicator,
 } from 'react-native';
@@ -20,76 +20,36 @@ const FALLBACK_BANNERS = [
   { id: '3', title: 'Compare & Save', subtitle: 'Lowest price guaranteed', gradient: ['#667EEA', '#764BA2'], emoji: '💰' },
 ];
 
-const BannerCarousel = ({ onBannerPress }) => {
+const BannerCarousel = ({ products, onBannerPress, isLoading }) => {
   const flatListRef = useRef(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const autoScrollTimer = useRef(null);
-  const [banners, setBanners] = useState(FALLBACK_BANNERS);
-  const [isLoading, setIsLoading] = useState(true);
-
-  // ✅ Fetch featured products from backend
-  useEffect(() => {
-    let isMounted = true;
+  
+  // ✅ Convert products to banner format
+  const banners = useMemo(() => {
+    if (!Array.isArray(products) || products.length === 0) {
+      return FALLBACK_BANNERS;
+    }
     
-    const fetchFeaturedProducts = async () => {
-      try {
-        console.log('🔄 BannerCarousel: Fetching featured products...');
-        setIsLoading(true);
-        
-        const response = await homeAPI.getFeatured(6);
-        const featuredProducts = response?.success ? (response.data || []) : [];
-        console.log('✅ BannerCarousel: API response received', { count: featuredProducts.length });
-        
-        if (isMounted && Array.isArray(featuredProducts) && featuredProducts.length > 0) {
-          console.log('✅ BannerCarousel: Converting to banner format');
-          // ✅ Convert API response to banner format
-          const featuredBanners = featuredProducts.map((product, idx) => ({
-            id: product.product_id || idx.toString(),
-            product_id: product.product_id,
-            title: product.title || `Product ${idx + 1}`,
-            subtitle: product.best_platform ? `${String(product.best_platform).toUpperCase()} - ₹${Math.floor(product.best_price || 0).toLocaleString('en-IN')}` : `₹${Math.floor(product.best_price || 0).toLocaleString('en-IN')}`,
-            image_url: product.image_url,
-            platform: product.best_platform,
-            discount_percent: product.discount_percentage || 0,
-            gradient: [
-              ['#FF6B35', '#FF8555'],
-              ['#4ECDC4', '#44B3AB'],
-              ['#667EEA', '#764BA2'],
-              ['#F093FB', '#F5576C'],
-              ['#4FACFE', '#00F2FE'],
-              ['#43E97B', '#38F9D7'],
-            ][idx % 6],
-            emoji: ['📦', '🎁', '💝', '🛍️', '🏆', '⭐'][idx % 6],
-          }));
-          
-          console.log('✅ BannerCarousel: Setting banners', { count: featuredBanners.length });
-          setBanners(featuredBanners);
-        } else if (isMounted) {
-          console.warn('⚠️  BannerCarousel: No data from API, using fallback');
-          setBanners(FALLBACK_BANNERS);
-        }
-      } catch (error) {
-        console.error('❌ BannerCarousel: API Error:', error.message);
-        if (isMounted) {
-          setBanners(FALLBACK_BANNERS);
-        }
-      } finally {
-        if (isMounted) {
-          setIsLoading(false);
-        }
-      }
-    };
-    
-    // Small delay to ensure API client is ready
-    const timer = setTimeout(() => {
-      fetchFeaturedProducts();
-    }, 500);
-    
-    return () => {
-      isMounted = false;
-      clearTimeout(timer);
-    };
-  }, []);
+    return products.slice(0, 6).map((product, idx) => ({
+      id: product.product_id || idx.toString(),
+      product_id: product.product_id,
+      title: product.title || `Product ${idx + 1}`,
+      subtitle: product.best_platform ? `${String(product.best_platform).toUpperCase()} - ₹${Math.floor(product.best_price || 0).toLocaleString('en-IN')}` : `₹${Math.floor(product.best_price || 0).toLocaleString('en-IN')}`,
+      image_url: product.image_url,
+      platform: product.best_platform,
+      discount_percent: product.discount_percentage || 0,
+      gradient: [
+        ['#FF6B35', '#FF8555'],
+        ['#4ECDC4', '#44B3AB'],
+        ['#667EEA', '#764BA2'],
+        ['#F093FB', '#F5576C'],
+        ['#4FACFE', '#00F2FE'],
+        ['#43E97B', '#38F9D7'],
+      ][idx % 6],
+      emoji: ['📦', '🎁', '💝', '🛍️', '🏆', '⭐'][idx % 6],
+    }));
+  }, [products]);
 
   // ✅ Auto-scroll carousel
   const scrollToIndex = (index) => {

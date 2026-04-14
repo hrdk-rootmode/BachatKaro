@@ -5,7 +5,8 @@
 
 import { createSlice, createAsyncThunk, createSelector } from '@reduxjs/toolkit';
 import { streakAPI } from '../services/streakApi';
-import { activateProTrial } from './authSlice';
+import { activateProTrial, refreshUserData } from './authSlice';
+import { fetchWatchlist } from './watchlistSlice';
 import { STREAK_MILESTONES } from '../utils/constants';
 
 const milestoneDaysAsc = Object.keys(STREAK_MILESTONES)
@@ -14,6 +15,21 @@ const milestoneDaysAsc = Object.keys(STREAK_MILESTONES)
 
 const getNextMilestoneDay = (streakDays) => {
   return milestoneDaysAsc.find((day) => day > streakDays) || null;
+};
+
+export const getWatchlistBonusForStreak = (streakDays) => {
+  const days = Math.max(0, Number(streakDays || 0));
+  let bonus = 0;
+
+  if (days >= 7) {
+    bonus += 1;
+  }
+
+  if (days >= 10) {
+    bonus += 2;
+  }
+
+  return bonus;
 };
 
 // --------------------------------------------
@@ -58,7 +74,7 @@ const initialState = {
  */
 export const checkAndMarkStreak = createAsyncThunk(
   'streak/checkAndMark',
-  async (_, { rejectWithValue }) => {
+  async (_, { dispatch, rejectWithValue }) => {
     try {
       // Step 1: Get current status without modifying
       const statusResult = await streakAPI.getStreakStatus();
@@ -115,7 +131,13 @@ export const checkAndMarkStreak = createAsyncThunk(
       }
       if (checkInData.streakMilestoneReward) {
         console.log('[StreakSlice] 🎁 Milestone reward unlocked!', checkInData.streakMilestoneReward);
+        if (checkInData.streakMilestoneReward.reward_type === 'watchlist_slots') {
+          dispatch(fetchWatchlist({ forceRefresh: true }));
+        }
       }
+
+      // Keep watchlist limit synced with backend after check-in updates usage stats.
+      dispatch(fetchWatchlist({ forceRefresh: true }));
       
       return {
         currentStreak: checkInData.currentStreak,
@@ -170,21 +192,48 @@ export const claimStreakReward = createAsyncThunk(
     try {
       console.log('[StreakSlice] Claiming reward:', reward);
 
-      const durationHours = Number(reward?.details?.duration_hours || 24);
-      if (!Number.isFinite(durationHours) || durationHours <= 0) {
-        return rejectWithValue('Invalid reward duration');
-      }
+      const rewardType = reward?.reward_type || reward?.rewardType || reward?.type || null;
 
-      // Activate temporary Pro access from claimed streak reward.
-      dispatch(activateProTrial({ durationHours }));
+      if (rewardType === 'premium_days') {
+        const durationHours = Number(reward?.details?.duration_hours || reward?.reward_value || 24);
+        if (!Number.isFinite(durationHours) || durationHours <= 0) {
+          return rejectWithValue('Invalid reward duration');
+        }
+
+        // Activate temporary Pro access from claimed streak reward.
+        dispatch(activateProTrial({ durationHours }));
+      }
       
       // Hide the modal
       dispatch(hideRewardModal());
       
-      return { success: true, durationHours };
+      return { success: true, rewardType };
     } catch (error) {
       console.error('[StreakSlice] claimStreakReward error:', error);
       return rejectWithValue(error.message || 'Failed to claim reward');
+    }
+  }
+);
+
+/**
+ * Development-only helper: fully reset streak and streak rewards on backend + local state.
+ * Keeps data consistent after app reload.
+ */
+export const debugResetStreakCompletelyForDev = createAsyncThunk(
+  'streak/debugResetComplete',
+  async (_, { dispatch, rejectWithValue }) => {
+    try {
+      const result = await streakAPI.debugReset();
+      if (!result?.success) {
+        return rejectWithValue(result?.error || 'Failed to reset streak');
+      }
+
+      dispatch(fetchWatchlist({ forceRefresh: true }));
+      dispatch(refreshUserData());
+
+      return result.data || {};
+    } catch (error) {
+      return rejectWithValue(error?.message || 'Failed to reset streak');
     }
   }
 );
@@ -227,41 +276,41 @@ const streakSlice = createSlice({
 
     /**
      * Development-only helper: increases streak for quick UI testing.
+     * Handles both positive increments and missed days (negative values).
      */
     debugIncreaseStreakForDev: (state, action) => {
-      const increment = Math.max(1, Number(action.payload?.days || 1));
+      const increment = Number(action.payload?.days || 1);
       const previous = Math.max(0, Number(state.currentStreak || 0));
-      const next = previous + increment;
+      
+      // Handle missed day (negative increment)
+      if (increment < 0) {
+        // Reset streak if missed day
+        state.currentStreak = 0;
+        state.todayCompleted = false;
+        state.lastVisitDate = null; // Reset to simulate missed day
+        console.log(`[StreakDebug] Day missed! Streak reset from ${previous} to 0`);
+      } else {
+        // Normal increment
+        const next = previous + increment;
+        state.currentStreak = next;
+        state.todayCompleted = true;
+        state.lastVisitDate = new Date().toISOString().split('T')[0];
 
-      state.currentStreak = next;
-      state.longestStreak = Math.max(Number(state.longestStreak || 0), next);
-      state.todayCompleted = true;
-      state.lastVisitDate = new Date().toISOString().split('T')[0];
-      state.nextMilestone = getNextMilestoneDay(next);
+      }
+
+      state.longestStreak = Math.max(Number(state.longestStreak || 0), state.currentStreak);
+      state.nextMilestone = getNextMilestoneDay(state.currentStreak);
       state.lastCheckedAt = new Date().toISOString();
       state.error = null;
       state.isLoading = false;
       state.isCheckingIn = false;
-
-      const milestoneReached = milestoneDaysAsc.find((day) => day > previous && day <= next);
-      if (milestoneReached) {
-        const rewardMeta = STREAK_MILESTONES[milestoneReached];
-        state.unlockedReward = {
-          milestone: milestoneReached,
-          reward_type: 'PRO_TRIAL',
-          details: {
-            duration_hours: rewardMeta?.duration_hours || 24,
-            message: `Great work! You unlocked ${rewardMeta?.label || 'a streak reward'}.`,
-          },
-        };
-        state.isRewardModalVisible = true;
-      }
     },
 
     /**
      * Development-only helper: resets streak state for repeat testing.
      */
     debugResetStreakForDev: (state) => {
+      console.log(`[StreakDebug] Manual streak reset from ${state.currentStreak} to 0`);
       state.currentStreak = 0;
       state.longestStreak = 0;
       state.todayCompleted = false;
@@ -352,6 +401,32 @@ const streakSlice = createSlice({
       state.isLoading = false;
       state.error = action.payload || action.error.message || 'Failed to claim reward';
     });
+
+    builder.addCase(debugResetStreakCompletelyForDev.pending, (state) => {
+      state.isLoading = true;
+      state.error = null;
+    });
+
+    builder.addCase(debugResetStreakCompletelyForDev.fulfilled, (state) => {
+      const nowIso = new Date().toISOString();
+      state.isLoading = false;
+      state.currentStreak = 0;
+      state.longestStreak = 0;
+      state.todayCompleted = true;
+      state.lastVisitDate = nowIso.split('T')[0];
+      state.nextMilestone = getNextMilestoneDay(0);
+      state.streakHistory = [];
+      state.unlockedReward = null;
+      state.isRewardModalVisible = false;
+      state.lastCheckedAt = nowIso;
+      state.error = null;
+      state.isCheckingIn = false;
+    });
+
+    builder.addCase(debugResetStreakCompletelyForDev.rejected, (state, action) => {
+      state.isLoading = false;
+      state.error = action.payload || action.error.message || 'Failed to reset streak';
+    });
   },
 });
 
@@ -381,6 +456,10 @@ export const selectStreakError = (state) => state.streak.error;
 export const selectUnlockedReward = (state) => state.streak.unlockedReward;
 export const selectIsRewardModalVisible = (state) => state.streak.isRewardModalVisible;
 export const selectLastCheckedAt = (state) => state.streak.lastCheckedAt;
+export const selectWatchlistBonusForCurrentStreak = createSelector(
+  [selectCurrentStreak],
+  (currentStreak) => getWatchlistBonusForStreak(currentStreak)
+);
 
 // Composite selector for UI
 export const selectStreakData = createSelector(

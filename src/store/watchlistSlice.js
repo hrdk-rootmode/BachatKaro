@@ -15,6 +15,11 @@ const initialState = {
   items: [],
   totalItems: 0,
   limit: 5, // Default free plan limit
+  isGracePeriod: false,
+  graceDaysRemaining: null,
+  overLimitCount: 0,
+  warningMessage: null,
+  prunedCount: 0,
   
   // UI State
   isLoading: false,
@@ -296,6 +301,11 @@ const watchlistSlice = createSlice({
         state.items = action.payload.items || [];
         state.totalItems = action.payload.total || action.payload.items?.length || 0;
         state.limit = action.payload.limit || 5;
+        state.isGracePeriod = Boolean(action.payload.is_grace_period);
+        state.graceDaysRemaining = action.payload.grace_days_remaining ?? null;
+        state.overLimitCount = action.payload.over_limit_count || 0;
+        state.warningMessage = action.payload.warning_message || null;
+        state.prunedCount = action.payload.pruned_count || 0;
         state.lastFetched = Date.now();
         
         // Sync check cache with fetched items
@@ -535,6 +545,11 @@ export const {
 export const selectWatchlistItems = (state) => state.watchlist.items;
 export const selectWatchlistCount = (state) => state.watchlist.totalItems;
 export const selectWatchlistLimit = (state) => state.watchlist.limit;
+export const selectWatchlistGracePeriod = (state) => state.watchlist.isGracePeriod;
+export const selectWatchlistGraceDaysRemaining = (state) => state.watchlist.graceDaysRemaining;
+export const selectWatchlistOverLimitCount = (state) => state.watchlist.overLimitCount;
+export const selectWatchlistWarningMessage = (state) => state.watchlist.warningMessage;
+export const selectWatchlistPrunedCount = (state) => state.watchlist.prunedCount;
 export const selectIsWatchlistLoading = (state) => state.watchlist.isLoading;
 export const selectIsWatchlistRefreshing = (state) => state.watchlist.isRefreshing;
 export const selectWatchlistError = (state) => state.watchlist.error;

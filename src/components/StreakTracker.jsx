@@ -1,24 +1,23 @@
-// ============================================
-// DEALHUNT APP - STREAK TRACKER COMPONENT
-// Part 4: Gamification UI
-// ============================================
-
 import React, { useMemo } from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet, ScrollView } from 'react-native';
 import { useSelector } from 'react-redux';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 
 import {
   selectStreakData,
-  selectNextMilestone,
 } from '../store/streakSlice';
-import { COLORS, STREAK_MILESTONES } from '../utils/constants';
+import { COLORS } from '../utils/constants';
 
-// --------------------------------------------
-// DAY INDICATOR COMPONENT
-// --------------------------------------------
+// Milestone rewards configuration
+const MILESTONE_REWARDS = {
+  5: { emoji: '🔍', title: '5-Day Champion', reward: '+5 Extra Searches', color: '#F59E0B' },
+  7: { emoji: '🎉', title: 'Week Warrior', reward: '+1 Watchlist Slot', color: '#10B981' },
+  10: { emoji: '⭐', title: '10-Day Legend', reward: '+3 Watchlist Slots', color: '#8B5CF6' },
+  15: { emoji: '🏆', title: '15-Day Hero', reward: '+6 Hours Unlimited', color: '#3B82F6' },
+};
 
+// Day indicator for weekly view
 const DayIndicator = ({ label, status }) => {
   const getStyle = () => {
     switch (status) {
@@ -26,8 +25,6 @@ const DayIndicator = ({ label, status }) => {
         return { bg: COLORS.success + '20', border: COLORS.success, icon: 'checkmark', iconColor: COLORS.success };
       case 'today':
         return { bg: COLORS.primary + '20', border: COLORS.primary, icon: 'flame', iconColor: COLORS.primary };
-      case 'future':
-        return { bg: COLORS.gray100, border: COLORS.gray300, icon: null, iconColor: COLORS.gray400 };
       case 'broken':
         return { bg: COLORS.error + '10', border: COLORS.error + '30', icon: 'close', iconColor: COLORS.error };
       default:
@@ -48,13 +45,40 @@ const DayIndicator = ({ label, status }) => {
   );
 };
 
-// --------------------------------------------
-// STREAK TRACKER COMPONENT
-// --------------------------------------------
-
+// Milestone card for rewards display
+const MilestoneCard = ({ days, milestone, isCompleted, isCurrent }) => (
+  <View 
+    style={[
+      styles.milestoneCard,
+      isCompleted && styles.milestoneCardCompleted,
+      isCurrent && styles.milestoneCardCurrent
+    ]}
+  >
+    <View style={[styles.milestoneHeader, { backgroundColor: isCompleted ? milestone.color : '#E5E7EB' }]}>
+      <Text style={styles.milestoneEmoji}>{milestone.emoji}</Text>
+      <Text style={[styles.milestoneDays, { color: isCompleted ? 'white' : '#6B7280' }]}>
+        {days} Days
+      </Text>
+    </View>
+    <View style={styles.milestoneContent}>
+      <Text style={[styles.milestoneTitle, { color: isCompleted ? milestone.color : '#374151' }]}>
+        {milestone.title}
+      </Text>
+      <Text style={[styles.milestoneReward, { color: isCompleted ? '#059669' : '#6B7280' }]}>
+        {milestone.reward}
+      </Text>
+      {isCompleted && (
+        <View style={styles.completedBadge}>
+          <Ionicons name="checkmark-circle" size={12} color="#059669" />
+          <Text style={styles.completedText}>Unlocked</Text>
+        </View>
+      )}
+    </View>
+  </View>
+);
+// Main streak tracker component
 const StreakTracker = () => {
   const streakData = useSelector(selectStreakData);
-  const nextMilestone = useSelector(selectNextMilestone);
 
   const {
     currentStreak = 0,
@@ -73,54 +97,41 @@ const StreakTracker = () => {
 
     return days.map((label, index) => {
       if (index < completedCount) {
-        if (index === todayIndex) {
-          return { label, status: 'today' };
-        }
-        return { label, status: 'completed' };
+        return { label, status: index === todayIndex ? 'today' : 'completed' };
       }
-
       if (!todayCompleted && index === completedCount && index < days.length) {
         return { label, status: 'broken' };
       }
-
       return { label, status: 'future' };
     });
   }, [currentStreak, todayCompleted]);
 
   // Get next milestone info
   const milestoneInfo = useMemo(() => {
-    if (nextMilestone) {
-      return {
-        days: nextMilestone,
-        reward: STREAK_MILESTONES[nextMilestone],
-      };
-    }
-
-    // Calculate from constants if backend doesn't provide
-    const milestones = Object.keys(STREAK_MILESTONES).map(Number).sort((a, b) => a - b);
+    const milestones = Object.keys(MILESTONE_REWARDS).map(Number).sort((a, b) => a - b);
     const next = milestones.find(m => m > currentStreak);
     
     if (next) {
       return {
         days: next,
-        reward: STREAK_MILESTONES[next],
+        daysRemaining: next - currentStreak,
+        reward: MILESTONE_REWARDS[next],
       };
     }
-
     return null;
-  }, [currentStreak, nextMilestone]);
+  }, [currentStreak]);
 
-  const daysUntilReward = milestoneInfo ? milestoneInfo.days - currentStreak : null;
-
-  // Messages
+  // Dynamic message
   const getMessage = () => {
     if (isLoading) return 'Loading your streak...';
-    if (currentStreak === 0) return 'Start your streak today! 🚀';
-    if (currentStreak === 1) return 'Great start! Keep it going tomorrow 💪';
-    if (currentStreak >= 30) return `Amazing ${currentStreak}-day streak! 🔥`;
-    if (todayCompleted) return `${currentStreak} days strong! Come back tomorrow 🎯`;
-    return `${currentStreak} day streak! Check in to continue 🔥`;
+    if (currentStreak === 0) return 'Start your streak today!';
+    if (currentStreak === 1) return 'Great start! Keep it going!';
+    if (currentStreak >= 50) return `Amazing dedication! ${currentStreak} days!`;
+    if (todayCompleted) return `${currentStreak} days strong!`;
+    return `${currentStreak} days, check in to continue!`;
   };
+
+  const milestones = Object.keys(MILESTONE_REWARDS).map(Number).sort((a, b) => a - b);
 
   return (
     <View style={styles.container}>
@@ -131,12 +142,12 @@ const StreakTracker = () => {
         style={styles.gradient}
       >
         <View style={styles.content}>
-          {/* Header */}
+          {/* Header with streak value */}
           <View style={styles.header}>
             <View style={styles.headerLeft}>
               <Text style={styles.fireEmoji}>🔥</Text>
-              <View>
-                <Text style={styles.streakCount}>{currentStreak} Day Streak</Text>
+              <View style={styles.headerText}>
+                <Text style={styles.streakCount}>{currentStreak} Days</Text>
                 <Text style={styles.subtitle}>{getMessage()}</Text>
               </View>
             </View>
@@ -148,55 +159,74 @@ const StreakTracker = () => {
             )}
           </View>
 
-          {/* Week Visualization */}
+          {/* Week visualization */}
           <View style={styles.weekContainer}>
             {weekDays.map((day, index) => (
               <DayIndicator key={index} label={day.label} status={day.status} />
             ))}
           </View>
 
-          {/* Next Milestone */}
-          {milestoneInfo && daysUntilReward > 0 && (
-            <View style={styles.milestoneContainer}>
-              <Ionicons name="gift" size={16} color="rgba(255,255,255,0.9)" />
-              <Text style={styles.milestoneText}>
-                {daysUntilReward} more {daysUntilReward === 1 ? 'day' : 'days'} until{' '}
-                <Text style={styles.milestoneBold}>{milestoneInfo.reward?.label}</Text>
-              </Text>
-            </View>
-          )}
-
-          {/* Max milestone reached */}
-          {currentStreak >= 30 && !milestoneInfo && (
-            <View style={styles.milestoneContainer}>
-              <Ionicons name="star" size={16} color="#FFD700" />
-              <Text style={styles.milestoneText}>
-                You've reached the max streak! 🏆
-              </Text>
+          {/* Next milestone preview */}
+          {milestoneInfo && (
+            <View style={styles.nextMilestoneContainer}>
+              <Ionicons name="gift" size={14} color="rgba(255,255,255,0.9)" />
+              <View style={styles.milestonePreviewText}>
+                <Text style={styles.nextMilestoneMain}>
+                  {milestoneInfo.daysRemaining} more days
+                </Text>
+                <Text style={styles.nextMilestoneSmall}>
+                  until {milestoneInfo.reward.title}
+                </Text>
+              </View>
             </View>
           )}
         </View>
       </LinearGradient>
+
+      {/* Rewards Journey Section */}
+      <View style={styles.rewardsSection}>
+        <View style={styles.rewardsSectionHeader}>
+          <Ionicons name="star" size={18} color={COLORS.primary} />
+          <Text style={styles.rewardsSectionTitle}>Rewards Journey</Text>
+        </View>
+        
+        <ScrollView 
+          horizontal 
+          showsHorizontalScrollIndicator={false} 
+          style={styles.milestoneScroll}
+          contentContainerStyle={styles.milestoneScrollContent}
+        >
+          {milestones.map((days) => {
+            const isCompleted = currentStreak >= days;
+            const isCurrent = currentStreak === days;
+            
+            return (
+              <MilestoneCard 
+                key={days}
+                days={days}
+                milestone={MILESTONE_REWARDS[days]}
+                isCompleted={isCompleted}
+                isCurrent={isCurrent}
+              />
+            );
+          })}
+        </ScrollView>
+      </View>
     </View>
   );
 };
 
-// --------------------------------------------
-// STYLES
-// --------------------------------------------
-
 const styles = StyleSheet.create({
   container: {
     marginHorizontal: 16,
-    marginTop: 12,
-    marginBottom: 8,
+    marginVertical: 12,
     borderRadius: 16,
     overflow: 'hidden',
     shadowColor: '#FF6B35',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
+    shadowOpacity: 0.15,
     shadowRadius: 8,
-    elevation: 6,
+    elevation: 5,
   },
   gradient: {
     padding: 16,
@@ -207,7 +237,7 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'flex-start',
+    alignItems: 'center',
   },
   headerLeft: {
     flexDirection: 'row',
@@ -216,10 +246,13 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   fireEmoji: {
-    fontSize: 36,
+    fontSize: 32,
+  },
+  headerText: {
+    flex: 1,
   },
   streakCount: {
-    fontSize: 20,
+    fontSize: 24,
     fontWeight: '800',
     color: COLORS.white,
     letterSpacing: 0.5,
@@ -233,7 +266,7 @@ const styles = StyleSheet.create({
   badge: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.25)',
+    backgroundColor: 'rgba(255,255,255,0.2)',
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 12,
@@ -248,7 +281,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     gap: 6,
-    marginTop: 4,
   },
   dayIndicator: {
     flex: 1,
@@ -259,28 +291,129 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   dayLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  nextMilestoneContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    gap: 10,
+  },
+  milestonePreviewText: {
+    flex: 1,
+  },
+  nextMilestoneMain: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
+  nextMilestoneSmall: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.85)',
+    marginTop: 2,
+  },
+  // Rewards section
+  rewardsSection: {
+    backgroundColor: COLORS.white,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  rewardsSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  rewardsSectionTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  milestoneScroll: {
+    marginHorizontal: -16,
+    paddingHorizontal: 16,
+  },
+  milestoneScrollContent: {
+    gap: 12,
+    paddingRight: 16,
+  },
+  milestoneCard: {
+    width: 130,
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#E5E7EB',
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  milestoneCardCompleted: {
+    borderColor: '#10B981',
+    shadowColor: '#10B981',
+    shadowOpacity: 0.15,
+  },
+  milestoneCardCurrent: {
+    borderColor: '#F59E0B',
+    shadowColor: '#F59E0B',
+    shadowOpacity: 0.2,
+    transform: [{ scale: 1.04 }],
+  },
+  milestoneHeader: {
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 55,
+  },
+  milestoneEmoji: {
+    fontSize: 22,
+    marginBottom: 2,
+  },
+  milestoneDays: {
     fontSize: 12,
     fontWeight: '700',
   },
-  milestoneContainer: {
+  milestoneContent: {
+    padding: 10,
+  },
+  milestoneTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+  milestoneReward: {
+    fontSize: 11,
+    fontWeight: '500',
+    marginBottom: 6,
+  },
+  completedBadge: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    gap: 8,
-    marginTop: 4,
+    backgroundColor: '#D1FAE5',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 6,
+    gap: 3,
+    alignSelf: 'flex-start',
   },
-  milestoneText: {
-    fontSize: 13,
-    color: 'rgba(255,255,255,0.95)',
-    fontWeight: '500',
-    flex: 1,
-  },
-  milestoneBold: {
-    fontWeight: '700',
-    color: COLORS.white,
+  completedText: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#059669',
   },
 });
 

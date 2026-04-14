@@ -15,6 +15,7 @@ import {
   Alert,
   Linking,
   Animated,
+  Share,
 } from 'react-native';
 import { useDispatch, useSelector } from 'react-redux';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -36,10 +37,8 @@ import {
 import { COLORS } from '../../utils/constants';
 import {
   formatPrice,
-  formatShortDate,
   getPlatformBadge,
   getProductDisplayData,
-  getVariantBadge,
   parseApiDate,
   toEpochMs,
 } from '../../utils/formatters';
@@ -136,12 +135,14 @@ const ProductDetailScreen = ({ navigation, route }) => {
   const [crossPlatformListings, setCrossPlatformListings] = useState([]);
   const [crossPlatformLoading, setCrossPlatformLoading] = useState(false);
   const [showPriceHistoryInfo, setShowPriceHistoryInfo] = useState(false);
+    const [specsExpanded, setSpecsExpanded] = useState(false);
+  const [priceAlertEnabled, setPriceAlertEnabled] = useState(false);
+  const [wishlistRemindersEnabled, setWishlistRemindersEnabled] = useState(false);
   const lastHistoryRequestKeyRef = useRef(null);
   const productRequestInFlightRef = useRef(null);
 
   // Animation values
   const cardScaleAnim = useRef(new Animated.Value(1)).current;
-  const priceScaleAnim = useRef(new Animated.Value(1)).current;
 
   const isValidDisplayImage = (url) => {
     if (!url || typeof url !== 'string') return false;
@@ -220,7 +221,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
       dispatch(fetchPriceHistory({
         productId: product.id,
         platform: selectedPlatform,
-        days: 120,
       }));
     }
   }, [isRouteProductLoaded, product?.id, selectedPlatform, availablePlatforms, dispatch]);
@@ -466,54 +466,130 @@ const ProductDetailScreen = ({ navigation, route }) => {
   // ✅ Get display data from product
   const displayData = getProductDisplayData(product);
 
-  const handleOpenUrl = (url) => {
-    if (!url) {
+  const getListingUrl = (listing) => listing?.product_url || listing?.url || '';
+
+  const getActionMetaForListing = (listing) => {
+    const hasUrl = Boolean(getListingUrl(listing));
+    const inStock = listing?.in_stock !== false && listing?.inStock !== false;
+    const hasPrice = Number(
+      listing?.current_price ?? listing?.price ?? 0
+    ) > 0;
+
+    if (!hasUrl) {
+      return { label: 'Unavailable', disabled: true, icon: 'ban-outline' };
+    }
+
+    if (inStock && hasPrice) {
+      return { label: 'Buy Now', disabled: false, icon: 'bag-check-outline' };
+    }
+
+    if (hasPrice) {
+      return { label: 'Visit Site', disabled: false, icon: 'open-outline' };
+    }
+
+    return { label: 'View', disabled: false, icon: 'eye-outline' };
+  };
+
+  const renderFallbackAction = (listing) => {
+    const meta = getActionMetaForListing(listing);
+    return (
+      <TouchableOpacity
+        onPress={() => handleOpenUrl(getListingUrl(listing))}
+        disabled={meta.disabled}
+        style={styles.inlineAction}
+        activeOpacity={0.8}
+      >
+        <Ionicons
+          name={meta.icon}
+          size={12}
+          color={meta.disabled ? COLORS.gray500 : COLORS.primary}
+        />
+        <Text
+          style={[
+            styles.inlineActionText,
+            meta.disabled && { color: COLORS.gray500 },
+          ]}
+        >
+          {meta.label}
+        </Text>
+      </TouchableOpacity>
+    );
+  };
+
+  const renderSummaryValue = (value, fallbackListing) => {
+    const hasValue = value !== null && value !== undefined && String(value).trim() !== '';
+    if (hasValue) {
+      return <Text style={styles.summaryValue}>{value}</Text>;
+    }
+    return renderFallbackAction(fallbackListing);
+  };
+
+  const handleOpenUrl = async (url) => {
+    const safeUrl = String(url || '').trim();
+    if (!safeUrl) {
       Alert.alert('Unavailable', 'Product link is not available right now.');
       return;
     }
 
-    Linking.openURL(url).catch(() =>
-      Alert.alert('Error', 'Cannot open URL')
-    );
+    try {
+      const canOpen = await Linking.canOpenURL(safeUrl);
+      if (!canOpen) {
+        Alert.alert('Unavailable', 'This link cannot be opened on your device.');
+        return;
+      }
+      await Linking.openURL(safeUrl);
+    } catch {
+      Alert.alert('Error', 'Cannot open URL');
+    }
   };
 
-  // Animation functions
-  const animateCard = (callback) => {
-    Animated.sequence([
-      Animated.timing(cardScaleAnim, {
-        toValue: 0.98,
-        duration: 100,
-        useNativeDriver: true,
-      }),
-      Animated.timing(cardScaleAnim, {
-        toValue: 1,
-        duration: 100,
-        useNativeDriver: true,
-      }),
-    ]).start();
-    if (callback) callback();
+  const handleTogglePriceAlert = () => {
+    setPriceAlertEnabled((prev) => {
+      const next = !prev;
+      Alert.alert(
+        next ? 'Price Alert Enabled' : 'Price Alert Paused',
+        next
+          ? 'You will be notified when this product price drops.'
+          : 'Price alerts are paused for this product.'
+      );
+      return next;
+    });
   };
 
-  const animatePrice = () => {
-    Animated.sequence([
-      Animated.timing(priceScaleAnim, {
-        toValue: 1.05,
-        duration: 150,
-        useNativeDriver: true,
-      }),
-      Animated.timing(priceScaleAnim, {
-        toValue: 1,
-        duration: 150,
-        useNativeDriver: true,
-      }),
-    ]).start();
+  const handleToggleWishlistReminders = () => {
+    setWishlistRemindersEnabled((prev) => {
+      const next = !prev;
+      Alert.alert(
+        next ? 'Reminder Enabled' : 'Reminder Disabled',
+        next
+          ? 'We will remind you about updates for this product.'
+          : 'Reminders are disabled for this product.'
+      );
+      return next;
+    });
   };
 
-   const latestListingForSelectedPlatform = Array.isArray(product?.listings)
-    ? product.listings
+  const handleShareProduct = async () => {
+    try {
+      await Share.share({
+        message: `${displayData.title} - ${formatPrice(selectedPlatformLivePrice ?? latestHistoryPoint?.price ?? product?.best_price ?? 0)}`,
+        title: displayData.title,
+      });
+    } catch {
+      Alert.alert('Unable to Share', 'Try sharing again in a moment.');
+    }
+  };
+
+  const productListings = Array.isArray(product?.listings) ? product.listings : [];
+  const validPricedListings = productListings.filter((l) => l && Number(l.current_price || 0) > 0);
+
+  const latestListingForSelectedPlatform = productListings.length > 0
+    ? productListings
         .filter((l) => String(l?.platform || '').toLowerCase() === String(selectedPlatform || '').toLowerCase())
         .sort((a, b) => toEpochMs(b?.last_scraped_at) - toEpochMs(a?.last_scraped_at))[0]
     : null;
+
+  const selectedPlatformActionMeta = getActionMetaForListing(latestListingForSelectedPlatform);
 
   const sanitizedHistory = Array.isArray(priceHistory?.history)
     ? priceHistory.history.filter((p) => Number(p?.price || 0) > 0)
@@ -539,10 +615,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
     ? sortedHistoryAsc[sortedHistoryAsc.length - 1]
     : null;
 
-  const oldestHistoryPoint = sortedHistoryAsc.length > 0
-    ? sortedHistoryAsc[0]
-    : null;
-
   const historyRecommendation = String(priceHistory?.recommendation || '').toLowerCase();
   const recommendationMeta = {
     buy_now: { label: 'Buy Now', color: COLORS.success, icon: 'checkmark-circle' },
@@ -557,11 +629,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
     priceHistory?.observed_change_percentage_7d !== null &&
     priceHistory?.observed_change_percentage_7d !== undefined;
   const observedChange7d = Number(priceHistory?.observed_change_percentage_7d || 0);
-  const hasObservedDropAmount =
-    priceHistory?.observed_drop_amount_7d !== null &&
-    priceHistory?.observed_drop_amount_7d !== undefined;
-  const observedDropAmount7d = Number(priceHistory?.observed_drop_amount_7d || 0);
-
   const predictionAvailable = Boolean(priceHistory?.prediction_available);
   const hasPredictedChange7d =
     priceHistory?.predicted_change_percentage_7d !== null &&
@@ -575,48 +642,56 @@ const ProductDetailScreen = ({ navigation, route }) => {
     ? priceHistory.insight_basis.filter(Boolean)
     : [];
 
+  const historyStats = (() => {
+    if (sanitizedHistory.length === 0) {
+      return {
+        min: 0,
+        max: 0,
+        avg: 0,
+        rangePct: 0,
+        volatilityPct: 0,
+        qualityLabel: 'Low',
+      };
+    }
+
+    const prices = sanitizedHistory.map((p) => Number(p?.price || 0)).filter((p) => p > 0);
+    if (prices.length === 0) {
+      return {
+        min: 0,
+        max: 0,
+        avg: 0,
+        rangePct: 0,
+        volatilityPct: 0,
+        qualityLabel: 'Low',
+      };
+    }
+
+    const min = Math.min(...prices);
+    const max = Math.max(...prices);
+    const avg = prices.reduce((sum, value) => sum + value, 0) / prices.length;
+    const variance = prices.reduce((sum, value) => sum + ((value - avg) ** 2), 0) / prices.length;
+    const stdDev = Math.sqrt(variance);
+    const rangePct = avg > 0 ? ((max - min) / avg) * 100 : 0;
+    const volatilityPct = avg > 0 ? (stdDev / avg) * 100 : 0;
+
+    const qualityScore = (dataPointsCount >= 25 ? 2 : dataPointsCount >= 10 ? 1 : 0)
+      + (historySpanDays >= 60 ? 2 : historySpanDays >= 30 ? 1 : 0);
+    const qualityLabel = qualityScore >= 4 ? 'High' : qualityScore >= 2 ? 'Medium' : 'Low';
+
+    return {
+      min,
+      max,
+      avg,
+      rangePct,
+      volatilityPct,
+      qualityLabel,
+    };
+  })();
+
   const latestKnownUpdateAt = latestHistoryPoint?.date || latestListingForSelectedPlatform?.last_scraped_at || null;
   const freshnessStatus = getFreshnessStatus(latestKnownUpdateAt);
 
-  // ✅ NEW: Get best price and cheapest platform for comparison header
-  const getBestPriceInfo = () => {
-    if (!Array.isArray(product?.listings) || product.listings.length === 0) {
-      return { bestPrice: null, cheapestPlatform: null, savings: null };
-    }
-    
-    const validListings = product.listings.filter(l => l && l.current_price);
-    if (validListings.length === 0) return { bestPrice: null, cheapestPlatform: null, savings: null };
-    
-    const cheapest = validListings.reduce((min, curr) => 
-      curr.current_price < min.current_price ? curr : min
-    );
-    
-    const avgPrice = validListings.reduce((sum, l) => sum + l.current_price, 0) / validListings.length;
-    const savings = Math.round(((avgPrice - cheapest.current_price) / avgPrice) * 100);
-    
-    return { 
-      bestPrice: cheapest.current_price,
-      cheapestPlatform: cheapest.platform,
-      savings: savings > 0 ? savings : null
-    };
-  };
-
-  const getSelectedPlatformLivePrice = () => {
-    if (!Array.isArray(product?.listings) || product.listings.length === 0) return null;
-
-    const platformListings = product.listings.filter(
-      (l) => l && l.current_price != null && String(l.platform || '').toLowerCase() === String(selectedPlatform || '').toLowerCase()
-    );
-
-    if (platformListings.length === 0) return null;
-
-    // Prefer the most recently scraped listing for that platform
-    const latestListing = platformListings
-      .slice()
-      .sort((a, b) => toEpochMs(b?.last_scraped_at) - toEpochMs(a?.last_scraped_at))[0];
-
-    return latestListing?.current_price ?? null;
-  };
+  const selectedPlatformLivePrice = latestListingForSelectedPlatform?.current_price ?? null;
 
   // ✅ NEW: Group listings by variant fingerprint for cross-platform comparison
   const groupListingsByVariant = () => {
@@ -638,94 +713,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
       listings,
       platformCount: listings.length
     }));
-  };
-
-  const renderListingCard = ({ item }) => {
-    // 🛡️ DEFENSIVE: Handle invalid items gracefully
-    if (!item || !item.id) {
-      return null;
-    }
-    
-    const platformBadge = getPlatformBadge(item.platform || 'amazon');
-    
-    // ✅ CRITICAL: Use current_price (backend field), fallback to price
-    const currentPrice = item.current_price || item.price;
-    const originalPrice = item.original_price || item.mrp || null;
-    const discountPct = item.discount_percentage || item.discount_percent || 0;
-
-    return (
-      <TouchableOpacity
-        style={styles.listingCard}
-        onPress={() => handleOpenUrl(item.product_url || item.url)}
-        activeOpacity={0.7}
-      >
-        {/* Platform Badge */}
-        <View
-          style={[
-            styles.platformTag,
-            { backgroundColor: platformBadge.color },
-          ]}
-        >
-          <Text style={styles.platformTagText}>
-            {platformBadge.icon}
-            {platformBadge.name}
-          </Text>
-        </View>
-
-        {/* Price */}
-        <View style={styles.listingPriceContainer}>
-          <Text style={styles.listingPrice}>
-            {formatPrice(currentPrice)}
-          </Text>
-          {originalPrice && originalPrice > currentPrice && (
-            <Text style={styles.listingOriginalPrice}>
-              {formatPrice(originalPrice)}
-            </Text>
-          )}
-        </View>
-
-        {/* Discount */}
-        {discountPct > 0 && (
-          <View style={styles.discountTag}>
-            <Text style={styles.discountTagText}>
-              {Math.round(discountPct)}% OFF
-            </Text>
-          </View>
-        )}
-
-        {/* Rating */}
-        {item.rating !== null && item.rating !== undefined && (
-          <View style={styles.ratingSmall}>
-            <Ionicons name="star" size={12} color="#FFC107" />
-            <Text style={styles.ratingSmallText}>
-              {typeof item.rating === 'number' ? item.rating.toFixed(1) : item.rating}
-            </Text>
-          </View>
-        )}
-
-        {/* Stock Status */}
-        <View style={[
-          styles.stockStatus,
-          { borderLeftColor: item.in_stock ? COLORS.success : COLORS.error }
-        ]}>
-          <Text style={[
-            styles.stockText,
-            { color: item.in_stock ? COLORS.success : COLORS.error }
-          ]}>
-            {item.in_stock ? 'In Stock' : 'Out of Stock'}
-          </Text>
-        </View>
-
-        {/* Buy Button */}
-        <TouchableOpacity
-          style={styles.buyButton}
-          onPress={() => handleOpenUrl(item.product_url || item.url)}
-        >
-          <Ionicons name="open-outline" size={16} color={COLORS.white} />
-          <Text style={styles.buyButtonText}>View on Site</Text>
-        </TouchableOpacity>
-      </TouchableOpacity>
-    );
   };
 
   return (
@@ -789,7 +776,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
               <View style={styles.priceRow}>
                 <Text style={styles.currentPrice}>
                   {(() => {
-                    const livePlatformPrice = getSelectedPlatformLivePrice();
+                    const livePlatformPrice = selectedPlatformLivePrice;
                     const historyLatestPrice = latestHistoryPoint ? latestHistoryPoint.price : null;
                     const resolvedPrice = livePlatformPrice ?? historyLatestPrice ?? product?.best_price ?? 0;
                     return formatPrice(resolvedPrice);
@@ -797,7 +784,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
                 </Text>
                 {(() => {
                   const selectedListingOriginal = Number(latestListingForSelectedPlatform?.original_price || 0);
-                  const currentPrice = getSelectedPlatformLivePrice() ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
+                  const currentPrice = selectedPlatformLivePrice ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
                   if (selectedListingOriginal > currentPrice) {
                     const discountPercent = Math.round(((selectedListingOriginal - currentPrice) / selectedListingOriginal) * 100);
                     return (
@@ -864,74 +851,78 @@ const ProductDetailScreen = ({ navigation, route }) => {
           <View style={styles.priceSummaryRow}>
             <View style={styles.summaryItem}>
               <Text style={styles.summaryLabel}>Lowest</Text>
-              <Text style={styles.summaryValue}>
-                {(() => {
-                  const validListings = product?.listings?.filter(l => l && l.current_price) || [];
-                  if (validListings.length === 0) return 'N/A';
-                  const lowest = Math.min(...validListings.map(l => l.current_price));
-                  return formatPrice(lowest);
-                })()}
-              </Text>
+              {(() => {
+                if (validPricedListings.length === 0) {
+                  return renderSummaryValue(null, product?.listings?.[0]);
+                }
+                const lowest = Math.min(...validPricedListings.map(l => l.current_price));
+                return renderSummaryValue(formatPrice(lowest), product?.listings?.[0]);
+              })()}
             </View>
             
             <View style={styles.summaryDivider} />
             
             <View style={styles.summaryItem}>
               <Text style={styles.summaryLabel}>Highest</Text>
-              <Text style={styles.summaryValue}>
-                {(() => {
-                  const validListings = product?.listings?.filter(l => l && l.current_price) || [];
-                  if (validListings.length === 0) return 'N/A';
-                  const highest = Math.max(...validListings.map(l => l.current_price));
-                  return formatPrice(highest);
-                })()}
-              </Text>
+              {(() => {
+                if (validPricedListings.length === 0) {
+                  return renderSummaryValue(null, product?.listings?.[0]);
+                }
+                const highest = Math.max(...validPricedListings.map(l => l.current_price));
+                return renderSummaryValue(formatPrice(highest), product?.listings?.[0]);
+              })()}
             </View>
             
             <View style={styles.summaryDivider} />
             
             <View style={styles.summaryItem}>
               <Text style={styles.summaryLabel}>Updated</Text>
-              <Text style={styles.summaryValue}>
-                {(() => {
-                  const latestPoint = latestHistoryPoint;
-                  const latestListing = Array.isArray(product?.listings) 
-                    ? product.listings
-                        .filter(l => l && l.last_scraped_at)
-                        .sort((a, b) => toEpochMs(b.last_scraped_at) - toEpochMs(a.last_scraped_at))[0]
-                    : null;
-                  
-                  const updateTime = latestPoint?.date || latestListing?.last_scraped_at;
-                  if (!updateTime) return 'N/A';
-                  
-                  const date = parseApiDate(updateTime);
-                  if (!date) return 'N/A';
-                  
-                  const today = new Date();
-                  const diffMs = today - date;
-                  const diffMins = Math.floor(diffMs / 60000);
-                  const diffHours = Math.floor(diffMins / 60);
-                  const diffDays = Math.floor(diffHours / 24);
-                  
-                  if (diffMins < 1) return 'Just now';
-                  if (diffMins < 60) return `${diffMins} min${diffMins > 1 ? 's' : ''} ago`;
-                  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
-                  if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
-                  
-                  return date.toLocaleDateString('en-IN', { 
-                    month: 'short', 
+              {(() => {
+                const latestPoint = latestHistoryPoint;
+                const latestListing = Array.isArray(product?.listings) 
+                  ? product.listings
+                      .filter(l => l && l.last_scraped_at)
+                      .sort((a, b) => toEpochMs(b.last_scraped_at) - toEpochMs(a.last_scraped_at))[0]
+                  : null;
+                
+                const updateTime = latestPoint?.date || latestListing?.last_scraped_at;
+                if (!updateTime) {
+                  return renderSummaryValue(null, product?.listings?.[0]);
+                }
+                
+                const date = parseApiDate(updateTime);
+                if (!date) {
+                  return renderSummaryValue(null, product?.listings?.[0]);
+                }
+                
+                const today = new Date();
+                const diffMs = today - date;
+                const diffMins = Math.floor(diffMs / 60000);
+                const diffHours = Math.floor(diffMins / 60);
+                const diffDays = Math.floor(diffHours / 24);
+
+                let formatted = '';
+                if (diffMins < 1) formatted = 'Just now';
+                else if (diffMins < 60) formatted = `${diffMins} min${diffMins > 1 ? 's' : ''} ago`;
+                else if (diffHours < 24) formatted = `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+                else if (diffDays < 7) formatted = `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+                else {
+                  formatted = date.toLocaleDateString('en-IN', {
+                    month: 'short',
                     day: 'numeric',
-                    year: date.getFullYear() !== today.getFullYear() ? 'numeric' : undefined
+                    year: date.getFullYear() !== today.getFullYear() ? 'numeric' : undefined,
                   });
-                })()}
-              </Text>
+                }
+
+                return renderSummaryValue(formatted, product?.listings?.[0]);
+              })()}
             </View>
           </View>
 
           {/* Original Price */}
           {(() => {
             const selectedListingOriginal = Number(latestListingForSelectedPlatform?.original_price || 0);
-            const currentPrice = getSelectedPlatformLivePrice() ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
+            const currentPrice = selectedPlatformLivePrice ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
             if (selectedListingOriginal > currentPrice) {
               return (
                 <View style={styles.originalPriceContainer}>
@@ -949,6 +940,63 @@ const ProductDetailScreen = ({ navigation, route }) => {
           })()}
         </View>
 
+        {/* Quick Commerce Action */}
+        <View style={styles.quickActionContainer}>
+          <Text style={styles.quickActionLabel}>Ready to checkout?</Text>
+          <TouchableOpacity
+            style={[
+              styles.quickActionButton,
+              selectedPlatformActionMeta.disabled && styles.quickActionButtonDisabled,
+            ]}
+            onPress={() => handleOpenUrl(getListingUrl(latestListingForSelectedPlatform))}
+            disabled={selectedPlatformActionMeta.disabled}
+            activeOpacity={0.85}
+          >
+            <Ionicons
+              name={selectedPlatformActionMeta.icon}
+              size={17}
+              color={COLORS.white}
+            />
+            <Text style={styles.quickActionButtonText}>
+              {selectedPlatformActionMeta.label}
+              {selectedPlatform ? ` on ${getPlatformBadge(selectedPlatform).name}` : ''}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+          {/* ✅ NEW: Premium Feature Strip - Price Alerts & Social */}
+          <View style={styles.premiumFeatureStrip}>
+            <TouchableOpacity style={styles.premiumFeatureButton} activeOpacity={0.7} onPress={handleTogglePriceAlert}>
+              <Ionicons name="notifications-outline" size={20} color={COLORS.primary} />
+              <View style={styles.premiumFeatureButtonContent}>
+                <Text style={styles.premiumFeatureButtonTitle}>Price Alert</Text>
+                <Text style={styles.premiumFeatureButtonSubtitle}>
+                  {priceAlertEnabled ? 'Enabled for this product' : 'Get notified on drops'}
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={COLORS.gray400} />
+            </TouchableOpacity>
+          
+            <TouchableOpacity style={styles.premiumFeatureButton} activeOpacity={0.7} onPress={handleShareProduct}>
+              <Ionicons name="share-social-outline" size={20} color={COLORS.primary} />
+              <View style={styles.premiumFeatureButtonContent}>
+                <Text style={styles.premiumFeatureButtonTitle}>Share</Text>
+                <Text style={styles.premiumFeatureButtonSubtitle}>With friends</Text>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={COLORS.gray400} />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.premiumFeatureButtonLast} activeOpacity={0.7} onPress={handleToggleWishlistReminders}>
+              <Ionicons name="sparkles-outline" size={20} color={COLORS.primary} />
+              <View style={styles.premiumFeatureButtonContent}>
+                <Text style={styles.premiumFeatureButtonTitle}>Wishlist Reminders</Text>
+                <Text style={styles.premiumFeatureButtonSubtitle}>
+                  {wishlistRemindersEnabled ? 'Reminder active' : 'Enable smart reminders'}
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={COLORS.gray400} />
+            </TouchableOpacity>
+          </View>
         <View style={styles.productSection}>
           {/* Price Accuracy Disclaimer */}
           <PriceAccuracyDisclaimer 
@@ -970,6 +1018,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
                 bestPlatform={product.listings.reduce((best, curr) => 
                   curr.current_price < (best?.current_price || Infinity) ? curr : best
                 )?.platform}
+                product={product}
               />
             </View>
           )}
@@ -1001,35 +1050,119 @@ const ProductDetailScreen = ({ navigation, route }) => {
           )}
         </View>
 
-        {/* ✅ NEW: Variant Information Section */}
-        {(displayData.variant_type || displayData.storage_gb || displayData.color || displayData.condition) && (
-          <View style={styles.variantSection}>
-            <Text style={styles.sectionTitle}>Variant Details</Text>
-            <View style={styles.variantInfoContainer}>
-              {displayData.variant_type && (
-                <View style={styles.variantInfo}>
-                  <Text style={styles.variantLabel}>Type</Text>
-                  <Text style={styles.variantValue}>{displayData.variant_type}</Text>
+        {/* ✅ NEW: Price Prediction Section */}
+        {predictionAvailable && (
+          <View style={styles.predictionSection}>
+            <View style={styles.predictionHeader}>
+              <View style={styles.predictionTitleRow}>
+                <Ionicons name="trending-up" size={20} color={COLORS.primary} />
+                <Text style={styles.predictionTitle}>Price Prediction</Text>
+              </View>
+              {confidenceScore > 0 && (
+                <View style={styles.confidenceBadge}>
+                  <Text style={styles.confidenceText}>{Math.round(confidenceScore)}% confidence</Text>
                 </View>
               )}
-              {displayData.storage_gb && (
-                <View style={styles.variantInfo}>
-                  <Text style={styles.variantLabel}>Storage</Text>
-                  <Text style={styles.variantValue}>{displayData.storage_gb}GB</Text>
+            </View>
+            
+            <View style={styles.predictionContent}>
+              {hasPredictedChange7d && (
+                <View style={[
+                  styles.predictionCard,
+                  predictedChange7d < 0 ? styles.predictionCardGood : styles.predictionCardNeutral
+                ]}>
+                  <Ionicons 
+                    name={predictedChange7d < 0 ? "arrow-down" : "arrow-up"} 
+                    size={24} 
+                    color={predictedChange7d < 0 ? COLORS.success : COLORS.warning} 
+                  />
+                  <View style={styles.predictionInfo}>
+                    <Text style={styles.predictionLabel}>7-Day Forecast</Text>
+                    <Text style={[
+                      styles.predictionValue,
+                      { color: predictedChange7d < 0 ? COLORS.success : COLORS.warning }
+                    ]}>
+                      {predictedChange7d > 0 ? '+' : ''}{predictedChange7d.toFixed(1)}%
+                    </Text>
+                  </View>
                 </View>
               )}
-              {displayData.color && (
-                <View style={styles.variantInfo}>
-                  <Text style={styles.variantLabel}>Color</Text>
-                  <Text style={styles.variantValue}>{displayData.color}</Text>
+              
+              {hasObservedWeeklyChange && (
+                <View style={styles.observedChangeCard}>
+                  <Text style={styles.observedChangeLabel}>Observed 7-Day Change</Text>
+                  <Text style={[
+                    styles.observedChangeValue,
+                    { color: observedChange7d < 0 ? COLORS.success : COLORS.error }
+                  ]}>
+                    {observedChange7d > 0 ? '+' : ''}{observedChange7d.toFixed(1)}%
+                  </Text>
                 </View>
               )}
-              {displayData.condition && (
-                <View style={styles.variantInfo}>
-                  <Text style={styles.variantLabel}>Condition</Text>
-                  <Text style={styles.variantValue}>{displayData.condition}</Text>
+              
+              {recommendationReasons.length > 0 && (
+                <View style={styles.reasonsContainer}>
+                  <Text style={styles.reasonsTitle}>Why {recommendationConfig.label}?</Text>
+                  {recommendationReasons.slice(0, 3).map((reason, idx) => (
+                    <Text key={`reason-${idx}`} style={styles.reasonText}>• {reason}</Text>
+                  ))}
                 </View>
               )}
+            </View>
+          </View>
+        )}
+
+        {/* VIP Premium Insights Card */}
+        {dataPointsCount > 10 && (
+          <View style={styles.vipInsightsCard}>
+            <View style={styles.vipHeader}>
+              <View style={styles.vipBadge}>
+                <Ionicons name="star" size={14} color={COLORS.warning} />
+                <Text style={styles.vipBadgeText}>VIP INSIGHTS</Text>
+              </View>
+              <Text style={styles.vipSubtitle}>Premium price analysis</Text>
+            </View>
+
+            <View style={styles.vipContent}>
+              <View style={styles.vipInsightItem}>
+                <View style={[styles.vipIconBox, { backgroundColor: COLORS.success + '15' }]}>
+                  <Ionicons name="trending-down" size={20} color={COLORS.success} />
+                </View>
+                <View style={styles.vipInsightText}>
+                  <Text style={styles.vipInsightLabel}>Price Stability</Text>
+                  <Text style={styles.vipInsightValue}>
+                    {historyStats.volatilityPct < 5 ? 'Very Stable' : historyStats.volatilityPct < 15 ? 'Moderate' : 'Volatile'}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.vipInsightItem}>
+                <View style={[styles.vipIconBox, { backgroundColor: COLORS.primary + '15' }]}>
+                  <Ionicons name="flash" size={20} color={COLORS.primary} />
+                </View>
+                <View style={styles.vipInsightText}>
+                  <Text style={styles.vipInsightLabel}>Best Time to Buy</Text>
+                  <Text style={styles.vipInsightValue}>{recommendationConfig.label}</Text>
+                </View>
+              </View>
+
+              <View style={styles.vipInsightItem}>
+                <View style={[styles.vipIconBox, { backgroundColor: COLORS.warning + '15' }]}>
+                  <Ionicons name="wallet" size={20} color={COLORS.warning} />
+                </View>
+                <View style={styles.vipInsightText}>
+                  <Text style={styles.vipInsightLabel}>Potential Savings</Text>
+                  <Text style={styles.vipInsightValue}>
+                    {(() => {
+                      const currentPrice = selectedPlatformLivePrice ?? latestHistoryPoint?.price ?? product?.best_price ?? 0;
+                      const potentialSavings = ((historyStats.min - currentPrice) / currentPrice) * 100;
+                      return potentialSavings > 0
+                        ? `${Math.abs(potentialSavings).toFixed(0)}% possible`
+                        : 'Current best price';
+                    })()}
+                  </Text>
+                </View>
+              </View>
             </View>
           </View>
         )}
@@ -1038,6 +1171,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
         {(() => {
           const filteredSpecs = Object.entries(displayData.specs || {})
             .filter(([_, value]) => value != null && value !== undefined && value !== '' && String(value).trim() !== '');
+          const visibleSpecs = specsExpanded ? filteredSpecs : filteredSpecs.slice(0, 6);
           
           return filteredSpecs.length > 0 && (
             <View style={styles.proSpecsContainer}>
@@ -1051,7 +1185,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
               </View>
               
               <View style={styles.proSpecsGrid}>
-                {filteredSpecs.map(([key, value]) => (
+                {visibleSpecs.map(([key, value]) => (
                   <View key={`spec-${key}`} style={styles.proSpecCard}>
                     <Text style={styles.proSpecLabel}>
                       {key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
@@ -1060,42 +1194,77 @@ const ProductDetailScreen = ({ navigation, route }) => {
                   </View>
                 ))}
               </View>
+
+              {filteredSpecs.length > 6 && (
+                <TouchableOpacity
+                  style={styles.specsExpandButton}
+                  activeOpacity={0.8}
+                  onPress={() => setSpecsExpanded((prev) => !prev)}
+                >
+                  <Text style={styles.specsExpandButtonText}>
+                    {specsExpanded ? 'Show Less' : `Show ${filteredSpecs.length - 6} More`}
+                  </Text>
+                  <Ionicons
+                    name={specsExpanded ? 'chevron-up' : 'chevron-down'}
+                    size={16}
+                    color={COLORS.primary}
+                  />
+                </TouchableOpacity>
+              )}
             </View>
           );
         })()}
 
-        {/* Professional Platform Comparison Section - Only show when 2+ platforms available */}
-        {Array.isArray(product?.listings) && product.listings.length > 1 && (
-          <View style={styles.proPlatformContainer}>
-            <View style={styles.proPlatformHeader}>
-              <Text style={styles.proPlatformTitle}>Compare Prices</Text>
-              <View style={styles.proPlatformBadge}>
-                <Text style={styles.proPlatformBadgeText}>
-                  {product.listings.length} Platform{product.listings.length !== 1 ? 's' : ''}
-                </Text>
+        {/* Cross-Platform Comparison - Only show same product on 2+ platforms */}
+        {(() => {
+          const variantGroups = groupListingsByVariant();
+          const multiPlatformVariants = variantGroups.filter(vg => vg.platformCount >= 2);
+          
+          if (multiPlatformVariants.length === 0) return null;
+          
+          return (
+            <View style={styles.proPlatformContainer}>
+              <View style={styles.proPlatformHeader}>
+                <View style={styles.proPlatformTitleRow}>
+                  <Ionicons name="git-compare" size={20} color={COLORS.primary} />
+                  <Text style={styles.proPlatformTitle}>Cross-Platform Comparison</Text>
+                </View>
+                <View style={styles.proPlatformBadge}>
+                  <Text style={styles.proPlatformBadgeText}>
+                    {multiPlatformVariants.length} variant{multiPlatformVariants.length > 1 ? 's' : ''} on 2+ platforms
+                  </Text>
+                </View>
               </View>
-            </View>
+              <Text style={styles.proPlatformSubtitle}>
+                Same product variant available across multiple platforms
+              </Text>
 
-            <View style={styles.proPlatformGrid}>
-              {product.listings
-                .filter(item => item && item.id)
-                .sort((a, b) => (a.current_price || 0) - (b.current_price || 0))
-                .map((item, index) => {
-                  const badge = getPlatformBadge(item.platform || 'amazon');
-                  const isSelected = item.platform === selectedPlatform;
-                  const isCheapest = index === 0; // First item after sorting by price
-                  
-                  return (
-                    <TouchableOpacity
-                      key={`platform-${item.id}`}
-                      style={[
-                        styles.proPlatformCard,
-                        isSelected && styles.proPlatformCardSelected,
-                        isCheapest && styles.proPlatformCardCheapest
-                      ]}
-                      onPress={() => setSelectedPlatform(item.platform)}
-                      activeOpacity={0.8}
-                    >
+              <View style={styles.proPlatformGrid}>
+                {multiPlatformVariants.map((variantGroup, vIndex) => (
+                  <View key={`variant-${vIndex}`} style={styles.variantGroup}>
+                    <Text style={styles.variantGroupName}>
+                      {variantGroup.variant !== 'default' ? variantGroup.variant : 'Standard Variant'}
+                    </Text>
+                    <View style={styles.variantPlatforms}>
+                      {variantGroup.listings
+                        .sort((a, b) => (a.current_price || 0) - (b.current_price || 0))
+                        .map((item, index) => {
+                        const badge = getPlatformBadge(item.platform || 'amazon');
+                        const isSelected = item.platform === selectedPlatform;
+                        const isCheapest = index === 0;
+                        
+                        const itemActionMeta = getActionMetaForListing(item);
+                        return (
+                          <TouchableOpacity
+                            key={`platform-${item.id}`}
+                            style={[
+                              styles.proPlatformCard,
+                              isSelected && styles.proPlatformCardSelected,
+                              isCheapest && styles.proPlatformCardCheapest
+                            ]}
+                            onPress={() => setSelectedPlatform(item.platform)}
+                            activeOpacity={0.8}
+                          >
                       {/* Best Deal Badge */}
                       {isCheapest && (
                         <View style={styles.bestDealBadge}>
@@ -1159,150 +1328,44 @@ const ProductDetailScreen = ({ navigation, route }) => {
                       <TouchableOpacity
                         style={[
                           styles.proPlatformAction,
-                          { backgroundColor: isSelected ? COLORS.primary : COLORS.gray100 }
+                          {
+                            backgroundColor:
+                              itemActionMeta.disabled
+                                ? COLORS.gray300
+                                : (isSelected ? COLORS.primary : COLORS.gray100),
+                          }
                         ]}
                         onPress={() => handleOpenUrl(item.product_url || item.url)}
+                        disabled={itemActionMeta.disabled}
                         activeOpacity={0.8}
                       >
                         <Ionicons 
-                          name="open-outline" 
+                          name={itemActionMeta.icon}
                           size={16} 
-                          color={isSelected ? COLORS.white : COLORS.gray600} 
+                          color={isSelected && !itemActionMeta.disabled ? COLORS.white : COLORS.gray600} 
                         />
                         <Text style={[
                           styles.proPlatformActionText,
-                          { color: isSelected ? COLORS.white : COLORS.gray600 }
+                          {
+                            color:
+                              isSelected && !itemActionMeta.disabled
+                                ? COLORS.white
+                                : COLORS.gray600,
+                          }
                         ]}>
-                          {isSelected ? 'Selected' : 'View Deal'}
+                          {itemActionMeta.label}
                         </Text>
                       </TouchableOpacity>
                     </TouchableOpacity>
                   );
-                })}
-            </View>
-          </View>
-        )}
-
-        {/* Price Comparison */}
-        <View style={styles.comparisonSection}>
-          {/* Header with Best Price Info */}
-          {(() => {
-            const { bestPrice, cheapestPlatform, savings } = getBestPriceInfo();
-            return (
-              <>
-                <View style={styles.comparisonHeader}>
-                  <View style={styles.comparisonTitleRow}>
-                    <Text style={styles.sectionTitle}>Price Comparison</Text>
-                    {Array.isArray(product?.listings) && product.listings.length > 0 && (
-                      <View style={styles.listingCountBadge}>
-                        <Text style={styles.listingCountText}>
-                          {product.listings.length} Listing{product.listings.length !== 1 ? 's' : ''}
-                        </Text>
-                      </View>
-                    )}
-                  </View>
-                  {bestPrice && (
-                    <View style={styles.bestPriceTag}>
-                      <Text style={styles.bestPriceText}>Best: {formatPrice(bestPrice)}</Text>
-                      {savings && <Text style={styles.savingsText}>Save {savings}%</Text>}
+                    })}
                     </View>
-                  )}
-                </View>
-                {cheapestPlatform && (
-                  <Text style={styles.cheapestPlatformHint}>
-                    Lowest price on {getPlatformBadge(cheapestPlatform).name}
-                  </Text>
-                )}
-              </>
-            );
-          })()}
-          
-          {Array.isArray(product?.listings) && product.listings.length > 0 ? (
-            <View>
-              {/* If multiple variants, show grouped comparison */}
-              {(() => {
-                const variantGroups = groupListingsByVariant();
-                return variantGroups.length > 1 ? (
-                  <View style={styles.variantComparisonNote}>
-                    <Ionicons name="information-circle" size={16} color={COLORS.info} />
-                    <Text style={styles.variantComparisonText}>
-                      Showing {variantGroups.length} variant(s) across {product.listings.length} platform(s)
-                    </Text>
                   </View>
-                ) : null;
-              })()}
-              
-              <FlatList
-                data={product.listings.filter(item => item && item.id)}
-                renderItem={renderListingCard}
-                keyExtractor={(item, index) => `listing-${item?.id || `index-${index}`}`}
-                scrollEnabled={false}
-              />
-
-              <View style={styles.comparisonSubSection}>
-                <View style={styles.comparisonSubHeader}>
-                  <Text style={styles.comparisonSubTitle}>Same Product On Other Platforms</Text>
-                  {!crossPlatformLoading && otherPlatformListings.length > 0 && (
-                    <Text style={styles.comparisonSubHint}>{otherPlatformListings.length} option{otherPlatformListings.length > 1 ? 's' : ''}</Text>
-                  )}
-                </View>
-
-                {crossPlatformLoading ? (
-                  <View style={styles.chartLoading}>
-                    <ActivityIndicator color={COLORS.primary} />
-                    <Text style={{ marginTop: 8, color: COLORS.textSecondary }}>Checking platform availability...</Text>
-                  </View>
-                ) : otherPlatformListings.length > 0 ? (
-                  <FlatList
-                    data={otherPlatformListings}
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    keyExtractor={(item, index) => `same-product-${item?.id || index}`}
-                    contentContainerStyle={{ paddingHorizontal: 2, paddingBottom: 4 }}
-                    renderItem={({ item }) => {
-                      const badge = getPlatformBadge(item?.platform || 'amazon');
-                      const isInStock = item?.inStock !== false;
-                      return (
-                        <TouchableOpacity
-                          style={styles.crossPlatformCard}
-                          activeOpacity={0.85}
-                          onPress={() => handleOpenUrl(item?.url)}
-                        >
-                          <View style={styles.crossPlatformHeader}>
-                            <View style={[styles.platformTag, { backgroundColor: badge.color, marginBottom: 0 }]}>
-                              <Text style={styles.platformTagText}>{badge.icon}{badge.name}</Text>
-                            </View>
-                          </View>
-                          <Text style={styles.crossPlatformPrice}>{formatPrice(item?.price || 0)}</Text>
-                          {item?.originalPrice && item.originalPrice > item.price && (
-                            <Text style={styles.crossPlatformOriginalPrice}>{formatPrice(item.originalPrice)}</Text>
-                          )}
-                          <Text style={[styles.crossPlatformStock, { color: isInStock ? COLORS.success : COLORS.error }]}>
-                            {isInStock ? 'In stock' : 'Out of stock'}
-                          </Text>
-                          <TouchableOpacity
-                            style={styles.crossPlatformCta}
-                            onPress={() => handleOpenUrl(item?.url)}
-                          >
-                            <Text style={styles.crossPlatformCtaText}>Open Deal</Text>
-                          </TouchableOpacity>
-                        </TouchableOpacity>
-                      );
-                    }}
-                  />
-                ) : (
-                  <View style={styles.noPriceHistory}>
-                    <Text style={{ color: COLORS.textSecondary }}>
-                      No confirmed same-product listing found on other platforms yet.
-                    </Text>
-                  </View>
-                )}
+                ))}
               </View>
             </View>
-          ) : (
-            <Text style={{ color: COLORS.textSecondary }}>No price listings available</Text>
-          )}
-        </View>
+          );
+        })()}
 
         {/* Professional Price History Section */}
         <View style={styles.proPriceHistoryContainer}>
@@ -1372,28 +1435,54 @@ const ProductDetailScreen = ({ navigation, route }) => {
           
           {sanitizedHistory.length > 0 ? (
             <View style={styles.proPriceHistoryContent}>
+              <View style={styles.proAccuracyBanner}>
+                <View>
+                  <Text style={styles.proAccuracyTitle}>Data Quality: {historyStats.qualityLabel}</Text>
+                  <Text style={styles.proAccuracySubtitle}>
+                    Based on {dataPointsCount} tracked prices across {historySpanDays || 'recent'} days
+                  </Text>
+                </View>
+                <View style={styles.proAccuracyBadge}>
+                  <Text style={styles.proAccuracyBadgeText}>{historyStats.qualityLabel}</Text>
+                </View>
+              </View>
+
               {/* Price Stats Cards */}
               <View style={styles.proPriceStatsContainer}>
                 <View style={styles.proPriceStatCard}>
                   <Text style={styles.proPriceStatLabel}>Lowest</Text>
                   <Text style={styles.proPriceStatValue}>
-                    {formatPrice(Math.min(...sanitizedHistory.map((p) => Number(p.price || 0))))}
+                    {formatPrice(historyStats.min)}
                   </Text>
                 </View>
                 <View style={styles.proPriceStatCard}>
                   <Text style={styles.proPriceStatLabel}>Highest</Text>
                   <Text style={styles.proPriceStatValue}>
-                    {formatPrice(Math.max(...sanitizedHistory.map((p) => Number(p.price || 0))))}
+                    {formatPrice(historyStats.max)}
                   </Text>
                 </View>
                 <View style={styles.proPriceStatCard}>
                   <Text style={styles.proPriceStatLabel}>Average</Text>
                   <Text style={styles.proPriceStatValue}>
-                    {formatPrice(
-                      sanitizedHistory.reduce((sum, p) => sum + Number(p.price || 0), 0) /
-                      sanitizedHistory.length
-                    )}
+                    {formatPrice(historyStats.avg)}
                   </Text>
+                </View>
+              </View>
+
+              <View style={styles.proMetricsRow}>
+                <View style={styles.proMetricItem}>
+                  <Text style={styles.proMetricLabel}>Price Range</Text>
+                  <Text style={styles.proMetricValue}>{historyStats.rangePct.toFixed(1)}%</Text>
+                </View>
+                <View style={styles.proMetricDivider} />
+                <View style={styles.proMetricItem}>
+                  <Text style={styles.proMetricLabel}>Volatility</Text>
+                  <Text style={styles.proMetricValue}>{historyStats.volatilityPct.toFixed(1)}%</Text>
+                </View>
+                <View style={styles.proMetricDivider} />
+                <View style={styles.proMetricItem}>
+                  <Text style={styles.proMetricLabel}>Latest Update</Text>
+                  <Text style={styles.proMetricValue}>{latestKnownUpdateAt ? 'Available' : 'Pending'}</Text>
                 </View>
               </View>
               
@@ -1421,7 +1510,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
                   <View style={styles.proPredictionContent}>
                     {hasObservedWeeklyChange ? (
                       <View style={styles.proTrendItem}>
-                        <Text style={styles.proTrendLabel}>Recent Trend (7 days)</Text>
+                        <Text style={styles.proTrendLabel}>Observed Trend (Last 7 Days)</Text>
                         <Text style={[
                           styles.proTrendValue,
                           { color: observedChange7d <= 0 ? COLORS.success : COLORS.error }
@@ -1437,7 +1526,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
 
                     {predictionAvailable && hasPredictedChange7d ? (
                       <View style={styles.proForecastItem}>
-                        <Text style={styles.proForecastLabel}>7-Day Forecast</Text>
+                        <Text style={styles.proForecastLabel}>Forecast (Next 7 Days)</Text>
                         <Text style={[
                           styles.proForecastValue,
                           { color: predictedChange7d <= 0 ? COLORS.success : COLORS.error }
@@ -1589,6 +1678,10 @@ const styles = StyleSheet.create({
     paddingBottom: 24,
   },
 
+  containerLuxury: {
+    flex: 1,
+    backgroundColor: '#FAFBFD',
+  },
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -1727,6 +1820,20 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 4,
   },
+  
+    proPriceHistoryContainerLuxury: {
+      backgroundColor: 'linear-gradient(135deg, #F8F9FA 0%, #FFFFFF 100%)',
+      borderRadius: 16,
+      padding: 20,
+      marginBottom: 16,
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: 0.12,
+      shadowRadius: 12,
+      elevation: 6,
+      borderWidth: 1,
+      borderColor: '#E6ECF5',
+    },
   priceHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1825,6 +1932,21 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: COLORS.textPrimary,
   },
+  inlineAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#EEF5FF',
+  },
+  inlineActionText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
   summaryDivider: {
     width: 1,
     backgroundColor: COLORS.gray200,
@@ -1856,6 +1978,33 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   savingsText: {
+    color: COLORS.white,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  quickActionContainer: {
+    marginTop: 12,
+  },
+  quickActionLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 8,
+  },
+  quickActionButton: {
+    backgroundColor: COLORS.primary,
+    borderRadius: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  quickActionButtonDisabled: {
+    backgroundColor: COLORS.gray400,
+  },
+  quickActionButtonText: {
     color: COLORS.white,
     fontSize: 14,
     fontWeight: '700',
@@ -1921,6 +2070,24 @@ const styles = StyleSheet.create({
     color: COLORS.textPrimary,
   },
 
+    // ✅ ENHANCED: Luxury Specifications Expansion
+    specsExpandButton: {
+      marginTop: 14,
+      paddingTop: 14,
+      borderTopWidth: 1,
+      borderTopColor: COLORS.gray200,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: 10,
+    },
+
+    specsExpandButtonText: {
+      fontSize: 14,
+      fontWeight: '600',
+      color: COLORS.primary,
+      marginRight: 6,
+    },
   // Professional Platform Comparison Styles
   proPlatformContainer: {
     backgroundColor: COLORS.white,
@@ -2166,6 +2333,20 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 4,
   },
+  
+    proPriceContainerLuxury: {
+      backgroundColor: COLORS.white,
+      borderRadius: 16,
+      padding: 22,
+      marginBottom: 16,
+      borderWidth: 1,
+      borderColor: '#F0F3F7',
+      shadowColor: '#001A4D',
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: 0.12,
+      shadowRadius: 12,
+      elevation: 6,
+    },
   proPriceHistoryHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -2266,6 +2447,39 @@ const styles = StyleSheet.create({
   proPriceHistoryContent: {
     gap: 16,
   },
+  proAccuracyBanner: {
+    backgroundColor: '#F4F7FF',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#DCE6FF',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  proAccuracyTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proAccuracySubtitle: {
+    marginTop: 2,
+    fontSize: 11,
+    fontWeight: '500',
+    color: COLORS.gray600,
+  },
+  proAccuracyBadge: {
+    backgroundColor: COLORS.primary,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  proAccuracyBadgeText: {
+    color: COLORS.white,
+    fontSize: 11,
+    fontWeight: '700',
+  },
   proPriceStatsContainer: {
     flexDirection: 'row',
     gap: 12,
@@ -2289,6 +2503,38 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: COLORS.textPrimary,
     textAlign: 'center',
+  },
+  proMetricsRow: {
+    backgroundColor: '#FBFCFE',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E6ECF5',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  proMetricItem: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  proMetricLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: COLORS.gray600,
+    marginBottom: 4,
+    textTransform: 'uppercase',
+  },
+  proMetricValue: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  proMetricDivider: {
+    width: 1,
+    height: 26,
+    backgroundColor: COLORS.gray200,
   },
   proPredictionCard: {
     backgroundColor: '#F8F9FA',
@@ -3241,6 +3487,311 @@ const styles = StyleSheet.create({
     bottom: 24,
     right: 20,
     zIndex: 100,
+  },
+
+    // ✅ NEW: Premium Feature Styles
+    premiumFeatureStrip: {
+      marginTop: 12,
+      marginHorizontal: 16,
+      backgroundColor: COLORS.white,
+      borderRadius: 14,
+      overflow: 'hidden',
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.08,
+      shadowRadius: 8,
+      elevation: 4,
+    },
+
+    premiumFeatureButton: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+      borderBottomWidth: 1,
+      borderBottomColor: COLORS.gray100,
+    },
+
+    premiumFeatureButtonLast: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+    },
+
+    premiumFeatureButtonContent: {
+      flex: 1,
+      marginLeft: 12,
+    },
+
+    premiumFeatureButtonTitle: {
+      fontSize: 15,
+      fontWeight: '600',
+      color: COLORS.textPrimary,
+      marginBottom: 2,
+    },
+
+    premiumFeatureButtonSubtitle: {
+      fontSize: 12,
+      fontWeight: '500',
+      color: COLORS.gray600,
+    },
+
+    // ✅ NEW: VIP Insights Styles
+    vipInsightsCard: {
+      backgroundColor: COLORS.white,
+      borderRadius: 16,
+      padding: 18,
+      marginHorizontal: 16,
+      marginBottom: 16,
+      borderWidth: 1.5,
+      borderColor: COLORS.warning + '30',
+      shadowColor: COLORS.warning,
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: 0.15,
+      shadowRadius: 12,
+      elevation: 6,
+    },
+
+    vipHeader: {
+      marginBottom: 14,
+    },
+
+    vipBadge: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      alignSelf: 'flex-start',
+      backgroundColor: COLORS.warning + '15',
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+      borderRadius: 20,
+      marginBottom: 8,
+    },
+
+    vipBadgeText: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: COLORS.warning,
+      marginLeft: 6,
+      letterSpacing: 0.5,
+    },
+
+    vipSubtitle: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: COLORS.textPrimary,
+    },
+
+    vipContent: {
+      gap: 12,
+    },
+
+    vipInsightItem: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: '#F8F9FA',
+      paddingHorizontal: 12,
+      paddingVertical: 12,
+      borderRadius: 10,
+    },
+
+    vipIconBox: {
+      width: 40,
+      height: 40,
+      borderRadius: 10,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+
+    vipInsightText: {
+      flex: 1,
+      marginLeft: 12,
+    },
+
+    vipInsightLabel: {
+      fontSize: 12,
+      fontWeight: '600',
+      color: COLORS.gray600,
+      marginBottom: 3,
+    },
+
+    vipInsightValue: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: COLORS.textPrimary,
+    },
+
+  // Price Prediction Section Styles
+  predictionSection: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    marginHorizontal: 12,
+    marginVertical: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#E7ECF2',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+
+  predictionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.gray200,
+  },
+
+  predictionTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+
+  predictionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+
+  confidenceBadge: {
+    backgroundColor: COLORS.successLight,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+
+  confidenceText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.success,
+  },
+
+  predictionContent: {
+    gap: 12,
+  },
+
+  predictionCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: COLORS.gray50,
+    gap: 16,
+  },
+
+  predictionCardGood: {
+    backgroundColor: COLORS.successLight + '30',
+    borderLeftWidth: 3,
+    borderLeftColor: COLORS.success,
+  },
+
+  predictionCardNeutral: {
+    backgroundColor: COLORS.warningLight + '30',
+    borderLeftWidth: 3,
+    borderLeftColor: COLORS.warning,
+  },
+
+  predictionInfo: {
+    flex: 1,
+  },
+
+  predictionLabel: {
+    fontSize: 12,
+    color: COLORS.textSecondary,
+    marginBottom: 4,
+  },
+
+  predictionValue: {
+    fontSize: 20,
+    fontWeight: '700',
+  },
+
+  observedChangeCard: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: COLORS.gray50,
+  },
+
+  observedChangeLabel: {
+    fontSize: 13,
+    color: COLORS.textSecondary,
+  },
+
+  observedChangeValue: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+
+  reasonsContainer: {
+    marginTop: 8,
+    padding: 12,
+    backgroundColor: COLORS.infoLight + '20',
+    borderRadius: 8,
+  },
+
+  reasonsTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+    marginBottom: 8,
+  },
+
+  reasonText: {
+    fontSize: 12,
+    color: COLORS.textSecondary,
+    marginBottom: 4,
+    lineHeight: 18,
+  },
+
+  // Section Header Styles
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+
+  // Cross-Platform Comparison Styles
+  proPlatformTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+
+  proPlatformSubtitle: {
+    fontSize: 13,
+    color: COLORS.textSecondary,
+    marginTop: 4,
+    marginBottom: 12,
+  },
+
+  variantGroup: {
+    marginBottom: 16,
+    backgroundColor: COLORS.gray50,
+    borderRadius: 12,
+    padding: 12,
+  },
+
+  variantGroupName: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+    marginBottom: 8,
+  },
+
+  variantPlatforms: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
   },
 });
 

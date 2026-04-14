@@ -87,6 +87,7 @@ export const API = {
     STREAK_CHECK_IN: '/streak/check-in',
     STREAK_STATUS: '/streak/status',
     STREAK_MILESTONES: '/streak/milestones',
+    STREAK_DEBUG_RESET: '/streak/debug/reset',
     
     // Subscription (Part 5)
     SUBSCRIPTION_PLANS: '/subscription/plans',

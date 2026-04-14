@@ -201,12 +201,18 @@ const WatchlistScreen = () => {
     items,
     totalCount,
     limit,
+    isGracePeriod,
+    graceDaysRemaining,
+    overLimitCount,
+    warningMessage,
+    prunedCount,
     isLoading,
     isRefreshing,
     error,
     isEmpty,
     fetch,
     refresh,
+    clearError,
   } = useWatchlist();
   
   // Local state
@@ -324,6 +330,21 @@ const WatchlistScreen = () => {
   const handleItemRemoved = useCallback((productId) => {
     console.log('Removed from watchlist:', productId);
   }, []);
+
+  const showGraceBanner = Boolean(isGracePeriod || overLimitCount > 0 || prunedCount > 0 || warningMessage);
+  const watchlistErrorMessage = useMemo(() => {
+    if (!error) return null;
+
+    if (typeof error === 'string') {
+      return error;
+    }
+
+    if (error?.type === 'LIMIT_REACHED') {
+      return `Your watchlist is full (${totalCount}/${limit}). Remove one item to add a new product.`;
+    }
+
+    return error?.message || error?.error || 'Something went wrong while updating your watchlist.';
+  }, [error, limit, totalCount]);
   
   // Render item
   const renderItem = useCallback(({ item, index }) => (
@@ -331,8 +352,10 @@ const WatchlistScreen = () => {
       item={item}
       index={index}
       onRemove={handleItemRemoved}
+      warningMode={showGraceBanner}
+      overLimit={overLimitCount > 0}
     />
-  ), [handleItemRemoved]);
+  ), [handleItemRemoved, overLimitCount, showGraceBanner]);
   
   // Key extractor
   const keyExtractor = useCallback(
@@ -363,8 +386,10 @@ const WatchlistScreen = () => {
         <View style={styles.header}>
           <View style={styles.headerLeft}>
             <Text style={styles.headerTitle}>Watchlist</Text>
-            <View style={styles.countBadge}>
-              <Text style={styles.countText}>{totalCount}/{limit}</Text>
+            <View style={styles.countStack}>
+              <View style={styles.countBadge}>
+                <Text style={styles.countText}>{totalCount}/{limit}</Text>
+              </View>
             </View>
           </View>
         </View>
@@ -380,8 +405,10 @@ const WatchlistScreen = () => {
         <View style={styles.header}>
           <View style={styles.headerLeft}>
             <Text style={styles.headerTitle}>Watchlist</Text>
-            <View style={styles.countBadge}>
-              <Text style={styles.countText}>{totalCount}/{limit}</Text>
+            <View style={styles.countStack}>
+              <View style={styles.countBadge}>
+                <Text style={styles.countText}>{totalCount}/{limit}</Text>
+              </View>
             </View>
           </View>
         </View>
@@ -404,8 +431,10 @@ const WatchlistScreen = () => {
       <View style={styles.header}>
         <View style={styles.headerLeft}>
           <Text style={styles.headerTitle}>Watchlist</Text>
-          <View style={styles.countBadge}>
-            <Text style={styles.countText}>{totalCount}/{limit}</Text>
+          <View style={styles.countStack}>
+            <View style={styles.countBadge}>
+              <Text style={styles.countText}>{totalCount}/{limit}</Text>
+            </View>
           </View>
         </View>
         
@@ -419,20 +448,34 @@ const WatchlistScreen = () => {
           </TouchableOpacity>
         )}
       </View>
+
+      {watchlistErrorMessage && (
+        <View style={styles.inlineErrorBanner}>
+          <Ionicons name="alert-circle-outline" size={16} color={COLORS.error} />
+          <Text style={styles.inlineErrorText}>{watchlistErrorMessage}</Text>
+          <TouchableOpacity onPress={clearError} style={styles.inlineErrorClose} activeOpacity={0.8}>
+            <Ionicons name="close" size={16} color={COLORS.error} />
+          </TouchableOpacity>
+        </View>
+      )}
       
       {/* ✅ Part 5: Limit Warning with Working Upgrade Button */}
-      {totalCount >= limit && (
+      {showGraceBanner && (
         <View style={styles.limitWarning}>
-          <Ionicons name="warning-outline" size={16} color={COLORS.warning} />
+          <Ionicons name={isGracePeriod ? 'time-outline' : 'warning-outline'} size={16} color={COLORS.warning} />
           <Text style={styles.limitWarningText}>
-            Watchlist full! Upgrade to add more products.
+            {warningMessage || (isGracePeriod
+              ? `Grace period active. Remove ${overLimitCount} excess item${overLimitCount === 1 ? '' : 's'} within ${graceDaysRemaining ?? 2} day${(graceDaysRemaining ?? 2) === 1 ? '' : 's'}.`
+              : prunedCount > 0
+                ? `Auto-removed ${prunedCount} item${prunedCount === 1 ? '' : 's'} after grace period.`
+                : `Watchlist exceeds your limit by ${overLimitCount} item${overLimitCount === 1 ? '' : 's'}.`)}
           </Text>
           <TouchableOpacity 
             style={styles.upgradeLink}
             onPress={handleUpgrade}
             activeOpacity={0.8}
           >
-            <Text style={styles.upgradeLinkText}>Upgrade</Text>
+            <Text style={styles.upgradeLinkText}>{isGracePeriod ? 'Manage' : 'Upgrade'}</Text>
           </TouchableOpacity>
         </View>
       )}
@@ -506,6 +549,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
+
+  countStack: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    gap: 4,
+  },
   
   headerTitle: {
     fontSize: 22,
@@ -524,6 +573,12 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     color: COLORS.primary,
+  },
+
+  bonusText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: COLORS.success,
   },
   
   sortButton: {
@@ -570,6 +625,36 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     color: COLORS.white,
+  },
+
+  inlineErrorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginHorizontal: 16,
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+  },
+
+  inlineErrorText: {
+    flex: 1,
+    fontSize: 12,
+    color: COLORS.error,
+    fontWeight: '500',
+  },
+
+  inlineErrorClose: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
   },
   
   // List

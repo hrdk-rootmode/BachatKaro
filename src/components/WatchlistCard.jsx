@@ -3,7 +3,7 @@
 // Part 3: Watchlist & Price Alerts
 // ============================================
 
-import React, { memo, useCallback, useRef } from 'react';
+import React, { memo, useCallback, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -61,6 +61,8 @@ const WatchlistCard = ({
   item,
   onRemove,
   index = 0,
+  warningMode = false,
+  overLimit = false,
 }) => {
   const navigation = useNavigation();
   const dispatch = useDispatch();
@@ -77,6 +79,40 @@ const WatchlistCard = ({
   // Animation values
   const scaleAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(1)).current;
+  const shakeAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (warningMode) {
+      const loop = Animated.loop(
+        Animated.sequence([
+          Animated.timing(shakeAnim, {
+            toValue: 1,
+            duration: 80,
+            useNativeDriver: true,
+          }),
+          Animated.timing(shakeAnim, {
+            toValue: -1,
+            duration: 80,
+            useNativeDriver: true,
+          }),
+          Animated.timing(shakeAnim, {
+            toValue: 0,
+            duration: 80,
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      loop.start();
+      return () => loop.stop();
+    }
+
+    shakeAnim.setValue(0);
+  }, [shakeAnim, warningMode]);
+
+  const shakeTranslateX = shakeAnim.interpolate({
+    inputRange: [-1, 0, 1],
+    outputRange: [-2, 0, 2],
+  });
   
   // Extract product details
   const title =
@@ -244,8 +280,14 @@ const WatchlistCard = ({
       style={[
         styles.container,
         {
-          transform: [{ scale: scaleAnim }],
+          transform: [
+            { translateX: shakeTranslateX },
+            { scale: scaleAnim },
+          ],
           opacity: opacityAnim,
+          borderColor: warningMode ? COLORS.warning : COLORS?.surface || '#FFFFFF',
+          borderWidth: warningMode ? 1.5 : 0,
+          shadowOpacity: warningMode ? 0.15 : 0.08,
         },
       ]}
     >
@@ -317,7 +359,11 @@ const WatchlistCard = ({
         
         {/* Remove Button */}
         <TouchableOpacity
-          style={styles.removeButton}
+          style={[
+            styles.removeButton,
+            warningMode && styles.removeButtonWarning,
+            overLimit && styles.removeButtonOverLimit,
+          ]}
           onPress={handleRemove}
           disabled={isRemoving}
           hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
@@ -513,6 +559,17 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 2,
     elevation: 2,
+  },
+
+  removeButtonWarning: {
+    backgroundColor: '#FFF7ED',
+    borderWidth: 1,
+    borderColor: COLORS?.warning || '#F59E0B',
+  },
+
+  removeButtonOverLimit: {
+    backgroundColor: '#FEF2F2',
+    borderColor: COLORS?.error || '#EF4444',
   },
 });
 

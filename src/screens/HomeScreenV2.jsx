@@ -20,6 +20,7 @@ import {
   selectTrendingStatus,
 } from '../store/searchSlice';
 import { selectThemePalette } from '../store/themeSlice';
+import { fetchUnreadCount, selectUnreadCount } from '../store/notificationSlice';
 import { homeAPI } from '../services/homeApi';
 import { toEpochMs } from '../utils/formatters';
 import { COLORS, APP } from '../utils/constants';
@@ -145,6 +146,24 @@ const dedupeProducts = (items) => {
   return Array.from(map.values());
 };
 
+const getComparablePrice = (product) => {
+  const candidates = [
+    product?.best_price,
+    product?.current_price,
+    product?.price,
+    product?.min_price,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
 const matchCategory = (product) => {
   const searchable = `${product?.title || ''} ${product?.category || ''} ${product?.subcategory || ''} ${product?.ai_generated_essence || ''}`.toLowerCase();
   const found = CATEGORY_SECTIONS.find((category) =>
@@ -190,6 +209,7 @@ const HomeScreenV2 = () => {
   const searchResults = useSelector(selectSearchResults) || [];
   const lastSearchQuery = useSelector(selectLastSearchQuery) || '';
   const themePalette = useSelector(selectThemePalette);
+  const unreadNotificationCount = useSelector(selectUnreadCount);
 
   const [refreshing, setRefreshing] = React.useState(false);
   const [visibleItemsPerSection, setVisibleItemsPerSection] = React.useState(8);
@@ -205,6 +225,7 @@ const HomeScreenV2 = () => {
     if (trendingStatus === 'idle') {
       dispatch(fetchTrending());
     }
+    dispatch(fetchUnreadCount());
   }, []);
 
   const fetchHomeData = useCallback(async () => {
@@ -234,13 +255,13 @@ const HomeScreenV2 = () => {
   // Pull to refresh
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([dispatch(fetchTrending()), fetchHomeData()]);
+    await Promise.all([dispatch(fetchTrending()), fetchHomeData(), dispatch(fetchUnreadCount())]);
     setRefreshing(false);
   }, [dispatch, fetchHomeData]);
 
   useFocusEffect(
     useCallback(() => {
-      Promise.all([dispatch(fetchTrending()), fetchHomeData()]);
+      Promise.all([dispatch(fetchTrending()), fetchHomeData(), dispatch(fetchUnreadCount())]);
     }, [dispatch, fetchHomeData])
   );
 
@@ -275,7 +296,9 @@ const HomeScreenV2 = () => {
     const explicit = Array.isArray(crossPlatformHighlights) ? crossPlatformHighlights : [];
     const explicitValid = explicit.filter((item) => Number(item?.platform_count || 0) >= 2);
     if (explicitValid.length > 0) {
-      return explicitValid;
+      return [...explicitValid]
+        .sort((a, b) => getComparablePrice(b) - getComparablePrice(a))
+        .slice(0, CROSS_PLATFORM_HIGHLIGHT_LIMIT);
     }
 
     const fallbackMap = new Map();
@@ -291,7 +314,9 @@ const HomeScreenV2 = () => {
       }
     }
 
-    return Array.from(fallbackMap.values()).slice(0, CROSS_PLATFORM_HIGHLIGHT_LIMIT);
+    return Array.from(fallbackMap.values())
+      .sort((a, b) => getComparablePrice(b) - getComparablePrice(a))
+      .slice(0, CROSS_PLATFORM_HIGHLIGHT_LIMIT);
   }, [crossPlatformHighlights, mergedFeedProducts]);
 
   const newArrivals = useMemo(() => {
@@ -539,6 +564,16 @@ const HomeScreenV2 = () => {
     });
   }, [navigation]);
 
+  const handleViewAllCategory = useCallback((category) => {
+    navigation.navigate('CategoryProducts', {
+      categoryId: category.id,
+      categoryTitle: category.title,
+      categoryEmoji: category.emoji,
+      categoryQuery: category.query,
+      categoryKeywords: category.keywords,
+    });
+  }, [navigation]);
+
   const handleSearchTap = useCallback(() => {
     navigation.navigate('SearchTab', { screen: 'SearchMain' });
   }, [navigation]);
@@ -585,8 +620,15 @@ const HomeScreenV2 = () => {
           <Text style={[styles.appName, { color: themePalette.text || COLORS.textPrimary }]}>{APP.NAME}</Text>
         </View>
         <View style={styles.headerRight}>
-          <TouchableOpacity style={styles.iconBtn}>
+          <TouchableOpacity style={styles.iconBtn} onPress={() => navigation.navigate('Notifications')}>
             <Ionicons name="notifications-outline" size={24} color={themePalette.text || COLORS.textPrimary} />
+            {unreadNotificationCount > 0 && (
+              <View style={styles.notificationBadge}>
+                <Text style={styles.notificationBadgeText}>
+                  {unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}
+                </Text>
+              </View>
+            )}
           </TouchableOpacity>
         </View>
       </View>
@@ -728,6 +770,7 @@ const HomeScreenV2 = () => {
               products={section.products}
               maxItems={visibleItemsPerSection}
               onProductPress={handleProductPress}
+              onSeeAll={() => handleViewAllCategory(section)}
               isLoading={isLoading || homeDataLoading}
             />
           </View>
@@ -778,7 +821,24 @@ const styles = StyleSheet.create({
   },
   appName: { fontSize: 20, fontWeight: '800', color: COLORS.textPrimary },
   headerRight: { flexDirection: 'row' },
-  iconBtn: { padding: 8 },
+  iconBtn: { padding: 8, position: 'relative' },
+  notificationBadge: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    backgroundColor: COLORS.danger || '#DC2626',
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  notificationBadgeText: {
+    color: COLORS.white,
+    fontSize: 10,
+    fontWeight: '700',
+  },
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',

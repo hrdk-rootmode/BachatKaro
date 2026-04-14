@@ -15,6 +15,10 @@ import { store, persistor } from './src/store/store';
 import AppNavigator from './src/navigation/AppNavigator';
 import TopToastProvider from './src/components/common/TopToastProvider';
 
+// Global Modals
+import RewardModal from './src/components/RewardModal';
+import SubscriptionSuccessModal from './src/components/SubscriptionSuccessModal';
+
 // Constants
 import { COLORS } from './src/utils/constants';
 
@@ -89,6 +93,10 @@ const App = () => {
                 backgroundColor={COLORS.background}
               />
               <AppNavigator />
+              
+              {/* Global Modals */}
+              <RewardModal />
+              <SubscriptionSuccessModal />
             </TopToastProvider>
           </NavigationContainer>
         </PersistGate>

@@ -58,9 +58,17 @@ export const streakAPI = {
         data: {
           currentStreak: data.current_streak ?? data.currentStreak ?? 0,
           longestStreak: data.longest_streak ?? data.longestStreak ?? 0,
-          todayCompleted: data.today_completed ?? data.todayCompleted ?? false,
+          todayCompleted:
+            data.today_completed ??
+            data.todayCompleted ??
+            (typeof data.can_check_in_today === 'boolean' ? !data.can_check_in_today : false),
           lastVisitDate: data.last_visit_date || data.lastVisitDate || null,
-          streakMilestoneReward: data.streak_milestone_reward || data.streakMilestoneReward || null,
+          streakMilestoneReward:
+            data.streak_milestone_reward ||
+            data.streakMilestoneReward ||
+            data.reward_unlocked ||
+            data.rewardUnlocked ||
+            null,
           // Additional fields the backend may provide
           nextMilestone: data.next_milestone || data.nextMilestone || null,
           streakHistory: data.streak_history || data.streakHistory || [],
@@ -124,7 +132,12 @@ export const streakAPI = {
           longestStreak: data.longest_streak ?? data.longestStreak ?? 0,
           todayCompleted: data.today_completed ?? data.todayCompleted ?? true,
           lastVisitDate: data.last_visit_date || data.lastVisitDate || null,
-          streakMilestoneReward: data.streak_milestone_reward || data.streakMilestoneReward || null,
+          streakMilestoneReward:
+            data.streak_milestone_reward ||
+            data.streakMilestoneReward ||
+            data.reward_unlocked ||
+            data.rewardUnlocked ||
+            null,
           message: data.message || 'Check-in successful!',
           isNewStreak: data.is_new_streak ?? data.isNewStreak ?? false,
           wasReset: data.was_reset ?? data.wasReset ?? false,
@@ -206,6 +219,28 @@ export const streakAPI = {
           error.message ||
           'Failed to fetch milestones',
         code: error.response?.status || 'UNKNOWN',
+      };
+    }
+  },
+
+  /**
+   * Development helper: completely reset streak and reward-derived bonuses
+   */
+  debugReset: async () => {
+    try {
+      const response = await post(API.ENDPOINTS.STREAK_DEBUG_RESET);
+      if (!response?.success) {
+        return buildErrorResult(response, 'Failed to reset streak', 'Please login to reset streak');
+      }
+
+      return {
+        success: true,
+        data: normalizePayload(response),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.response?.data?.detail || error?.message || 'Failed to reset streak',
       };
     }
   },

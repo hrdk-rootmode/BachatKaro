@@ -11,8 +11,6 @@ import {
   ScrollView,
   TouchableOpacity,
   ActivityIndicator,
-  Modal,
-  Animated,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
@@ -195,23 +193,21 @@ const MockCheckoutModal = ({
 }) => {
   const paymentStatus = getPaymentServiceStatus();
   
-  if (!plan) return null;
+  if (!visible || !plan) return null;
   
   return (
-    <Modal
-      visible={visible}
-      transparent
-      animationType="slide"
-      onRequestClose={onClose}
-    >
-      <View style={styles.modalOverlay}>
-        <View style={styles.modalContent}>
+    <View style={styles.modalOverlay}>
+      <TouchableOpacity
+        style={styles.modalBackdropTapArea}
+        activeOpacity={1}
+        onPress={isProcessing ? undefined : onClose}
+      />
+      <View style={styles.modalContent}>
           {/* Header */}
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>Complete Purchase</Text>
             <TouchableOpacity
               onPress={onClose}
-              disabled={isProcessing}
               hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
             >
               <Ionicons name="close" size={24} color={COLORS.gray500} />
@@ -276,78 +272,11 @@ const MockCheckoutModal = ({
           <TouchableOpacity
             style={styles.cancelButton}
             onPress={onClose}
-            disabled={isProcessing}
           >
             <Text style={styles.cancelButtonText}>Cancel</Text>
           </TouchableOpacity>
-        </View>
       </View>
-    </Modal>
-  );
-};
-
-// --------------------------------------------
-// SUCCESS MODAL
-// --------------------------------------------
-
-const SuccessModal = ({ visible, plan, onClose }) => {
-  const scaleAnim = React.useRef(new Animated.Value(0)).current;
-  
-  useEffect(() => {
-    if (visible) {
-      Animated.spring(scaleAnim, {
-        toValue: 1,
-        tension: 50,
-        friction: 7,
-        useNativeDriver: true,
-      }).start();
-    } else {
-      scaleAnim.setValue(0);
-    }
-  }, [visible, scaleAnim]);
-  
-  if (!plan) return null;
-  
-  return (
-    <Modal
-      visible={visible}
-      transparent
-      animationType="fade"
-      onRequestClose={onClose}
-    >
-      <View style={styles.modalOverlay}>
-        <Animated.View style={[
-          styles.successModalContent,
-          { transform: [{ scale: scaleAnim }] },
-        ]}>
-          <View style={styles.successIconContainer}>
-            <Ionicons name="checkmark-circle" size={64} color={COLORS.success} />
-          </View>
-          
-          <Text style={styles.successTitle}>Welcome to {plan.name}! 🎉</Text>
-          <Text style={styles.successSubtitle}>
-            Your subscription is now active. Enjoy your enhanced features!
-          </Text>
-          
-          <View style={styles.successFeatures}>
-            {(SUBSCRIPTION.PLAN_FEATURES[plan.id] || []).slice(0, 3).map((feature, index) => (
-              <View key={index} style={styles.successFeatureRow}>
-                <Ionicons name="checkmark" size={16} color={COLORS.success} />
-                <Text style={styles.successFeatureText}>{feature.text}</Text>
-              </View>
-            ))}
-          </View>
-          
-          <TouchableOpacity
-            style={styles.successButton}
-            onPress={onClose}
-            activeOpacity={0.85}
-          >
-            <Text style={styles.successButtonText}>Start Exploring</Text>
-          </TouchableOpacity>
-        </Animated.View>
-      </View>
-    </Modal>
+    </View>
   );
 };
 
@@ -372,8 +301,6 @@ const PlansScreen = () => {
   // Local state
   const [selectedPlan, setSelectedPlan] = useState(null);
   const [showCheckout, setShowCheckout] = useState(false);
-  const [showSuccess, setShowSuccess] = useState(false);
-  const [subscribedPlan, setSubscribedPlan] = useState(null);
   
   // Get highlighted plan from navigation params
   const highlightedPlanId = route.params?.highlightedPlan || 'pro';
@@ -434,20 +361,21 @@ const PlansScreen = () => {
   // Handle checkout confirmation
   const handleConfirmPayment = useCallback(async () => {
     if (!selectedPlan) return;
+
+    const planToPurchase = selectedPlan;
+    // Close checkout layer immediately to avoid any stale transparent blocker.
+    setShowCheckout(false);
+    setSelectedPlan(null);
     
     try {
-      const result = await dispatch(subscribeToPlan({
-        planId: selectedPlan.id,
+      await dispatch(subscribeToPlan({
+        planId: planToPurchase.id,
         userInfo: {
           email: user?.email,
           name: user?.email?.split('@')[0],
         },
       })).unwrap();
-      
-      // Success!
-      setShowCheckout(false);
-      setSubscribedPlan(selectedPlan);
-      setShowSuccess(true);
+
     } catch (error) {
       console.error('[PlansScreen] Payment failed:', error);
       // Error is handled by Redux state
@@ -462,13 +390,6 @@ const PlansScreen = () => {
       dispatch(clearError());
     }
   }, [paymentInProgress, dispatch]);
-  
-  // Handle success close
-  const handleCloseSuccess = useCallback(() => {
-    setShowSuccess(false);
-    setSubscribedPlan(null);
-    navigation.goBack();
-  }, [navigation]);
   
   // Handle back press
   const handleBack = useCallback(() => {
@@ -574,12 +495,6 @@ const PlansScreen = () => {
         isProcessing={paymentInProgress || isVerifying}
       />
       
-      {/* Success Modal */}
-      <SuccessModal
-        visible={showSuccess}
-        plan={subscribedPlan}
-        onClose={handleCloseSuccess}
-      />
     </SafeAreaView>
   );
 };
@@ -861,9 +776,15 @@ const styles = StyleSheet.create({
   
   // Modal
   modalOverlay: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'flex-end',
+    zIndex: 50,
+    elevation: 50,
+  },
+
+  modalBackdropTapArea: {
+    ...StyleSheet.absoluteFillObject,
   },
   
   modalContent: {
@@ -1003,68 +924,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   
-  // Success Modal
-  successModalContent: {
-    backgroundColor: COLORS.white,
-    marginHorizontal: 24,
-    marginVertical: 'auto',
-    borderRadius: 24,
-    padding: 32,
-    alignItems: 'center',
-  },
-  
-  successIconContainer: {
-    marginBottom: 20,
-  },
-  
-  successTitle: {
-    fontSize: 22,
-    fontWeight: '800',
-    color: COLORS.textPrimary,
-    textAlign: 'center',
-    marginBottom: 8,
-  },
-  
-  successSubtitle: {
-    fontSize: 14,
-    color: COLORS.textSecondary,
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 20,
-  },
-  
-  successFeatures: {
-    alignSelf: 'stretch',
-    backgroundColor: COLORS.successLight + '50',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 24,
-    gap: 10,
-  },
-  
-  successFeatureRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  
-  successFeatureText: {
-    fontSize: 14,
-    color: COLORS.textPrimary,
-  },
-  
-  successButton: {
-    backgroundColor: COLORS.primary,
-    paddingVertical: 14,
-    paddingHorizontal: 32,
-    borderRadius: 12,
-  },
-  
-  successButtonText: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: COLORS.white,
-  },
 });
 
 export default PlansScreen;

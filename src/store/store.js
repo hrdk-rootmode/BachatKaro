@@ -22,6 +22,7 @@ import watchlistReducer from './watchlistSlice';
 import streakReducer from './streakSlice';
 import subscriptionReducer from './subscriptionSlice'; // Future slice for subscription management
 import themeReducer from './themeSlice';
+import notificationReducer from './notificationSlice';
 // Part 3
 // --------------------------------------------
 // PERSIST CONFIGURATION
@@ -31,7 +32,7 @@ const persistConfig = {
   key: 'dealhunt_root',
   version: 1,
   storage: AsyncStorage,
-  whitelist: ['auth', 'theme'], // Persist auth + selected theme mode
+  whitelist: ['auth', 'theme', 'notifications'], // Persist auth/theme/notifications
   // blacklist: ['search'], // Alternative way
 };
 
@@ -47,6 +48,7 @@ const rootReducer = combineReducers({
   streak: streakReducer,       // Part 4
   subscription: subscriptionReducer, // Part 5
   theme: themeReducer,
+  notifications: notificationReducer,
 });
 
 // --------------------------------------------

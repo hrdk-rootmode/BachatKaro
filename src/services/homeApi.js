@@ -97,6 +97,25 @@ export const homeAPI = {
       };
     }
   },
+
+  // ✅ NEW: Category products
+  getCategoryProducts: async (categoryId) => {
+    try {
+      const response = await get(`/home/category/${categoryId}`, { limit: 100 });
+      if (!response.success) return response;
+
+      return {
+        success: true,
+        data: Array.isArray(response.data) ? response.data : [],
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.error || 'Failed to fetch category products',
+      };
+    }
+  },
 };
+
 
 export default homeAPI;
