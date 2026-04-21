@@ -251,6 +251,9 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
     try:
         async with _RUN_LOCK:
             async with async_session_maker() as db:
+                # Import Redis client for cache invalidation
+                from app.core.redis_client import get_redis
+                redis = await get_redis()
                 watchlisted_product_ids = await _get_watchlisted_product_ids(db)
 
                 # Step 1: Get products to scrape
@@ -307,6 +310,21 @@ async def run_daily_scrape(force_all: bool = False, max_products: Optional[int] 
 
                 # Step 6: Log results
                 await _log_scrape_results(db, stats, start_time)
+
+                # Invalidate watchlist cache if prices changed
+                if stats["price_changes"] > 0:
+                    try:
+                        # Get all users who have watchlisted products
+                        result = await db.execute(select(UserWatchlist.user_id).distinct())
+                        user_ids = result.scalars().all()
+                        
+                        # Invalidate cache for each user
+                        for user_id in user_ids:
+                            await redis.delete(f"watchlist:{user_id}")
+                        
+                        logger.info(f"Invalidated watchlist cache for {len(user_ids)} users after price changes")
+                    except Exception as e:
+                        logger.warning(f"Failed to invalidate watchlist cache: {e}")
 
                 logger.info(
                     f"✅ Daily scrape completed | "
@@ -799,7 +817,26 @@ async def _scrape_product_price(
                 old_price = float(listing.current_price)
                 if old_price > 0:
                     ratio = new_price / old_price
-                    if ratio > PRICE_SPIKE_MAX_RATIO or ratio < (1.0 / PRICE_SPIKE_MAX_RATIO):
+                    effective_max_ratio = PRICE_SPIKE_MAX_RATIO
+                    if platform_name.lower() == "flipkart":
+                        effective_max_ratio = max(effective_max_ratio, 8.0)
+
+                    # Allow recovery from previously corrupted tiny baselines
+                    # (e.g., old ₹189 due to past parse issue, new ₹1299 is real).
+                    if (
+                        platform_name.lower() == "flipkart"
+                        and ratio > effective_max_ratio
+                        and old_price < 500
+                        and new_price >= 1000
+                    ):
+                        logger.info(
+                            f"✅ Spike guard bypassed for likely baseline-recovery "
+                            f"{platform_name}/{listing.external_id}: "
+                            f"₹{old_price:.0f} → ₹{new_price:.0f} (ratio={ratio:.2f})"
+                        )
+                        return new_price, getattr(product_data, "in_stock", True)
+
+                    if ratio > effective_max_ratio or ratio < (1.0 / effective_max_ratio):
                         if signal is not None:
                             signal["spike_rejected"] = True
                         logger.warning(

@@ -5,15 +5,17 @@ Price tracking and alert management
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, delete
+from sqlalchemy import select, and_, delete, case
 from typing import List
 from datetime import datetime, timedelta
 from decimal import Decimal
 import logging
+from pydantic import ValidationError
 
 from app.core.database import get_db
+from app.core.config import settings
 from app.core.redis_client import RedisClient, get_redis
-from app.models import User, Product, ProductListing, UserWatchlist
+from app.models import User, Product, ProductListing, UserWatchlist, Platform
 from app.schemas import (
     WatchlistAddRequest,
     WatchlistUpdateRequest,
@@ -22,7 +24,7 @@ from app.schemas import (
     UserPlan
 )
 from app.api.deps import get_current_user
-from app.services.plan_catalog import get_plan_catalog, get_plan_limit
+from app.services.plan_catalog import get_plan_catalog, get_plan_limit, normalize_watchlist_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,17 +41,35 @@ async def get_product_with_best_listing(
     product_id: str,
     db: AsyncSession
 ) -> tuple:
-    """Get product and its cheapest listing"""
+    """Get product and its best listing based on platform priority and price"""
     # Get product
     product = await db.get(Product, product_id)
     if not product:
         return None, None
     
-    # Get cheapest listing
+    # Get listings ordered by platform priority (prefer non-Amazon platforms)
+    # Platform priority: flipkart > myntra > nykaa > croma > meesho > amazon
+    platform_priority = {
+        "flipkart": 1,
+        "myntra": 2,
+        "nykaa": 3,
+        "croma": 4,
+        "meesho": 5,
+        "amazon": 6,
+    }
+    
+    # Case statement for platform priority
+    priority_case = case(
+        *[(Platform.name == name, priority) for name, priority in platform_priority.items()],
+        else_=99
+    )
+    
+    # Get listings ordered by platform priority, then by price
     result = await db.execute(
         select(ProductListing)
+        .join(Platform, ProductListing.platform_id == Platform.id)
         .where(ProductListing.product_id == product_id)
-        .order_by(ProductListing.current_price.asc())
+        .order_by(priority_case.asc(), ProductListing.current_price.asc())
         .limit(1)
     )
     listing = result.scalar_one_or_none()
@@ -63,10 +83,37 @@ def format_watchlist_item(
     listing: ProductListing
 ) -> WatchlistItemResponse:
     """Format watchlist item for response"""
-    # Calculate price change percentage
+    # Calculate price change using alert history (same logic as notifications)
     price_change = None
-    if listing and listing.original_price and listing.original_price > 0:
-        price_change = ((listing.original_price - listing.current_price) / listing.original_price) * 100
+    previous_price = None
+    price_change_direction = None  # 'up' or 'down'
+    
+    if listing and listing.current_price is not None:
+        current_price = float(listing.current_price)
+        
+        # Try to get previous price from alert history
+        alert_history = watchlist_item.user.alert_history if watchlist_item.user else []
+        if alert_history:
+            for alert in reversed(alert_history):
+                if alert.get("product_id") == str(watchlist_item.product_id) and alert.get("price") is not None:
+                    previous_price = float(alert.get("price"))
+                    if current_price > previous_price:
+                        price_change_direction = "up"
+                        price_change = ((current_price - previous_price) / previous_price) * 100
+                    elif current_price < previous_price:
+                        price_change_direction = "down"
+                        price_change = ((previous_price - current_price) / previous_price) * 100
+                    break
+        
+        # Fallback to original_price if no alert history
+        if previous_price is None and listing.original_price and listing.original_price > 0:
+            original_price = float(listing.original_price)
+            if current_price > original_price:
+                price_change_direction = "up"
+                price_change = ((current_price - original_price) / original_price) * 100
+            elif current_price < original_price:
+                price_change_direction = "down"
+                price_change = ((original_price - current_price) / original_price) * 100
     
     # Check if target price is reached
     is_target_reached = False
@@ -86,7 +133,10 @@ def format_watchlist_item(
         image_url=product.image_url if product else None,
         product_url=listing.product_url if listing else "",
         in_stock=listing.in_stock if listing else False,
+        price_change=Decimal(str(round(price_change, 2))) if price_change else None,
         price_change_percentage=Decimal(str(round(price_change, 2))) if price_change else None,
+        previous_price=Decimal(str(round(previous_price, 2))) if previous_price else None,
+        price_change_direction=price_change_direction,
         is_target_reached=is_target_reached
     )
 
@@ -106,9 +156,10 @@ async def _get_watchlist_state(user: User, db: AsyncSession) -> dict:
     plan_catalog = await get_plan_catalog(db)
     usage_stats = dict(user.usage_stats or {})
     current_plan = str(user.plan).lower()
-    base_limit = get_plan_limit(plan_catalog, current_plan, "watchlist_limit", 5)
+    base_limit = get_plan_limit(plan_catalog, current_plan, "watchlist_limit", settings.PLAN_FREE_WISHLIST)
+    base_limit = normalize_watchlist_limit(base_limit, current_plan)
     watchlist_bonus = int(usage_stats.get("watchlist_bonus") or 0)
-    limit = base_limit + watchlist_bonus
+    limit = max(0, base_limit + watchlist_bonus)
     grace_until = _parse_datetime(usage_stats.get("watchlist_grace_until"))
     now = datetime.utcnow()
     grace_active = bool(grace_until and grace_until > now)
@@ -173,7 +224,13 @@ async def get_watchlist(
     
     if cached:
         logger.info(f"Watchlist cache HIT | User: {user.id}")
-        return WatchlistResponse(**cached)
+        try:
+            return WatchlistResponse(**cached)
+        except ValidationError:
+            logger.warning(
+                f"Watchlist cache invalid; rebuilding from DB | User: {user.id}"
+            )
+            await redis.delete(cache_key)
     
     watchlist_state = await _get_watchlist_state(user, db)
 

@@ -13,6 +13,7 @@ from datetime import datetime
 import uuid
 
 from app.core.database import Base
+from app.core.config import settings
 
 
 # =============================================================================
@@ -377,7 +378,7 @@ class SubscriptionPlan(Base):
     
     # Features as JSON
     features = Column(JSONB, nullable=False, default={
-        "daily_searches": 10,
+        "daily_searches": settings.PLAN_FREE_SEARCHES,
         "watchlist_limit": 5,
         "price_alerts": False,
         "ai_chat_queries": 0,

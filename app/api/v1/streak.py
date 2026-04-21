@@ -6,9 +6,10 @@ Daily check-ins, rewards, and milestones
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime, timedelta, date
 from decimal import Decimal
+import re
 import logging
 
 from app.core.database import get_db
@@ -39,26 +40,11 @@ FREEZE_LIMITS = {
 }
 
 DEFAULT_MILESTONES = [
-    # Early milestones - Quick wins
-    {"days": 3, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🔥", "badge_name": "Fire Starter", "description": "+5 bonus searches"},
-    {"days": 5, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🏆", "badge_name": "5-Day Warrior", "description": "+5 daily extra searches"},
+    # Short-term milestones only (admin can extend later).
+    {"days": 5, "reward_type": "searches", "reward_value": 10, "badge_emoji": "🏆", "badge_name": "5-Day Warrior", "description": "+10 extra searches"},
     {"days": 7, "reward_type": "watchlist_slots", "reward_value": 1, "badge_emoji": "⭐", "badge_name": "Week Warrior", "description": "+1 watchlist slot"},
-    {"days": 10, "reward_type": "watchlist_slots", "reward_value": 2, "badge_emoji": "🌟", "badge_name": "10-Day Legend", "description": "+2 watchlist slots"},
-    
-    # Mid-tier milestones - Building consistency
-    {"days": 15, "reward_type": "watchlist_slots", "reward_value": 5, "badge_emoji": "💪", "badge_name": "Dedicated Hunter", "description": "+5 watchlist slots"},
-    {"days": 20, "reward_type": "unlimited_search_hours", "reward_value": 6, "badge_emoji": "🕒", "badge_name": "Search Master", "description": "6 hours unlimited search"},
-    {"days": 30, "reward_type": "premium_days", "reward_value": 10, "badge_emoji": "👑", "badge_name": "Monthly Champion", "description": "+10 days free subscription"},
-    
-    # Advanced milestones - Long-term commitment
-    {"days": 45, "reward_type": "watchlist_slots", "reward_value": 10, "badge_emoji": "📈", "badge_name": "Watchlist Expert", "description": "+10 watchlist slots"},
-    {"days": 60, "reward_type": "premium_days", "reward_value": 14, "badge_emoji": "💎", "badge_name": "Diamond Hunter", "description": "+14 days free subscription"},
-    {"days": 90, "reward_type": "free_month", "reward_value": 1, "badge_emoji": "📆", "badge_name": "Quarter Master", "description": "Next month completely free"},
-    
-    # Elite milestones - Ultimate rewards
-    {"days": 100, "reward_type": "premium_days", "reward_value": 30, "badge_emoji": "🏆", "badge_name": "Century Champion", "description": "+30 days free subscription"},
-    {"days": 180, "reward_type": "free_month", "reward_value": 2, "badge_emoji": "📆", "badge_name": "Half-Year Hero", "description": "Next 2 months completely free"},
-    {"days": 365, "reward_type": "premium_days", "reward_value": 90, "badge_emoji": "🎖️", "badge_name": "Legendary Saver", "description": "+90 days free subscription"},
+    {"days": 10, "reward_type": "searches", "reward_value": 5, "badge_emoji": "🌟", "badge_name": "10-Day Legend", "description": "+5 extra searches +1 watchlist slot"},
+    {"days": 15, "reward_type": "searches", "reward_value": 5, "badge_emoji": "💪", "badge_name": "Dedicated Hunter", "description": "+5 extra searches +2 watchlist slots"},
 ]
 
 
@@ -112,36 +98,48 @@ def create_streak_notification(user_id, title: str, message: str, data: Optional
     )
 
 
-def get_next_milestone(current_streak: int, claimed_milestones: List[int]) -> Optional[int]:
+def get_next_milestone(
+    current_streak: int,
+    claimed_milestones: List[int],
+    milestone_days: Optional[List[int]] = None,
+) -> Optional[int]:
     """Get next unclaimed milestone"""
-    for milestone in DEFAULT_MILESTONES:
-        if milestone["days"] > current_streak and milestone["days"] not in claimed_milestones:
-            return milestone["days"]
+    source_days = milestone_days or [int(m["days"]) for m in DEFAULT_MILESTONES]
+    for day in sorted({int(d) for d in source_days if int(d) > 0}):
+        if day > current_streak and day not in claimed_milestones:
+            return day
     return None
+
+
+async def _seed_default_milestones_if_empty(db: AsyncSession) -> bool:
+    """Seed streak_milestones table with defaults when no rows exist."""
+    existing_result = await db.execute(select(StreakMilestone.id).limit(1))
+    if existing_result.scalar_one_or_none() is not None:
+        return False
+
+    for item in DEFAULT_MILESTONES:
+        db.add(
+            StreakMilestone(
+                streak_days=int(item["days"]),
+                reward_type=str(item["reward_type"]),
+                reward_value=int(item["reward_value"]),
+                badge_emoji=item.get("badge_emoji"),
+                badge_name=item.get("badge_name"),
+                announcement_text=item.get("description"),
+                confetti_enabled=True,
+                is_active=True,
+                sort_order=int(item["days"]),
+            )
+        )
+
+    await db.commit()
+    logger.info("Seeded default streak milestones into DB")
+    return True
 
 
 async def get_milestones_from_db(db: AsyncSession) -> List[dict]:
     """Get milestones from database or use defaults"""
-    normalized_overrides = {
-        5: {
-            "reward_type": "searches",
-            "reward_value": 5,
-            "badge_emoji": "🏆",
-            "badge_name": "5-Day Warrior",
-        },
-        7: {
-            "reward_type": "watchlist_slots",
-            "reward_value": 1,
-            "badge_emoji": "⭐",
-            "badge_name": "Week Warrior",
-        },
-        10: {
-            "reward_type": "watchlist_slots",
-            "reward_value": 2,
-            "badge_emoji": "🌟",
-            "badge_name": "10-Day Legend",
-        },
-    }
+    await _seed_default_milestones_if_empty(db)
 
     result = await db.execute(
         select(StreakMilestone)
@@ -156,14 +154,104 @@ async def get_milestones_from_db(db: AsyncSession) -> List[dict]:
     return [
         {
             "days": m.streak_days,
-            "reward_type": normalized_overrides.get(m.streak_days, {}).get("reward_type", m.reward_type),
-            "reward_value": normalized_overrides.get(m.streak_days, {}).get("reward_value", m.reward_value),
-            "badge_emoji": normalized_overrides.get(m.streak_days, {}).get("badge_emoji", m.badge_emoji),
-            "badge_name": normalized_overrides.get(m.streak_days, {}).get("badge_name", m.badge_name),
-            "badge_color": m.badge_color
+            "reward_type": m.reward_type,
+            "reward_value": m.reward_value,
+            "badge_emoji": m.badge_emoji,
+            "badge_name": m.badge_name,
+            "badge_color": m.badge_color,
+            "announcement_text": m.announcement_text,
         }
         for m in db_milestones
     ]
+
+
+def _extract_secondary_reward_counts(announcement_text: Optional[str]) -> tuple[int, int]:
+    """Parse optional secondary rewards from announcement text."""
+    text = str(announcement_text or "")
+    search_matches = [int(m) for m in re.findall(r"\+(\d+)\s*(?:daily\s+)?(?:extra\s+)?search", text, flags=re.IGNORECASE)]
+    watchlist_matches = [int(m) for m in re.findall(r"\+(\d+)\s*watchlist", text, flags=re.IGNORECASE)]
+
+    return (max(search_matches) if search_matches else 0, max(watchlist_matches) if watchlist_matches else 0)
+
+
+def _calculate_milestone_limit_bonus(milestone: dict) -> Tuple[int, int]:
+    """Return (search_bonus, watchlist_bonus) represented by a milestone."""
+    reward_type = str(milestone.get("reward_type") or "").lower()
+    reward_value = int(milestone.get("reward_value") or 0)
+    search_bonus = reward_value if reward_type == "searches" else 0
+    watchlist_bonus = reward_value if reward_type == "watchlist_slots" else 0
+
+    text_search, text_watchlist = _extract_secondary_reward_counts(milestone.get("announcement_text"))
+    search_bonus = max(search_bonus, int(text_search or 0))
+    watchlist_bonus = max(watchlist_bonus, int(text_watchlist or 0))
+
+    return search_bonus, watchlist_bonus
+
+
+def _normalize_claimed_milestones(values: Optional[List]) -> List[int]:
+    claimed: List[int] = []
+    for item in values or []:
+        try:
+            claimed.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(claimed))
+
+
+async def reconcile_streak_limit_bonuses(
+    user: User,
+    db: AsyncSession,
+    milestones_config: List[dict],
+    current_streak: int,
+    claimed_milestones: List[int],
+) -> List[int]:
+    """Ensure streak-derived search/watchlist bonuses are reflected in usage stats."""
+    active_milestones = [m for m in milestones_config if int(m.get("days", 0) or 0) > 0]
+    eligible_days = {
+        int(m["days"]) for m in active_milestones if int(m.get("days", 0) or 0) <= int(current_streak or 0)
+    }
+
+    normalized_claimed = set(_normalize_claimed_milestones(claimed_milestones))
+    if eligible_days:
+        normalized_claimed.update(eligible_days)
+
+    expected_search_bonus = 0
+    expected_watchlist_bonus = 0
+    for milestone in active_milestones:
+        day = int(milestone.get("days", 0) or 0)
+        if day in normalized_claimed and day <= int(current_streak or 0):
+            search_bonus, watchlist_bonus = _calculate_milestone_limit_bonus(milestone)
+            expected_search_bonus += int(search_bonus)
+            expected_watchlist_bonus += int(watchlist_bonus)
+
+    usage_stats = dict(user.usage_stats or {})
+    current_search_bonus = int(usage_stats.get("bonus_searches", 0) or 0)
+    current_daily_search_bonus = int(usage_stats.get("daily_search_bonus", 0) or 0)
+    current_watchlist_bonus = int(usage_stats.get("watchlist_bonus", 0) or 0)
+
+    changed = False
+    if current_search_bonus < expected_search_bonus:
+        usage_stats["bonus_searches"] = expected_search_bonus
+        changed = True
+    if current_daily_search_bonus < expected_search_bonus:
+        usage_stats["daily_search_bonus"] = expected_search_bonus
+        changed = True
+    if current_watchlist_bonus < expected_watchlist_bonus:
+        usage_stats["watchlist_bonus"] = expected_watchlist_bonus
+        changed = True
+
+    normalized_list = sorted(normalized_claimed)
+    streak_data = dict(user.streak_data or {})
+    if _normalize_claimed_milestones(streak_data.get("streak_rewards_claimed", [])) != normalized_list:
+        streak_data["streak_rewards_claimed"] = normalized_list
+        user.streak_data = streak_data
+        changed = True
+
+    if changed:
+        user.usage_stats = usage_stats
+        await db.commit()
+
+    return normalized_list
 
 
 async def apply_milestone_reward(
@@ -174,6 +262,11 @@ async def apply_milestone_reward(
     """Apply milestone reward to user"""
     reward_type = milestone["reward_type"]
     reward_value = milestone["reward_value"]
+    announcement_text = milestone.get("announcement_text")
+    search_from_text, watchlist_from_text = _extract_secondary_reward_counts(announcement_text)
+    applied_searches = 0
+    applied_watchlist = 0
+    message_parts: List[str] = []
     
     if reward_type == "searches":
         # Add bonus searches (aligned with auth/stats usage key)
@@ -181,14 +274,16 @@ async def apply_milestone_reward(
         usage_stats["bonus_searches"] = int(usage_stats.get("bonus_searches", 0) or 0) + reward_value
         usage_stats["daily_search_bonus"] = int(usage_stats.get("daily_search_bonus", 0) or 0) + reward_value
         user.usage_stats = usage_stats
-        return f"+{reward_value} daily extra searches"
+        applied_searches = reward_value
+        message_parts.append(f"+{reward_value} extra searches")
     
     elif reward_type == "watchlist_slots":
         # Add bonus watchlist slots
         usage_stats = dict(user.usage_stats or {})
         usage_stats["watchlist_bonus"] = usage_stats.get("watchlist_bonus", 0) + reward_value
         user.usage_stats = usage_stats
-        return f"+{reward_value} watchlist slots"
+        applied_watchlist = reward_value
+        message_parts.append(f"+{reward_value} watchlist slot{'s' if reward_value > 1 else ''}")
     
     elif reward_type == "unlimited_search_hours":
         # Add unlimited search hours
@@ -209,7 +304,7 @@ async def apply_milestone_reward(
         
         usage_stats["unlimited_search_until"] = new_until.isoformat()
         user.usage_stats = usage_stats
-        return f"{reward_value} hours unlimited search"
+        message_parts.append(f"{reward_value} hours unlimited search")
     
     elif reward_type == "premium_days":
         # Add premium days
@@ -220,7 +315,7 @@ async def apply_milestone_reward(
             user.plan_expires_at = user.plan_expires_at + timedelta(days=reward_value)
         else:
             user.plan_expires_at = datetime.utcnow() + timedelta(days=reward_value)
-        return f"+{reward_value} days premium"
+        message_parts.append(f"+{reward_value} days premium")
     
     elif reward_type == "free_month":
         # Give free month(s)
@@ -231,13 +326,31 @@ async def apply_milestone_reward(
             user.plan_expires_at = user.plan_expires_at + timedelta(days=30 * reward_value)
         else:
             user.plan_expires_at = datetime.utcnow() + timedelta(days=30 * reward_value)
-        return f"{reward_value} month{'s' if reward_value > 1 else ''} completely free"
+        message_parts.append(f"{reward_value} month{'s' if reward_value > 1 else ''} completely free")
     
     elif reward_type == "badge":
         # Badge is automatically added via claimed milestones
-        return f"Badge: {milestone.get('badge_name', 'New Badge')}"
-    
-    return "Reward applied"
+        message_parts.append(f"Badge: {milestone.get('badge_name', 'New Badge')}")
+
+    # Secondary reward support from announcement text (for mixed rewards like +search +watchlist).
+    extra_searches = max(0, int(search_from_text) - int(applied_searches))
+    if extra_searches > 0:
+        usage_stats = dict(user.usage_stats or {})
+        usage_stats["bonus_searches"] = int(usage_stats.get("bonus_searches", 0) or 0) + extra_searches
+        usage_stats["daily_search_bonus"] = int(usage_stats.get("daily_search_bonus", 0) or 0) + extra_searches
+        user.usage_stats = usage_stats
+        message_parts.append(f"+{extra_searches} extra searches")
+
+    extra_watchlist = max(0, int(watchlist_from_text) - int(applied_watchlist))
+    if extra_watchlist > 0:
+        usage_stats = dict(user.usage_stats or {})
+        usage_stats["watchlist_bonus"] = int(usage_stats.get("watchlist_bonus", 0) or 0) + extra_watchlist
+        user.usage_stats = usage_stats
+        message_parts.append(f"+{extra_watchlist} watchlist slot{'s' if extra_watchlist > 1 else ''}")
+
+    if message_parts:
+        return " + ".join(message_parts)
+    return announcement_text or "Reward applied"
 
 
 # =============================================================================
@@ -274,21 +387,18 @@ async def daily_check_in(
     longest_streak = streak_data.get("longest_streak", 0)
     total_check_ins = streak_data.get("total_check_ins", 0)
     claimed_milestones_raw = streak_data.get("streak_rewards_claimed", [])
-    claimed_milestones = []
-    for item in claimed_milestones_raw:
-        try:
-            claimed_milestones.append(int(item))
-        except (TypeError, ValueError):
-            continue
+    claimed_milestones = _normalize_claimed_milestones(claimed_milestones_raw)
     
     # Check if already checked in today
     if not can_check_in_today(last_check_in):
+        milestones = await get_milestones_from_db(db)
+        milestone_days = [int(m["days"]) for m in milestones]
         return StreakCheckInResponse(
             success=False,
             current_streak=current_streak,
             max_streak=longest_streak,
             reward_unlocked=None,
-            next_milestone=get_next_milestone(current_streak, claimed_milestones),
+            next_milestone=get_next_milestone(current_streak, claimed_milestones, milestone_days),
             next_milestone_reward=None,
             message="Already checked in today! Come back tomorrow.",
             confetti=False
@@ -360,11 +470,20 @@ async def daily_check_in(
         )
     
     await db.commit()
+
+    # Final safety sync: keep usage limits consistent with claimed/eligible milestones.
+    claimed_milestones = await reconcile_streak_limit_bonuses(
+        user=user,
+        db=db,
+        milestones_config=milestones,
+        current_streak=current_streak,
+        claimed_milestones=claimed_milestones,
+    )
     
-    # Invalidate cache
+    # Invalidate ALL related caches COMPLETELY
     await redis.delete(f"streak:{user.id}")
-    if reward_unlocked:
-        await redis.delete(f"watchlist:{user.id}")
+    await redis.delete(f"watchlist:{user.id}")
+    await redis.delete_pattern(f"user:*{user.id}*")
     
     # Track in Redis for analytics
     await redis.increment(f"check_ins:daily:{date.today().isoformat()}")
@@ -375,12 +494,13 @@ async def daily_check_in(
     )
     
     # Get next milestone
-    next_milestone = get_next_milestone(current_streak, claimed_milestones)
+    milestone_days = [int(m["days"]) for m in milestones]
+    next_milestone = get_next_milestone(current_streak, claimed_milestones, milestone_days)
     next_reward = None
     if next_milestone:
         for m in milestones:
             if m["days"] == next_milestone:
-                next_reward = f"{m['reward_value']} {m['reward_type']}"
+                next_reward = m.get("announcement_text") or f"{m['reward_value']} {m['reward_type']}"
                 break
     
     return StreakCheckInResponse(
@@ -432,7 +552,7 @@ async def get_streak_status(
     longest_streak = streak_data.get("longest_streak", 0)
     total_check_ins = streak_data.get("total_check_ins", 0)
     last_check_in = streak_data.get("last_check_in")
-    claimed_milestones = streak_data.get("streak_rewards_claimed", [])
+    claimed_milestones = _normalize_claimed_milestones(streak_data.get("streak_rewards_claimed", []))
     freeze_count = streak_data.get("freeze_count", get_freeze_limit(user.plan))
     
     # Check if can check in today
@@ -443,6 +563,14 @@ async def get_streak_status(
     
     # Get milestones
     milestones_config = await get_milestones_from_db(db)
+
+    claimed_milestones = await reconcile_streak_limit_bonuses(
+        user=user,
+        db=db,
+        milestones_config=milestones_config,
+        current_streak=current_streak,
+        claimed_milestones=claimed_milestones,
+    )
     
     milestones = []
     for m in milestones_config:
@@ -450,6 +578,7 @@ async def get_streak_status(
             days=m["days"],
             reward_type=m["reward_type"],
             reward_value=m["reward_value"],
+            announcement_text=m.get("announcement_text"),
             badge_emoji=m.get("badge_emoji"),
             badge_name=m.get("badge_name"),
             badge_color=m.get("badge_color"),
@@ -458,7 +587,8 @@ async def get_streak_status(
         ))
     
     # Get next milestone
-    next_milestone = get_next_milestone(current_streak, claimed_milestones)
+    milestone_days = [int(m["days"]) for m in milestones_config]
+    next_milestone = get_next_milestone(current_streak, claimed_milestones, milestone_days)
     days_until_next = next_milestone - current_streak if next_milestone else None
     
     # Parse last check-in date
@@ -580,6 +710,7 @@ async def get_all_milestones(
             days=m["days"],
             reward_type=m["reward_type"],
             reward_value=m["reward_value"],
+            announcement_text=m.get("announcement_text"),
             badge_emoji=m.get("badge_emoji"),
             badge_name=m.get("badge_name"),
             badge_color=m.get("badge_color"),
@@ -676,7 +807,6 @@ async def debug_reset_streak(
     today = datetime.utcnow().date().isoformat()
     await redis.delete(f"streak:{user.id}")
     await redis.delete(f"watchlist:{user.id}")
-    await redis.delete(f"user_quota:{user.id}:{today}")
 
     return {
         "success": True,

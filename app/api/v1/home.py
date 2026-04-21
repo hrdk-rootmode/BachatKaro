@@ -402,3 +402,54 @@ async def get_category_products(
     except Exception as e:
         logger.error(f"Error fetching category products: {e}", exc_info=True)
         return []
+
+
+@router.get("/recently-price-changed", response_model=List[TrendingProductResponse])
+async def get_recently_price_changed(
+    days: int = 7,
+    limit: int = 50,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get products with recent price changes for home page
+    
+    ✅ Direct DB access (no cache)
+    ✅ Sorted by most recent price change
+    ✅ Real-time price change data
+    """
+    try:
+        query_service = QueryService(db)
+        
+        # Get products with recent price changes
+        product_listing_pairs = await query_service.get_recently_price_changed_products(
+            days=days,
+            limit=limit
+        )
+        
+        if not product_listing_pairs:
+            logger.info(f"No recently price-changed products available | User: {user.id}")
+            return []
+        
+        # Format responses
+        recently_changed = []
+        for product, listing in product_listing_pairs:
+            try:
+                # Get all listings for this product to calculate platform count
+                all_listings = await query_service.get_product_listings(str(product.id))
+                valid_listings = BusinessLogic.filter_valid_listings(all_listings, product)
+                platform_count = len(valid_listings)
+                
+                response = BusinessLogic.format_trending_response(product, listing, platform_count=platform_count)
+                response.rank = len(recently_changed) + 1
+                recently_changed.append(response)
+            except Exception as e:
+                logger.error(f"Error formatting recently changed product {product.id}: {e}")
+                continue
+        
+        logger.info(f"Recently price-changed products: {len(recently_changed)} | User: {user.id}")
+        return recently_changed
+        
+    except Exception as e:
+        logger.error(f"Error fetching recently price-changed products: {e}", exc_info=True)
+        return []

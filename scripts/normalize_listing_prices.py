@@ -10,12 +10,11 @@ What it fixes:
 
 Safety features:
 - Dry-run mode by default
-- Optional backup table before applying changes
 - Optional history recording when current_price changes
 
 Usage examples:
   python scripts/normalize_listing_prices.py --platform flipkart --dry-run
-  python scripts/normalize_listing_prices.py --platform flipkart --apply --backup
+    python scripts/normalize_listing_prices.py --platform flipkart --apply
   python scripts/normalize_listing_prices.py --platform amazon --apply --no-history
 """
 
@@ -27,7 +26,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Tuple
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -132,7 +131,7 @@ async def _append_history_if_changed(db, listing: ProductListing, new_price: flo
     return True
 
 
-async def run(platform_name: str, apply_changes: bool, backup: bool, record_history: bool, limit: Optional[int]) -> None:
+async def run(platform_name: str, apply_changes: bool, record_history: bool, limit: Optional[int]) -> None:
     async with async_session_maker() as db:
         platform_id = await db.scalar(
             select(Platform.id).where(func.lower(Platform.name) == platform_name.lower())
@@ -154,24 +153,6 @@ async def run(platform_name: str, apply_changes: bool, backup: bool, record_hist
         if not listings:
             print("no_listings_found=1")
             return
-
-        if apply_changes and backup:
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            safe_platform = "".join(ch for ch in platform_name.lower() if ch.isalnum() or ch == "_")
-            backup_table = f"price_fix_backup_{safe_platform}_{timestamp}"
-            await db.execute(
-                text(
-                    f"""
-                    CREATE TABLE {backup_table} AS
-                    SELECT pl.*
-                    FROM product_listings pl
-                    JOIN platforms pf ON pf.id = pl.platform_id
-                    WHERE lower(pf.name) = :platform_name
-                    """
-                ),
-                {"platform_name": platform_name.lower()},
-            )
-            print(f"backup_table={backup_table}")
 
         scanned = 0
         changed_rows = 0
@@ -257,7 +238,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Normalize listing prices safely")
     parser.add_argument("--platform", required=True, help="Platform name, e.g. flipkart")
     parser.add_argument("--apply", action="store_true", help="Apply changes to DB")
-    parser.add_argument("--backup", action="store_true", help="Create backup table before applying")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes only")
     parser.add_argument("--no-history", action="store_true", help="Do not append price history on current_price changes")
     parser.add_argument("--limit", type=int, default=0, help="Optional listing limit")
@@ -271,7 +251,6 @@ if __name__ == "__main__":
         run(
             platform_name=args.platform,
             apply_changes=apply_changes,
-            backup=bool(args.backup),
             record_history=not bool(args.no_history),
             limit=args.limit if args.limit and args.limit > 0 else None,
         )

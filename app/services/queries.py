@@ -689,3 +689,42 @@ class QueryService:
             .order_by(ProductListing.last_scraped.asc().nullsfirst())
         )
         return result.scalars().all()
+
+    async def get_recently_price_changed_products(
+        self,
+        days: int = 7,
+        limit: int = 50
+    ) -> List[Tuple[Product, ProductListing]]:
+        """
+        Get products with recent price changes.
+        
+        Args:
+            days: Number of days to look back for price changes
+            limit: Maximum number of products to return
+            
+        Returns:
+            List of tuples: (Product, ProductListing) sorted by most recent price change
+        """
+        self.logger.debug(f"Query: get_recently_price_changed_products(days={days}, limit={limit})")
+        
+        cutoff_time = datetime.utcnow() - timedelta(days=days)
+        
+        # Get listings with recent price changes
+        result = await self.db.execute(
+            select(ProductListing, Product)
+            .join(Product, ProductListing.product_id == Product.id)
+            .where(
+                ProductListing.last_price_change_at >= cutoff_time,
+                ProductListing.current_price.isnot(None),
+                Product.image_url.isnot(None),
+                Product.title.isnot(None)
+            )
+            .order_by(ProductListing.last_price_change_at.desc())
+            .limit(limit)
+        )
+        
+        rows = result.all()
+        self.logger.debug(f"Found {len(rows)} products with recent price changes")
+        
+        # Return as list of (Product, ProductListing) tuples
+        return [(product, listing) for listing, product in rows]

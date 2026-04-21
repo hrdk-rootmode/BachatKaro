@@ -25,7 +25,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, update, delete, text, cast, String
+from sqlalchemy import select, func, and_, or_, update, delete, text, cast, String, Date
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 from bs4 import BeautifulSoup
@@ -50,7 +50,7 @@ from app.schemas import (
     # System
     SystemHealthResponse, SystemStatsResponse, ForceScrapeRequest, 
     ForceScrapeResponse, AppConfigUpdateRequest, MaintenanceModeRequest,
-    SubscriptionPlanUpdateRequest,
+    SubscriptionPlanUpdateRequest, StreakMilestoneConfigUpsertRequest,
     # Jobs
     SchedulerStatusResponse, TriggerJobRequest, TriggerJobResponse,
     # Scraper Testing
@@ -385,6 +385,23 @@ def serialize_subscription_plan(plan: SubscriptionPlan) -> dict:
         "tagline": plan.tagline,
         "features": features,
         "updated_at": plan.updated_at.isoformat() if plan.updated_at else None,
+    }
+
+
+def serialize_streak_milestone(milestone: StreakMilestone) -> dict:
+    """Serialize streak milestone row to admin-friendly payload."""
+    return {
+        "id": int(milestone.id),
+        "streak_days": int(milestone.streak_days),
+        "reward_type": str(milestone.reward_type),
+        "reward_value": int(milestone.reward_value),
+        "badge_emoji": milestone.badge_emoji,
+        "badge_name": milestone.badge_name,
+        "badge_color": milestone.badge_color,
+        "announcement_text": milestone.announcement_text,
+        "confetti_enabled": bool(milestone.confetti_enabled),
+        "is_active": bool(milestone.is_active),
+        "sort_order": int(milestone.sort_order or 0),
     }
 
 
@@ -1619,7 +1636,8 @@ async def update_listing_price(
     listing_id: str,
     update_data: dict,
     user: User = Depends(get_current_admin_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_redis)
 ):
     """Update listing price for admin"""
     await verify_admin_email(user)
@@ -1647,6 +1665,32 @@ async def update_listing_price(
     )
     
     await db.commit()
+    
+    # Invalidate watchlist cache for all users who have this product in their watchlist
+    from sqlalchemy import select
+    from app.models import UserWatchlist
+    
+    result = await db.execute(
+        select(UserWatchlist.user_id).where(UserWatchlist.product_id == listing.product_id)
+    )
+    user_ids = result.scalars().all()
+    
+    for user_id in user_ids:
+        await redis.delete(f"watchlist:{user_id}")
+    
+    logger.info(f"Invalidated watchlist cache for {len(user_ids)} users after price update for product {listing.product_id}")
+    
+    # Trigger price alert job immediately to check for price drops
+    try:
+        from jobs.check_price_alerts import run_check_price_alerts
+        import asyncio
+        
+        # Run in background without blocking
+        asyncio.create_task(run_check_price_alerts())
+        logger.info("Price alert job triggered immediately after price update")
+    except Exception as e:
+        logger.warning(f"Failed to trigger price alert job: {e}")
+    
     return {"success": True, "message": "Listing price updated"}
 
 @router.get("/listings/{listing_id}/price-history", response_model=dict)
@@ -1686,6 +1730,7 @@ async def get_listing_price_history(
     history_list = []
     for point in history_points:
         history_list.append({
+            "id": str(point.id),
             "price": float(point.price),
             "in_stock": point.in_stock,
             "recorded_at": point.recorded_at.isoformat() if point.recorded_at else None
@@ -1737,6 +1782,47 @@ async def add_price_history_point(
     
     await db.commit()
     return {"success": True, "message": "Price history point added"}
+
+@router.delete("/listings/{listing_id}/price-history/{history_id}", response_model=dict)
+async def delete_price_history_point(
+    listing_id: str,
+    history_id: str,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a specific price history point for a listing"""
+    await verify_admin_email(user)
+    
+    try:
+        lid = UUID(listing_id)
+        hid = int(history_id)  # PriceHistory.id is an integer, not UUID
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing ID or history ID")
+    
+    # Verify listing exists
+    listing = await db.get(ProductListing, lid)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    
+    # Delete the price history point
+    from sqlalchemy import delete as sql_delete
+    delete_stmt = sql_delete(PriceHistory).where(
+        PriceHistory.id == hid,
+        PriceHistory.product_listing_id == lid
+    )
+    result = await db.execute(delete_stmt)
+    
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Price history point not found")
+    
+    await log_action(
+        db, user.email, "deleted_price_history",
+        listing_id,
+        details={"history_id": str(hid)}
+    )
+    
+    await db.commit()
+    return {"success": True, "message": "Price history point deleted"}
 
 @router.get("/listings/{listing_id}/performance", response_model=dict)
 async def get_listing_performance(
@@ -2443,7 +2529,7 @@ async def get_system_logs(
         .order_by(SystemLog.log_date.desc())
     )
     logs = result.scalars().all()
-    
+
     return {
         "logs": [
             {
@@ -2456,6 +2542,106 @@ async def get_system_logs(
             for log in logs
         ],
         "period_days": days
+    }
+
+
+@router.get("/system/products-analysis", response_model=dict)
+async def get_products_analysis(
+    days: int = Query(30, ge=7, le=90),
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get product and listing focused scrape analytics for dashboard charts."""
+    await verify_admin_email(user)
+
+    since_date = date.today() - timedelta(days=days - 1)
+    since_dt = datetime.combine(since_date, datetime.min.time())
+
+    total_products_result = await db.execute(select(func.count(Product.id)))
+    total_products = total_products_result.scalar() or 0
+
+    total_listings_result = await db.execute(select(func.count(ProductListing.id)))
+    total_listings = total_listings_result.scalar() or 0
+
+    active_products_result = await db.execute(
+        select(func.count(func.distinct(ProductListing.product_id))).where(ProductListing.in_stock == True)
+    )
+    active_products = active_products_result.scalar() or 0
+
+    scraped_today_products_result = await db.execute(
+        select(func.count(func.distinct(ProductListing.product_id))).where(
+            ProductListing.last_scraped >= datetime.combine(date.today(), datetime.min.time())
+        )
+    )
+    products_scraped_today = scraped_today_products_result.scalar() or 0
+
+    scraped_today_listings_result = await db.execute(
+        select(func.count(ProductListing.id)).where(
+            ProductListing.last_scraped >= datetime.combine(date.today(), datetime.min.time())
+        )
+    )
+    listings_scraped_today = scraped_today_listings_result.scalar() or 0
+
+    scrape_date_expr = cast(ProductListing.last_scraped, Date)
+    daily_history_result = await db.execute(
+        select(
+            scrape_date_expr.label("scrape_date"),
+            func.count(func.distinct(ProductListing.product_id)).label("products_scraped"),
+            func.count(ProductListing.id).label("listings_scraped"),
+        )
+        .where(
+            ProductListing.last_scraped.is_not(None),
+            ProductListing.last_scraped >= since_dt,
+        )
+        .group_by(scrape_date_expr)
+        .order_by(scrape_date_expr)
+    )
+
+    daily_scrape_history = []
+    for row in daily_history_result.all():
+        scrape_date = row.scrape_date
+        if hasattr(scrape_date, "isoformat"):
+            scrape_date_value = scrape_date.isoformat()
+        else:
+            scrape_date_value = str(scrape_date)
+
+        daily_scrape_history.append(
+            {
+                "date": scrape_date_value,
+                "products_scraped": int(row.products_scraped or 0),
+                "listings_scraped": int(row.listings_scraped or 0),
+            }
+        )
+
+    category_result = await db.execute(
+        select(
+            Product.category.label("category"),
+            func.count(Product.id).label("count"),
+        )
+        .group_by(Product.category)
+        .order_by(func.count(Product.id).desc())
+    )
+
+    category_breakdown: Dict[str, int] = {}
+    for row in category_result.all():
+        count = int(row.count or 0)
+        if count <= 0:
+            continue
+
+        category_key = str(row.category).strip() if row.category else "uncategorized"
+        category_breakdown[category_key] = category_breakdown.get(category_key, 0) + count
+
+    return {
+        "days": days,
+        "totals": {
+            "total_products": int(total_products),
+            "total_listings": int(total_listings),
+            "active_products": int(active_products),
+            "products_scraped_today": int(products_scraped_today),
+            "listings_scraped_today": int(listings_scraped_today),
+        },
+        "daily_scrape_history": daily_scrape_history,
+        "category_breakdown": category_breakdown,
     }
 
 
@@ -2704,6 +2890,118 @@ async def update_subscription_plan_config(
         "success": True,
         "plan": serialize_subscription_plan(plan),
         "message": f"Subscription plan '{normalized_name}' updated successfully",
+    }
+
+
+@router.get("/system/streak-milestones", response_model=dict)
+async def list_streak_milestones_config(
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List streak milestone reward configuration from DB for admin editing."""
+    await verify_admin_email(user)
+
+    # Bootstrap defaults so admin always has editable streak entries.
+    from app.api.v1.streak import _seed_default_milestones_if_empty
+    await _seed_default_milestones_if_empty(db)
+
+    result = await db.execute(
+        select(StreakMilestone).order_by(StreakMilestone.streak_days.asc(), StreakMilestone.id.asc())
+    )
+    milestones = result.scalars().all()
+
+    return {
+        "milestones": [serialize_streak_milestone(m) for m in milestones]
+    }
+
+
+@router.put("/system/streak-milestones/{streak_days}", response_model=dict)
+async def upsert_streak_milestone_config(
+    streak_days: int,
+    request: Request,
+    milestone_update: StreakMilestoneConfigUpsertRequest,
+    user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+    redis_client: RedisClient = Depends(get_redis),
+):
+    """Create or update streak milestone rewards and propagate cache invalidation."""
+    await verify_admin_email(user)
+
+    if streak_days <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="streak_days must be >= 1")
+
+    result = await db.execute(
+        select(StreakMilestone).where(StreakMilestone.streak_days == streak_days)
+    )
+    milestone = result.scalar_one_or_none()
+    created = False
+
+    if milestone is None:
+        if milestone_update.reward_type is None or milestone_update.reward_value is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="reward_type and reward_value are required when creating a new milestone",
+            )
+        milestone = StreakMilestone(
+            streak_days=streak_days,
+            reward_type=milestone_update.reward_type,
+            reward_value=milestone_update.reward_value,
+            is_active=True,
+            sort_order=streak_days,
+        )
+        db.add(milestone)
+        created = True
+
+    if milestone_update.reward_type is not None:
+        milestone.reward_type = milestone_update.reward_type
+    if milestone_update.reward_value is not None:
+        milestone.reward_value = milestone_update.reward_value
+    if milestone_update.badge_emoji is not None:
+        milestone.badge_emoji = milestone_update.badge_emoji
+    if milestone_update.badge_name is not None:
+        milestone.badge_name = milestone_update.badge_name
+    if milestone_update.badge_color is not None:
+        milestone.badge_color = milestone_update.badge_color
+    if milestone_update.announcement_text is not None:
+        milestone.announcement_text = milestone_update.announcement_text
+    if milestone_update.confetti_enabled is not None:
+        milestone.confetti_enabled = milestone_update.confetti_enabled
+    if milestone_update.is_active is not None:
+        milestone.is_active = milestone_update.is_active
+    if milestone_update.sort_order is not None:
+        milestone.sort_order = milestone_update.sort_order
+
+    await db.commit()
+    await db.refresh(milestone)
+
+    # Force streak/watchlist recalculation payloads to refresh on next fetch.
+    await redis_client.delete_pattern("streak:*")
+    await redis_client.delete_pattern("watchlist:*")
+
+    await log_action(
+        db,
+        user.email,
+        "created_streak_milestone" if created else "updated_streak_milestone",
+        str(streak_days),
+        details={
+            "streak_days": int(milestone.streak_days),
+            "reward_type": milestone.reward_type,
+            "reward_value": int(milestone.reward_value),
+            "is_active": bool(milestone.is_active),
+            "confetti_enabled": bool(milestone.confetti_enabled),
+        },
+        request=request,
+    )
+
+    return {
+        "success": True,
+        "milestone": serialize_streak_milestone(milestone),
+        "created": created,
+        "message": (
+            f"Streak milestone {streak_days} created successfully"
+            if created
+            else f"Streak milestone {streak_days} updated successfully"
+        ),
     }
 
 

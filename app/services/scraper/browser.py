@@ -14,10 +14,18 @@ Version: 2.0.0 - God Mode Edition
 """
 
 import logging
-import asyncio
+import sys
+
+# Fix NotImplementedError on Windows for asyncio subprocess
+# Playwright requires WindowsProactorEventLoopPolicy on Windows for subprocess support
+if sys.platform == 'win32':
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+else:
+    import asyncio
+    
 import random
 import json
-import sys
 from typing import Optional, List, Dict, Any, Callable, Set
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field

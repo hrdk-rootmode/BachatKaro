@@ -3,11 +3,10 @@
 Reset and rebuild Flipkart prices.
 
 Flow:
-1. Backup flipkart listings and price history.
-2. Reset all flipkart listing price fields.
-3. Delete flipkart price_history rows.
-4. Re-scrape each flipkart listing URL and store normalized prices.
-5. Rebuild price_history baseline from fresh scraped price.
+1. Reset all flipkart listing price fields.
+2. Delete flipkart price_history rows.
+3. Re-scrape each flipkart listing URL and store normalized prices.
+4. Rebuild price_history baseline from fresh scraped price.
 
 Usage:
   python scripts/reset_and_rebuild_flipkart_prices.py
@@ -99,34 +98,6 @@ async def main() -> None:
             print("flipkart_listings_found=0")
             return
 
-        listings_backup_table = f"fk_listings_backup_{ts}"
-        history_backup_table = f"fk_price_history_backup_{ts}"
-
-        await db.execute(
-            text(
-                f"""
-                CREATE TABLE {listings_backup_table} AS
-                SELECT *
-                FROM product_listings
-                WHERE platform_id = :platform_id
-                """
-            ),
-            {"platform_id": platform_id},
-        )
-
-        await db.execute(
-            text(
-                f"""
-                CREATE TABLE {history_backup_table} AS
-                SELECT ph.*
-                FROM price_history ph
-                JOIN product_listings pl ON pl.id = ph.product_listing_id
-                WHERE pl.platform_id = :platform_id
-                """
-            ),
-            {"platform_id": platform_id},
-        )
-
         await db.execute(
             update(ProductListing)
             .where(ProductListing.platform_id == platform_id)
@@ -155,8 +126,7 @@ async def main() -> None:
         await db.commit()
 
         print("--- reset completed ---")
-        print(f"listings_backup_table={listings_backup_table}")
-        print(f"history_backup_table={history_backup_table}")
+        print("backup_tables_created=0")
         print(f"total_listings={total_listings}")
 
         handler = await get_platform_handler("flipkart", db=db)

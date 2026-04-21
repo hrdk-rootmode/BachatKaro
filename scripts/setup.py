@@ -208,7 +208,7 @@ SUBSCRIPTION_PLANS = [
         "duration_days": 30,
         "features": {
             "daily_searches": -1,  # Unlimited
-            "watchlist_limit": -1,  # Unlimited
+            "watchlist_limit": 200,
             "price_alerts": True,
             "ai_chat_queries": -1,  # Unlimited
             "ad_free": True,

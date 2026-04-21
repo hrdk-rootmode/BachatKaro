@@ -266,18 +266,69 @@ def require_plan(min_plan: UserPlan):
 # VALIDATION
 # ============================================================================
 
-async def check_rate_limit() -> None:
+async def check_rate_limit(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+) -> None:
     """
-    Rate limiting check
+    Check user daily search limit before allowing search
     
-    DEPRECATED: No longer uses Redis rate limiting.
-    Direct database access ensures fresh data.
-    
-    Returns:
-        None - always passes (rate limiting disabled)
+    Uses DB-first plan limits with environment fallback.
+    Respects bonuses and unlimited plans.
     """
-    # Rate limiting disabled - no Redis backing
-    return
+    from app.services.plan_catalog import get_plan_config
+    
+    try:
+        plan_config = await get_plan_config(db, user.plan)
+        daily_limit = plan_config.get("limits", {}).get(
+            "searches_per_day",
+            settings.SEARCH_USAGE_DEFAULT_LIMIT,
+        )
+
+        usage_stats = dict(user.usage_stats or {})
+
+        unlimited_until = usage_stats.get("unlimited_search_until")
+        if unlimited_until:
+            try:
+                parsed_until = datetime.fromisoformat(str(unlimited_until).replace("Z", "+00:00"))
+                now = datetime.now(parsed_until.tzinfo) if parsed_until.tzinfo else datetime.utcnow()
+                if parsed_until > now:
+                    return
+            except ValueError:
+                pass
+        
+        # Unlimited check
+        if daily_limit == -1:
+            return
+
+        searches_today = int(
+            usage_stats.get("searches_today", usage_stats.get("daily_searches", 0)) or 0
+        )
+        bonus_searches = max(
+            int(usage_stats.get("bonus_searches", 0) or 0),
+            int(usage_stats.get("daily_search_bonus", 0) or 0),
+        )
+        
+        total_allowed = daily_limit + bonus_searches
+        
+        if searches_today >= total_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "error": "search_limit_reached",
+                    "message": "Daily search limit reached",
+                    "used": searches_today,
+                    "limit": total_allowed,
+                    "plan": user.plan
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.debug(f"Rate limit check skipped: {e}")
+        # Fail open - allow search if limit check fails
+        return
 
 
 async def check_hardware_id_limit(

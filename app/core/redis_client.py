@@ -365,35 +365,6 @@ async def get_cached_search(query: str) -> Optional[list]:
     return await redis_client.get_json(key)
 
 
-async def increment_user_search_count(user_id: str, date: str) -> int:
-    """
-    Track daily search count for rate limiting
-    Auto-expires at midnight
-    """
-    key = f"user_quota:{user_id}:{date}"
-    count = await redis_client.increment(key)
-    
-    # Set expiry to end of day on first increment
-    if count == 1:
-        import datetime
-        now = datetime.datetime.now()
-        end_of_day = datetime.datetime.combine(
-            now.date() + datetime.timedelta(days=1),
-            datetime.time.min
-        )
-        seconds_until_midnight = int((end_of_day - now).total_seconds())
-        await redis_client.set_expiry(key, seconds_until_midnight)
-    
-    return count
-
-
-async def get_user_search_count(user_id: str, date: str) -> int:
-    """Get current search count for user today"""
-    key = f"user_quota:{user_id}:{date}"
-    value = await redis_client.get(key)
-    return int(value) if value else 0
-
-
 async def get_redis() -> RedisClient:
     """
     FastAPI dependency - returns the global RedisClient singleton

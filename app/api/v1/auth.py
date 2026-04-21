@@ -58,7 +58,7 @@ from app.api.deps import (
     check_ip_signup_limit,
     get_app_config
 )
-from app.services.plan_catalog import get_plan_catalog, get_plan_limit
+from app.services.plan_catalog import get_plan_catalog, get_plan_limit, normalize_watchlist_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -95,6 +95,39 @@ def _normalized_user_plan(value) -> str:
     normalized = str(value or UserPlan.FREE.value).lower()
     allowed = {UserPlan.FREE.value, UserPlan.PRO.value, UserPlan.PREMIUM.value}
     return normalized if normalized in allowed else UserPlan.FREE.value
+
+
+def _extract_iso_date(value) -> Optional[str]:
+    """Extract YYYY-MM-DD from ISO datetime/date strings."""
+    raw = _safe_str(value, None)
+    if not raw:
+        return None
+
+    try:
+        if "T" in raw:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.date().isoformat()
+        parsed = datetime.fromisoformat(raw)
+        return parsed.date().isoformat()
+    except ValueError:
+        return None
+
+
+def _normalize_daily_search_usage(usage_stats: dict) -> tuple[dict, bool]:
+    """Reset today's counters when data still points to a previous date."""
+    normalized = dict(usage_stats or {})
+    today = datetime.utcnow().date().isoformat()
+
+    last_reset = _safe_str(normalized.get("last_reset"), None)
+    last_search_day = _extract_iso_date(normalized.get("last_search_date"))
+
+    if last_reset == today or last_search_day == today:
+        return normalized, False
+
+    normalized["daily_searches"] = 0
+    normalized["searches_today"] = 0
+    normalized["last_reset"] = today
+    return normalized, True
 
 
 # =============================================================================
@@ -629,12 +662,16 @@ async def get_current_user_profile(
     - Notification preferences
     - Streak information
     """
+    usage_stats = _safe_dict(user.usage_stats)
+    usage_stats, usage_changed = _normalize_daily_search_usage(usage_stats)
+
     # Keep this value fresh based on real app profile fetches.
     user.last_active = datetime.now(timezone.utc)
+    if usage_changed:
+        user.usage_stats = usage_stats
     db.add(user)
     await db.commit()
 
-    usage_stats = _safe_dict(user.usage_stats)
     phone_number = _safe_str(
         usage_stats.get("phone_number", usage_stats.get("phone")),
         None,
@@ -668,6 +705,7 @@ async def get_current_user_profile(
         city=city,
         plan=normalized_plan,
         plan_expires_at=user.plan_expires_at,
+        usage_stats=usage_stats,
         referral_code=user.referral_code or "",
         total_searches=total_searches,
         searches_today=searches_today,
@@ -684,8 +722,7 @@ async def get_current_user_profile(
 @router.get("/me/stats", response_model=UserUsageStats)
 async def get_user_stats(
     user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    redis_client: RedisClient = Depends(get_redis)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Get Detailed Usage Statistics
@@ -699,17 +736,21 @@ async def get_user_stats(
     
     plan_catalog = await get_plan_catalog(db)
     usage_stats = _safe_dict(user.usage_stats)
+    usage_stats, usage_changed = _normalize_daily_search_usage(usage_stats)
+    if usage_changed:
+        user.usage_stats = usage_stats
+        await db.commit()
+
     streak_data = _safe_dict(user.streak_data)
     watchlist = _safe_list(user.watchlist)
 
     current_plan = _normalized_user_plan(user.plan)
     daily_limit = get_plan_limit(plan_catalog, current_plan, "searches_per_day", settings.PLAN_FREE_SEARCHES)
-    
-    # Get today's search count from Redis
-    today = datetime.utcnow().date().isoformat()
-    cache_key = f"user_quota:{user.id}:{today}"
-    searches_today = await redis_client.get(cache_key)
-    searches_today = int(searches_today) if searches_today else 0
+
+    searches_today = _safe_int(
+        usage_stats.get("searches_today", usage_stats.get("daily_searches")),
+        0,
+    )
     
     # Add bonus searches.
     # Legacy users may still have rewards under daily_search_bonus only.
@@ -717,16 +758,31 @@ async def get_user_stats(
         _safe_int(usage_stats.get('bonus_searches'), 0),
         _safe_int(usage_stats.get('daily_search_bonus'), 0),
     )
+
+    unlimited_until = usage_stats.get("unlimited_search_until")
+    if unlimited_until:
+        try:
+            expires_at = datetime.fromisoformat(str(unlimited_until).replace("Z", "+00:00"))
+            now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.utcnow()
+            if expires_at > now:
+                searches_remaining = -1
+            else:
+                unlimited_until = None
+        except ValueError:
+            unlimited_until = None
     
     if daily_limit == -1:
         searches_remaining = -1  # Unlimited
+    elif unlimited_until:
+        searches_remaining = -1
     else:
         searches_remaining = max(0, daily_limit + bonus_searches - searches_today)
 
     # Calculate watchlist limit
     watchlist_limit = get_plan_limit(plan_catalog, current_plan, "watchlist_limit", settings.PLAN_FREE_WISHLIST)
+    watchlist_limit = normalize_watchlist_limit(watchlist_limit, current_plan)
     watchlist_bonus = _safe_int(usage_stats.get("watchlist_bonus"), 0)
-    effective_watchlist_limit = watchlist_limit + watchlist_bonus
+    effective_watchlist_limit = max(0, watchlist_limit + watchlist_bonus)
     
     # Calculate days remaining for subscription
     days_remaining = None
@@ -751,6 +807,39 @@ async def get_user_stats(
         plan=current_plan,
         plan_expires_at=user.plan_expires_at
     )
+
+
+@router.post("/me/stats/reset-searches")
+async def reset_search_usage_for_debug(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Development-only helper to clear today's search usage counters."""
+    if settings.ENVIRONMENT.lower() == "production" and not settings.DEBUG:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Debug search reset is disabled in production"
+        )
+
+    usage_stats = _safe_dict(user.usage_stats)
+    usage_stats["daily_searches"] = 0
+    usage_stats["searches_today"] = 0
+    usage_stats["last_reset"] = datetime.utcnow().date().isoformat()
+    usage_stats["last_search_date"] = None
+    usage_stats.pop("last_search_query", None)
+    usage_stats.pop("last_url_search", None)
+    user.usage_stats = usage_stats
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": "Today's search usage has been reset",
+        "data": {
+            "searches_today": 0,
+            "total_searches": _safe_int(usage_stats.get("total_searches"), 0),
+        },
+    }
 
 
 @router.put("/me", response_model=UserResponse)
@@ -841,6 +930,7 @@ async def update_profile(
         city=city,
         plan=normalized_plan,
         plan_expires_at=user.plan_expires_at,
+        usage_stats=usage_stats,
         referral_code=user.referral_code or "",
         total_searches=total_searches,
         searches_today=searches_today,
@@ -891,10 +981,8 @@ async def delete_account(
     
     await db.commit()
     
-    # Remove from Redis rate limit tracking
     today = datetime.utcnow().date().isoformat()
-    await redis_client.delete(f"user_quota:{user.id}:{today}")
-    
+
     # Track deletion in analytics
     await redis_client.increment(f"deletions:daily:{today}")
     

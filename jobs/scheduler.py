@@ -14,7 +14,7 @@ Schedule Overview:
 ├─ 2:00 AM  - daily_scrape (price updates)
 ├─ 2:30 AM  - daily_scrape_trending (trending products)
 ├─ 3:00 AM  - seed_products (comprehensive seeding with cross-platform matching)
-├─ 5:00 AM  - load_trending_redis (cache refresh)
+├─ 5:00 AM  - load_trending_redis (cache refresh)(i removed)
 ├─ 6h cycle - check_price_alerts (6AM, 12PM, 6PM, 12AM)
 ├─ 8:00 PM  - send_streak_reminders
 ├─ Hourly   - sync_subscriptions (Google Play)

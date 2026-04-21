@@ -266,7 +266,7 @@ class Settings(BaseSettings):
     PLAN_FREE_SEARCHES: int = 10
     PLAN_FREE_WISHLIST: int = 5
     
-    PLAN_PRO_PRICE: int = 4900  # in paise
+    PLAN_PRO_PRICE: int = 9900  # in paise
     PLAN_PRO_DURATION_DAYS: int = 30
     PLAN_PRO_SEARCHES: int = 100
     PLAN_PRO_WISHLIST: int = 50
@@ -274,9 +274,10 @@ class Settings(BaseSettings):
     PLAN_PREMIUM_PRICE: int = 14900
     PLAN_PREMIUM_DURATION_DAYS: int = 30
     PLAN_PREMIUM_SEARCHES: int = -1  # unlimited
-    PLAN_PREMIUM_WISHLIST: int = -1  # unlimited
+    PLAN_PREMIUM_WISHLIST: int = 200
     
     REWARD_AD_BONUS_SEARCHES: int = 5
+    SEARCH_USAGE_DEFAULT_LIMIT: int = 10
     
     # =====================================================================
     # LEGACY COMPATIBILITY (from old config)

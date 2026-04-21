@@ -164,6 +164,7 @@ async def get_plan_catalog(
             features.get("watchlist_limit", default_limits.get("watchlist_limit", settings.PLAN_FREE_WISHLIST)),
             settings.PLAN_FREE_WISHLIST,
         )
+        watchlist_limit = normalize_watchlist_limit(watchlist_limit, plan_id)
 
         price_paise = _safe_int(round(float(db_plan.price_inr or 0) * 100), base.get("price_paise", 0))
         duration_days = _safe_int(db_plan.duration_days, base.get("duration_days", 30))
@@ -245,7 +246,38 @@ def get_plan_limit(
     normalized = (plan_id or "").strip().lower()
     plan_cfg = plan_catalog.get(normalized) or plan_catalog.get("free") or {}
     limits = plan_cfg.get("limits", {})
-    return _safe_int(limits.get(limit_key), default_value)
+    limit = _safe_int(limits.get(limit_key), default_value)
+    if limit_key == "watchlist_limit":
+        return normalize_watchlist_limit(limit, normalized)
+    return limit
+
+
+def normalize_watchlist_limit(limit_value: int, plan_id: str) -> int:
+    """Ensure watchlist limits are finite, even when legacy configs use -1."""
+    parsed_limit = _safe_int(limit_value, settings.PLAN_FREE_WISHLIST)
+    if parsed_limit >= 0:
+        return parsed_limit
+
+    normalized_plan = (plan_id or "").strip().lower()
+    plan_fallbacks = {
+        "free": settings.PLAN_FREE_WISHLIST,
+        "pro": settings.PLAN_PRO_WISHLIST,
+        "premium": settings.PLAN_PREMIUM_WISHLIST,
+    }
+    fallback = _safe_int(
+        plan_fallbacks.get(normalized_plan, settings.PLAN_FREE_WISHLIST),
+        settings.PLAN_FREE_WISHLIST,
+    )
+
+    if fallback >= 0:
+        return fallback
+
+    # Final safety net if env values are also negative.
+    return max(
+        _safe_int(settings.PLAN_PRO_WISHLIST, 50),
+        _safe_int(settings.PLAN_FREE_WISHLIST, 5),
+        1,
+    )
 
 
 def get_paid_plan_ids(plan_catalog: Dict[str, Dict[str, Any]]) -> list[str]:

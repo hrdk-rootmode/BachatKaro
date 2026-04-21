@@ -3,7 +3,7 @@ Groq AI Client with Platform-Specific Healing & Quota Management
 ENHANCED v2.0 - The Brain of Auto-Healing System
 
 🚀 NEW FEATURES:
-- Platform-specific AI prompts for 95% healing accuracy
+- Platform-specific AI prompts for 95% healing accuracy (amazon only ) and in dynamic platforms it failing
 - Complete platform healing (all selectors at once)
 - Database persistence for healed selectors
 - Circuit breaker pattern (stops after repeated failures)

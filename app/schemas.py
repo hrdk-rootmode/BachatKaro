@@ -84,6 +84,7 @@ class UserResponse(BaseModel):
     city: Optional[str] = None
     plan: UserPlan
     plan_expires_at: Optional[datetime]
+    usage_stats: Optional[Dict[str, Any]] = None
     referral_code: str
     total_searches: int
     searches_today: int
@@ -128,6 +129,7 @@ class SearchRequest(BaseModel):
     max_price: Optional[Decimal] = Field(default=None, ge=0)
     sort_by: Optional[str] = Field(default="relevance", pattern="^(relevance|price_low|price_high|rating)$")
     page: int = Field(default=1, ge=1, le=10)
+    count_usage: bool = Field(default=True, description="Whether this search increments the user's usage counters")
     
     @field_validator('query')
     @classmethod
@@ -471,7 +473,10 @@ class WatchlistItemResponse(BaseModel):
     image_url: Optional[str]
     product_url: str
     in_stock: bool
+    price_change: Optional[Decimal]
     price_change_percentage: Optional[Decimal]
+    previous_price: Optional[Decimal]
+    price_change_direction: Optional[str]  # 'up' or 'down'
     is_target_reached: bool = False
 
 
@@ -507,6 +512,7 @@ class StreakMilestoneSchema(BaseModel):
     days: int
     reward_type: str
     reward_value: int
+    announcement_text: Optional[str] = None
     badge_emoji: Optional[str]
     badge_name: Optional[str]
     badge_color: Optional[str]
@@ -1061,6 +1067,23 @@ class SubscriptionPlanUpdateRequest(BaseModel):
     sort_order: Optional[int] = None
     tagline: Optional[str] = Field(None, max_length=100)
     features: Optional[Dict[str, Any]] = None
+
+
+class StreakMilestoneConfigUpsertRequest(BaseModel):
+    """Admin request to create or update streak milestone reward config."""
+
+    reward_type: Optional[str] = Field(
+        None,
+        pattern="^(searches|watchlist_slots|unlimited_search_hours|premium_days|free_month|badge)$",
+    )
+    reward_value: Optional[int] = None
+    badge_emoji: Optional[str] = Field(None, max_length=10)
+    badge_name: Optional[str] = Field(None, max_length=50)
+    badge_color: Optional[str] = Field(None, pattern="^#[0-9A-Fa-f]{6}$")
+    announcement_text: Optional[str] = Field(None, max_length=200)
+    confetti_enabled: Optional[bool] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
 
 
 class MaintenanceModeRequest(BaseModel):

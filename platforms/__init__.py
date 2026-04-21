@@ -23,7 +23,7 @@ Supported Platforms (Auto-Discovered):
 ✅ Myntra.com       - API interception, __NEXT_DATA__ extraction
 ✅ Meesho.com       - Mobile stealth, Akamai bypass, API interception
 ✅ Nykaa.com        - JSON-LD, __NEXT_DATA__, API interception
-✅ Croma.com        - JSON-LD, API interception
+✅ Croma.com        - JSON-LD, API interception(Note working in croma)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

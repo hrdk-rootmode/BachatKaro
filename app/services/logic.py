@@ -17,7 +17,7 @@ Usage:
 """
 
 from typing import List, Optional, Dict, Tuple, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 
@@ -33,6 +33,15 @@ from app.schemas import (
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_datetime(value: Optional[datetime]) -> datetime:
+    """Return a timezone-aware UTC datetime for API responses."""
+    if value is None:
+        return datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class BusinessLogic:
@@ -192,7 +201,7 @@ class BusinessLogic:
             review_count=listing.review_count,
             image_url=product.image_url,
             in_stock=listing.in_stock if listing.in_stock is not None else True,
-            last_scraped_at=listing.last_scraped or datetime.utcnow(),
+            last_scraped_at=_utc_datetime(listing.last_scraped),
             extraction_confidence=listing.extraction_confidence,
             extraction_method=listing.extraction_method,
             data_source=listing.data_source,
@@ -291,8 +300,8 @@ class BusinessLogic:
             ai_tags=ai_metadata.get("tags", []),
             ai_metadata=ai_metadata,
             stats=product.stats or {},
-            created_at=product.created_at or datetime.utcnow(),
-            updated_at=product.updated_at,
+            created_at=_utc_datetime(product.created_at),
+            updated_at=_utc_datetime(product.updated_at),
             # Formatted listings
             listings=[
                 BusinessLogic.format_listing_response(listing, product)

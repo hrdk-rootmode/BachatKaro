@@ -32,7 +32,7 @@ import logging
 import re
 import hashlib
 from difflib import SequenceMatcher
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple
 from decimal import Decimal
 
@@ -43,6 +43,10 @@ from app.models import Product, ProductListing, Platform
 from app.services.scraper.base import ProductData
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 # =============================================================================
 # GARBAGE BRAND DETECTION (SAME AS fix_data.py v4.0)
@@ -664,7 +668,7 @@ class ProductService:
             color_source=getattr(product_data, "color_source", None),
             specs_confidence=getattr(product_data, "specs_confidence", None),
             specs_source=getattr(product_data, "specs_source", None),
-            last_enriched_at=datetime.utcnow() if getattr(product_data, "ai_processed", False) else None,
+            last_enriched_at=_utc_now() if getattr(product_data, "ai_processed", False) else None,
             enrichment_version=2,
             ai_metadata=ai_metadata,
             stats=initial_stats,
@@ -748,7 +752,7 @@ class ProductService:
                 changes.append(f"specs: merged {len(incoming_specs)} new fields")
 
         if getattr(incoming, "ai_processed", False):
-            existing.last_enriched_at = datetime.utcnow()
+            existing.last_enriched_at = _utc_now()
             existing.enrichment_version = 2
 
         incoming_image = getattr(incoming, "image_url", None)
@@ -796,14 +800,14 @@ class ProductService:
             "essence": str(essence)[:200].lower(),
             "tags": getattr(product_data, 'ai_tags', []) or [],
             "quality_score": max(0, min(100, int(quality_score))) if quality_score else 50,
-            "processed_at": datetime.utcnow().isoformat(),
+            "processed_at": _utc_now().isoformat(),
             "enriched": getattr(product_data, 'ai_processed', False),
             "enrichment_version": 2,
         }
 
         if not is_user_search:
             metadata["seeded"] = True
-            metadata["seeded_at"] = datetime.utcnow().isoformat()
+            metadata["seeded_at"] = _utc_now().isoformat()
 
         return metadata
     
@@ -825,7 +829,7 @@ class ProductService:
         if not is_user_search:
             stats["seed_score"] = self._calculate_seed_score(product_data)
             stats["seeded"] = True
-            stats["seeded_at"] = datetime.utcnow().isoformat()
+            stats["seeded_at"] = _utc_now().isoformat()
         
         return stats
     
@@ -839,7 +843,7 @@ class ProductService:
         
         if is_user_search:
             new_stats["searches"] = current_stats.get("searches", 0) + 1
-            new_stats["last_searched"] = datetime.utcnow().isoformat()
+            new_stats["last_searched"] = _utc_now().isoformat()
         
         return new_stats
     
@@ -1057,7 +1061,7 @@ class ProductService:
             "rating": getattr(product_data, 'rating', None),
             "review_count": getattr(product_data, 'review_count', None),
             "in_stock": getattr(product_data, 'in_stock', True),
-            "last_scraped": datetime.utcnow(),
+            "last_scraped": _utc_now(),
             "extraction_confidence": getattr(product_data, 'extraction_confidence', None),
             "extraction_method": getattr(getattr(product_data, 'extraction_method', None), 'value', None),
             "data_source": getattr(getattr(product_data, 'data_source', None), 'value', None),
@@ -1151,7 +1155,7 @@ class ProductService:
         if product:
             stats = product.stats or {}
             stats[stat_name] = stats.get(stat_name, 0) + increment
-            stats[f"last_{stat_name}"] = datetime.utcnow().isoformat()
+            stats[f"last_{stat_name}"] = _utc_now().isoformat()
             product.stats = stats
             await db.commit()
 

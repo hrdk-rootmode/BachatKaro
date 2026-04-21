@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List, Optional, Any, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 import inspect
@@ -39,8 +39,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _compute_freshness_status(last_updated_at: datetime) -> str:
-    age_hours = max(0.0, (datetime.utcnow() - last_updated_at).total_seconds() / 3600)
+    age_hours = max(0.0, (_utc_now() - _ensure_utc(last_updated_at)).total_seconds() / 3600)
     if age_hours < 2:
         return "fresh"
     if age_hours < 12:
@@ -223,7 +233,9 @@ async def get_product(
     try:
         # Get product from DB
         query_service = QueryService(db)
-        product = await query_service.get_product_by_id(product_id)
+        
+        # ✅ FIX: Handle integer product IDs correctly (string conversion)
+        product = await query_service.get_product_by_id(str(product_id))
         
         if not product:
             raise HTTPException(
@@ -232,7 +244,7 @@ async def get_product(
             )
         
         # Get all listings for this product
-        listings = await query_service.get_product_listings(product_id, order_by="price_asc")
+        listings = await query_service.get_product_listings(str(product_id), order_by="price_asc")
         
         # Filter to valid listings only
         valid_listings = BusinessLogic.filter_valid_listings(listings, product)
@@ -394,7 +406,7 @@ async def refresh_product_price(
     # =========================================================================
     # STEP 2: Attempt live scraping (with graceful failure handling)
     # =========================================================================
-    refresh_started_at = datetime.utcnow()
+    refresh_started_at = _utc_now()
     now_utc = refresh_started_at
     refreshed_count = 0
     changed_count = 0
@@ -548,7 +560,7 @@ async def refresh_product_price(
 
     response = await get_product(product_id=product_id, user=user, db=db)
 
-    elapsed_ms = int((datetime.utcnow() - refresh_started_at).total_seconds() * 1000)
+    elapsed_ms = int((_utc_now() - refresh_started_at).total_seconds() * 1000)
     refresh_meta = {
         "requested_platform": platform.value if platform else "all",
         "scraper_available": scraper_available,
@@ -634,7 +646,7 @@ async def refresh_product_price_by_location(
 
     from app.services.scraper.factory import get_platform_handler
 
-    now_utc = datetime.utcnow()
+    now_utc = _utc_now()
     snapshots: List[PlatformPriceSnapshot] = []
     location_applied_platforms = 0
     changed_count = 0

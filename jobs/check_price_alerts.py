@@ -259,8 +259,25 @@ async def run_check_price_alerts() -> Dict[str, Any]:
                         history = history[-MAX_ALERT_HISTORY:]
                     item.user.alert_history = history
 
-                    notif_type = "price_drop"
-                    notif_title = "Target Price Reached" if reason == "target_reached" else "Price Dropped"
+                    # Determine price change direction for notification title
+                    if reason == "target_reached":
+                        notif_type = "price_drop"
+                        notif_title = "Target Price Reached"
+                    elif last_alert and last_alert.get("price") is not None:
+                        previous_price = float(last_alert.get("price"))
+                        if current_price < previous_price:
+                            notif_type = "price_drop"
+                            notif_title = "Price Dropped"
+                        elif current_price > previous_price:
+                            notif_type = "price_rise"
+                            notif_title = "Price Increased"
+                        else:
+                            notif_type = "price_drop"
+                            notif_title = "Price Alert"
+                    else:
+                        notif_type = "price_drop"
+                        notif_title = "Price Alert"
+                    
                     notif_message = _build_alert_message(product.title, current_price, target_price, reason)
 
                     notification = Notification(
@@ -271,9 +288,11 @@ async def run_check_price_alerts() -> Dict[str, Any]:
                         data={
                             "product_id": product_id,
                             "product_title": product.title,
+                            "product_image_url": product.image_url,
                             "platform": listing.platform.name.lower() if listing.platform else "unknown",
                             "price": current_price,
                             "target_price": target_price,
+                            "previous_price": float(last_alert.get("price")) if last_alert and last_alert.get("price") else None,
                             "reason": reason,
                         },
                         is_read=False,

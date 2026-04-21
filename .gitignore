@@ -26,3 +26,6 @@ cache/healed_selectors_backup.json
 
 *.drawio
 *.drawio.png
+
+scripts/normalize_listing_prices.py
+scripts/reset_and_rebuild_flipkart_prices.py

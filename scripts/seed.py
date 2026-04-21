@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# FIX: THIS MUST RUN BEFORE ANYTHING ELSE - WINDOWS ASYNCIO SUBPROCESS BUG
+# Playwright requires WindowsProactorEventLoopPolicy on Windows for subprocess support
+import sys
+import asyncio
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 """
 Database Seeding Script (Hardened)
 

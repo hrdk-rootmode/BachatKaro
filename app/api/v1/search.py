@@ -193,6 +193,59 @@ def _safe_usage_stats(user: User) -> dict:
     return dict(user.usage_stats or {})
 
 
+def _apply_search_usage(
+    user: User,
+    *,
+    query: Optional[str] = None,
+    url: Optional[str] = None,
+) -> dict:
+    """Increment persisted search usage counters in the user's JSONB payload."""
+    usage_stats = _safe_usage_stats(user)
+    today = datetime.utcnow().date().isoformat()
+
+    last_search_date = usage_stats.get("last_search_date")
+    last_search_day = None
+    if last_search_date:
+        try:
+            last_search_day = datetime.fromisoformat(str(last_search_date).replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            last_search_day = None
+
+    if usage_stats.get("last_reset") != today and last_search_day != today:
+        usage_stats["daily_searches"] = 0
+        usage_stats["searches_today"] = 0
+        usage_stats["daily_search_bonus"] = 0
+
+    daily_searches = int(
+        usage_stats.get("daily_searches", usage_stats.get("searches_today", 0)) or 0
+    ) + 1
+    usage_stats["daily_searches"] = daily_searches
+    usage_stats["searches_today"] = daily_searches
+    usage_stats["total_searches"] = int(usage_stats.get("total_searches", 0) or 0) + 1
+    usage_stats["last_search_date"] = datetime.utcnow().isoformat()
+    usage_stats["last_reset"] = today
+
+    if query is not None:
+        usage_stats["last_search_query"] = query
+    if url is not None:
+        usage_stats["last_url_search"] = url
+
+    user.usage_stats = usage_stats
+    return usage_stats
+
+
+def _maybe_apply_search_usage(
+    user: User,
+    *,
+    query: Optional[str] = None,
+    url: Optional[str] = None,
+    count_usage: bool = True,
+) -> dict:
+    if not count_usage:
+        return _safe_usage_stats(user)
+    return _apply_search_usage(user, query=query, url=url)
+
+
 def _build_search_transaction(user_id, search_type: str, meta: dict | None = None) -> Transaction:
     """Create a lightweight transaction row for search analytics."""
     return Transaction(
@@ -725,7 +778,7 @@ async def scrape_and_match(
                 await product_service.save_product(
                     product_data=alt,
                     db=db,
-                    is_user_search=True
+                    is_user_search=False
                 )
             except Exception as e:
                 logger.debug(f"Failed to save alternative: {e}")
@@ -901,6 +954,20 @@ async def search_products(
             f"Time: {search_time_ms}ms"
         )
         
+        if request.count_usage and cached_total > 0:
+            _maybe_apply_search_usage(
+                user,
+                query=request.query,
+                count_usage=True,
+            )
+
+            db.add(_build_search_transaction(
+                user.id,
+                search_type="search",
+                meta={"query": request.query, "origin": "text_search_cache"}
+            ))
+            await db.commit()
+        
         return SearchResponse(
             query=request.query,
             total_results=cached_total,
@@ -959,20 +1026,20 @@ async def search_products(
     
     search_time_ms = int((time.time() - start_time) * 1000)
     
-    # Update user stats and persist searchable audit event.
-    usage_stats = _safe_usage_stats(user)
-    usage_stats['daily_searches'] = int(usage_stats.get('daily_searches', 0) or 0) + 1
-    usage_stats['total_searches'] = int(usage_stats.get('total_searches', 0) or 0) + 1
-    usage_stats['last_search_date'] = datetime.utcnow().isoformat()
-    usage_stats['last_search_query'] = request.query
-    user.usage_stats = usage_stats
+    # Update user stats and persist searchable audit event only when we found results.
+    if request.count_usage and results:
+        _maybe_apply_search_usage(
+            user,
+            query=request.query,
+            count_usage=True,
+        )
 
-    db.add(_build_search_transaction(
-        user.id,
-        search_type="search",
-        meta={"query": request.query, "origin": "text_search"}
-    ))
-    await db.commit()
+        db.add(_build_search_transaction(
+            user.id,
+            search_type="search",
+            meta={"query": request.query, "origin": "text_search"}
+        ))
+        await db.commit()
     
     logger.info(
         f"Database search: {request.query} | "
@@ -1062,6 +1129,16 @@ async def search_by_url(
         logger.info(f"URL search cache HIT: {url[:50]} | Time: {search_time_ms}ms")
         cached_result["cache_hit"] = True
         cached_result["search_time_ms"] = search_time_ms
+
+        if cached_result.get("alternatives"):
+            _apply_search_usage(user, url=url)
+            db.add(_build_search_transaction(
+                user.id,
+                search_type="ai_search",
+                meta={"url": url, "origin": "url_search_cache"}
+            ))
+            await db.commit()
+
         return cached_result
     
     # Step 4: Check if product exists in database
@@ -1239,12 +1316,7 @@ async def search_by_url(
     }
     
     # Update user stats and persist searchable audit event.
-    usage_stats = _safe_usage_stats(user)
-    usage_stats['daily_searches'] = int(usage_stats.get('daily_searches', 0) or 0) + 1
-    usage_stats['total_searches'] = int(usage_stats.get('total_searches', 0) or 0) + 1
-    usage_stats['last_search_date'] = datetime.utcnow().isoformat()
-    usage_stats['last_url_search'] = url
-    user.usage_stats = usage_stats
+    usage_stats = _apply_search_usage(user, url=url)
 
     db.add(_build_search_transaction(
         user.id,
