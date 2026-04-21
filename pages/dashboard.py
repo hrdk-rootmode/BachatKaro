@@ -5,6 +5,14 @@ from api_client import AdminApiClient, ApiError
 import pandas as pd
 
 
+def _format_api_error(e: ApiError) -> str:
+    status = f" (status {e.status_code})" if e.status_code is not None else ""
+    detail = ""
+    if e.payload is not None:
+        detail = f" | detail: {e.payload}"
+    return f"{str(e)}{status}{detail}"
+
+
 def _normalize_logs_dataframe(logs_list: list[dict]) -> pd.DataFrame:
     """Convert raw system logs payload to a numeric daily dataframe."""
     if not logs_list:
@@ -62,6 +70,46 @@ def _build_recent_trend(df_logs: pd.DataFrame, searches_today: int, revenue_toda
     trend_df.loc[today, "Revenue"] = max(float(trend_df.loc[today, "Revenue"]), float(revenue_today or 0))
     return trend_df
 
+
+def _build_products_scrape_dataframe(daily_history: list[dict]) -> pd.DataFrame:
+    """Build Date-indexed dataframe for products/listings scraped trend charts."""
+    if not daily_history:
+        empty_df = pd.DataFrame(columns=["Products Scraped", "Listings Scraped"])
+        empty_df.index.name = "Date"
+        return empty_df
+
+    rows = []
+    for item in daily_history:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "Date": pd.to_datetime(item.get("date"), errors="coerce"),
+                "Products Scraped": pd.to_numeric(item.get("products_scraped", 0), errors="coerce"),
+                "Listings Scraped": pd.to_numeric(item.get("listings_scraped", 0), errors="coerce"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        empty_df = pd.DataFrame(columns=["Products Scraped", "Listings Scraped"])
+        empty_df.index.name = "Date"
+        return empty_df
+
+    df = df.dropna(subset=["Date"]).copy()
+    if df.empty:
+        empty_df = pd.DataFrame(columns=["Products Scraped", "Listings Scraped"])
+        empty_df.index.name = "Date"
+        return empty_df
+
+    for col in ["Products Scraped", "Listings Scraped"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    df = df.dropna(subset=["Date"]).groupby("Date", as_index=True)[["Products Scraped", "Listings Scraped"]].sum().sort_index()
+    df.index.name = "Date"
+    return df
+
 st.set_page_config(
     page_title="Dashboard",
     page_icon="📊",
@@ -103,24 +151,31 @@ health_error = None
 try:
     stats = api.system_stats(token)
 except ApiError as e:
-    stats_error = str(e)
+    stats_error = _format_api_error(e)
 
 try:
     revenue = api.revenue_overview(token)
 except ApiError as e:
-    revenue_error = str(e)
+    revenue_error = _format_api_error(e)
 
 try:
     health = api.admin_health(token)
 except ApiError as e:
-    health_error = str(e)
+    health_error = _format_api_error(e)
 
 logs_data = {}
 logs_error = None
 try:
     logs_data = api.system_logs(token, days=30)
 except ApiError as e:
-    logs_error = str(e)
+    logs_error = _format_api_error(e)
+
+products_analysis_data = {}
+products_analysis_error = None
+try:
+    products_analysis_data = api.products_analysis(token, days=30)
+except ApiError as e:
+    products_analysis_error = _format_api_error(e)
 
 revenue_tx_payload = {}
 revenue_tx_error = None
@@ -128,7 +183,7 @@ try:
     # Live transaction feed for reactive revenue charts.
     revenue_tx_payload = api.revenue_transactions(token=token, page=1, limit=100, tx_type="payment", status="success")
 except ApiError as e:
-    revenue_tx_error = str(e)
+    revenue_tx_error = _format_api_error(e)
 
 if stats_error:
     st.warning(f"Stats endpoint issue: {stats_error}")
@@ -138,11 +193,17 @@ if health_error:
     st.warning(f"Health endpoint issue: {health_error}")
 if logs_error:
     st.warning(f"Logs endpoint issue: {logs_error}")
+if products_analysis_error:
+    st.warning(f"Products analysis endpoint issue: {products_analysis_error}")
 if revenue_tx_error:
     st.warning(f"Revenue transactions endpoint issue: {revenue_tx_error}")
 
 logs_list = logs_data.get("logs", [])
 df_logs = _normalize_logs_dataframe(logs_list)
+
+products_analysis_totals = products_analysis_data.get("totals", {}) if isinstance(products_analysis_data, dict) else {}
+products_scrape_history = products_analysis_data.get("daily_scrape_history", []) if isinstance(products_analysis_data, dict) else []
+df_products_scrape = _build_products_scrape_dataframe(products_scrape_history)
 
 revenue_tx_rows = []
 tx_items = revenue_tx_payload.get("transactions", []) if isinstance(revenue_tx_payload, dict) else []
@@ -193,6 +254,9 @@ premium_users = int(engagement.get("premium_users", 0) or 0)
 total_products = int(products.get("total_products", products.get("total_tracked", 0)) or 0)
 active_products = int(products.get("with_active_listings", 0) or 0)
 scraped_today = int(products.get("scraped_today", 0) or 0)
+total_listings = int(products_analysis_totals.get("total_listings", 0) or 0)
+products_scraped_today = int(products_analysis_totals.get("products_scraped_today", scraped_today) or 0)
+listings_scraped_today = int(products_analysis_totals.get("listings_scraped_today", 0) or 0)
 
 revenue_val = float(revenue.get("total_revenue_inr", 0) or 0)
 conversion = float(revenue.get("conversion_rate", 0) or 0)
@@ -321,39 +385,108 @@ elif focus == "users":
 elif focus == "products":
     st.markdown("### Products Analysis")
     with st.container(border=True):
-        p1, p2, p3 = st.columns(3)
+        p1, p2, p3, p4 = st.columns(4)
         with p1:
             st.metric("Total Products", f"{total_products:,}")
         with p2:
-            st.metric("Active Listings", f"{active_products:,}")
+            st.metric("Total Listings", f"{total_listings:,}")
         with p3:
+            st.metric("Active Products", f"{active_products:,}")
+        with p4:
             active_ratio = round((active_products / total_products) * 100, 1) if total_products > 0 else 0
             st.metric("Active Ratio", f"{active_ratio:.1f}%")
-        st.write(f"Products scraped today: {scraped_today:,}")
+        st.write(f"Products scraped today: {products_scraped_today:,} | Listings scraped today: {listings_scraped_today:,}")
 
         st.markdown("#### Scrape History")
         tabs = st.tabs(["Daily", "Weekly", "Monthly"])
+
+        if not df_products_scrape.empty:
+            scrape_data = df_products_scrape.copy()
+        else:
+            scrape_data = df_logs[["Scraped"]].copy() if not df_logs.empty else pd.DataFrame()
+            if not scrape_data.empty:
+                scrape_data = scrape_data.rename(columns={"Scraped": "Products Scraped"})
+                scrape_data["Listings Scraped"] = 0
+
+            today = pd.Timestamp.now().normalize()
+            if today not in scrape_data.index and products_scraped_today > 0:
+                scrape_data.loc[today, "Products Scraped"] = float(products_scraped_today)
+                scrape_data.loc[today, "Listings Scraped"] = float(listings_scraped_today)
+                scrape_data = scrape_data.sort_index()
+        
         with tabs[0]:
-            if not df_logs.empty:
-                st.bar_chart(df_logs["Scraped"])
+            if not scrape_data.empty and (scrape_data[["Products Scraped", "Listings Scraped"]].sum().sum() > 0):
+                st.bar_chart(scrape_data[["Products Scraped", "Listings Scraped"]], use_container_width=True)
+                st.caption(
+                    f"Period totals: {int(scrape_data['Products Scraped'].sum()):,} products | "
+                    f"{int(scrape_data['Listings Scraped'].sum()):,} listings"
+                )
+            else:
+                st.info("No scrape history data available yet. Showing today's value:")
+                st.metric("Today Products Scraped", f"{products_scraped_today:,}")
+                
         with tabs[1]:
-            if not df_logs.empty:
-                st.line_chart(df_logs["Scraped"].resample('W').sum())
+            if not scrape_data.empty and (scrape_data[["Products Scraped", "Listings Scraped"]].sum().sum() > 0):
+                weekly = scrape_data[["Products Scraped", "Listings Scraped"]].resample('W').sum()
+                st.line_chart(weekly, use_container_width=True)
+                st.caption(
+                    f"Current week: {int(weekly.iloc[-1]['Products Scraped']):,} products | "
+                    f"{int(weekly.iloc[-1]['Listings Scraped']):,} listings"
+                )
+            else:
+                st.info("Weekly aggregate data will appear after 7 days of scraping")
+                
         with tabs[2]:
-            if not df_logs.empty:
-                st.line_chart(df_logs["Scraped"].resample('ME').sum())
+            if not scrape_data.empty and len(scrape_data) > 0:
+                monthly = scrape_data[["Products Scraped", "Listings Scraped"]].resample('ME').sum()
+                st.line_chart(monthly, use_container_width=True)
+                st.caption(
+                    f"Current month: {int(monthly.iloc[-1]['Products Scraped']):,} products | "
+                    f"{int(monthly.iloc[-1]['Listings Scraped']):,} listings"
+                )
+            else:
+                st.info("Monthly trend will be visible once sufficient historical data exists")
 
         st.markdown("#### Category Breakdown")
-        categories_dict = products.get("by_category", {})
+        categories_dict = products_analysis_data.get("category_breakdown", {}) if isinstance(products_analysis_data, dict) else {}
+        if not categories_dict:
+            categories_dict = products.get("by_category", {})
+        
         if categories_dict:
-            cat_df = pd.DataFrame(list(categories_dict.items()), columns=["Category", "Count"]).set_index("Category")
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                st.dataframe(cat_df, use_container_width=True)
-            with c2:
-                st.bar_chart(cat_df)
+            # Process and clean category data
+            cat_list = []
+            for cat, count in categories_dict.items():
+                if count and int(count) > 0:
+                    cat_list.append({
+                        "Category": str(cat).replace("_", " ").title(), 
+                        "Count": int(count)
+                    })
+            
+            if cat_list:
+                cat_df = pd.DataFrame(cat_list)
+                cat_df = cat_df.sort_values("Count", ascending=False).reset_index(drop=True)
+                cat_df["% Share"] = round((cat_df["Count"] / cat_df["Count"].sum()) * 100, 1)
+                
+                c1, c2 = st.columns([1, 2])
+                with c1:
+                    st.dataframe(
+                        cat_df, 
+                        hide_index=True, 
+                        use_container_width=True,
+                        column_config={
+                            "Count": st.column_config.NumberColumn(format="%d"),
+                            "% Share": st.column_config.NumberColumn(format="%.1f %%")
+                        }
+                    )
+                with c2:
+                    chart_df = cat_df.set_index("Category")["Count"]
+                    st.bar_chart(chart_df, use_container_width=True)
+                st.caption(f"Total categories: {len(cat_list)} | Total categorized products: {int(cat_df['Count'].sum()):,}")
+            else:
+                st.warning("Category data exists but all values are zero or invalid")
         else:
-            st.info("Category breakdown data is not available currently from backend.")
+            st.warning("⚠️ Category breakdown is not being returned from backend system stats")
+            st.info("This is normal for new systems before products are properly categorized. Scraped products will be categorized automatically during indexing.")
 
 elif focus == "revenue":
     st.markdown("### Revenue Analysis")

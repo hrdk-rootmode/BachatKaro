@@ -373,6 +373,7 @@ with st.form("bulk_bonus_form"):
             )
             
             st.success(f"Bonuses granted to {result.get('users_affected', 0)} users")
+            st.rerun()
         except ApiError as e:
             st.error(f"Failed to grant bonuses: {e}")
 

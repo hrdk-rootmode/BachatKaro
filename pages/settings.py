@@ -2,6 +2,7 @@ import streamlit as st
 from auth import get_auth_state, enforce_session_timeout
 from config import load_settings
 from api_client import AdminApiClient, ApiError
+from firebase_auth import send_password_reset_email
 
 st.set_page_config(
     page_title="Settings",
@@ -23,7 +24,7 @@ api = AdminApiClient(settings)
 token = auth_state.get("token", "")
 
 st.title("⚙️ Settings")
-st.caption("Application settings and configuration")
+st.caption("Admin account tools")
 
 st.info("Sensitive keys (API keys, tokens, secrets) are env-only and will not be stored/exposed via DB config.")
 
@@ -37,9 +38,6 @@ try:
 except ApiError as e:
     st.error(f"Failed to load settings: {e}")
     configs = []
-
-# Settings sections
-tab1, tab2, tab3 = st.tabs(["General", "System", "Maintenance"])
 
 with st.expander("Sync Backend Settings Into DB (Non-sensitive only)"):
     overwrite_existing = st.checkbox("Overwrite existing DB values", value=False)
@@ -56,64 +54,25 @@ with st.expander("Sync Backend Settings Into DB (Non-sensitive only)"):
         except ApiError as e:
             st.error(f"Failed to sync settings: {e}")
 
-with tab1:
-    st.subheader("General Settings")
-    
-    with st.form("general_settings"):
-        app_name = st.text_input("Application Name", value="DealHunt Admin")
-        debug_mode = st.checkbox("Debug Mode", value=False)
-        log_level = st.selectbox("Log Level", ["INFO", "DEBUG", "WARNING", "ERROR"])
-        
-        if st.form_submit_button("Save General Settings"):
-            try:
-                api.update_config(token, "app_name", app_name, "string", "Application name", "general")
-                api.update_config(token, "debug_mode", str(debug_mode), "boolean", "Debug mode", "general")
-                api.update_config(token, "log_level", log_level, "string", "Log level", "general")
-                st.success("General settings saved!")
-                st.rerun()
-            except ApiError as e:
-                st.error(f"Failed to save settings: {e}")
+st.subheader("Admin Password Reset")
+st.caption("Send a secure Firebase password reset link to an admin email.")
 
-with tab2:
-    st.subheader("System Configuration")
-    
-    with st.form("system_settings"):
-        max_retries = st.number_input("Max API Retries", min_value=1, max_value=10, value=3)
-        timeout_seconds = st.number_input("Request Timeout (seconds)", min_value=1, max_value=60, value=10)
-        rate_limit_per_minute = st.number_input("Rate Limit (per minute)", min_value=1, max_value=10000, value=60)
-        
-        if st.form_submit_button("Save System Settings"):
-            try:
-                api.update_config(token, "max_retries", str(max_retries), "number", "Max API retries", "system")
-                api.update_config(token, "timeout_seconds", str(timeout_seconds), "number", "Request timeout", "system")
-                api.update_config(token, "rate_limit_per_minute", str(rate_limit_per_minute), "number", "Rate limit", "system")
-                st.success("System settings saved!")
-                st.rerun()
-            except ApiError as e:
-                st.error(f"Failed to save settings: {e}")
+default_email = (auth_state.get("email") or "").strip().lower()
+with st.form("admin_password_reset_form"):
+    reset_email = st.text_input("Admin Email", value=default_email, placeholder="admin@example.com")
+    submit_reset = st.form_submit_button("Send Password Reset Email", type="primary")
 
-with tab3:
-    st.subheader("Maintenance Mode")
-    
-    with st.form("maintenance_form"):
-        maintenance_enabled = st.checkbox("Enable Maintenance Mode", value=False)
-        maintenance_message = st.text_area(
-            "Maintenance Message",
-            value="System is under maintenance. Please try again later.",
-            height=100
-        )
-        
-        if st.form_submit_button("Update Maintenance Mode"):
+    if submit_reset:
+        if not reset_email:
+            st.error("Please enter an admin email.")
+        elif not settings.firebase_api_key:
+            st.error("FIREBASE_API_KEY is missing. Configure it in admin .env first.")
+        else:
             try:
-                result = api.maintenance_mode(
-                    token,
-                    maintenance_enabled,
-                    maintenance_message
-                )
-                st.success("Maintenance mode updated!")
-                st.rerun()
-            except ApiError as e:
-                st.error(f"Failed to update maintenance mode: {e}")
+                send_password_reset_email(settings.firebase_api_key, reset_email)
+                st.success(f"Password reset email sent to {reset_email}.")
+            except Exception as e:
+                st.error(f"Failed to send password reset email: {e}")
 
 st.divider()
 

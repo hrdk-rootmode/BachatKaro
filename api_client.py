@@ -144,6 +144,10 @@ class AdminApiClient:
         params = {"days": days}
         return self._data(self._request("GET", "/admin/system/logs", token=token, params=params))
 
+    def products_analysis(self, token: str, days: int = 30) -> Any:
+        params = {"days": days}
+        return self._data(self._request("GET", "/admin/system/products-analysis", token=token, params=params))
+
     # Users CRUD
     def list_users(
         self,
@@ -240,6 +244,19 @@ class AdminApiClient:
             self._request(
                 "PUT",
                 f"/admin/system/subscription-plans/{plan_name}",
+                token=token,
+                json=update_data,
+            )
+        )
+
+    def get_streak_milestones_config(self, token: str) -> Any:
+        return self._data(self._request("GET", "/admin/system/streak-milestones", token=token))
+
+    def upsert_streak_milestone(self, token: str, streak_days: int, update_data: dict) -> Any:
+        return self._data(
+            self._request(
+                "PUT",
+                f"/admin/system/streak-milestones/{int(streak_days)}",
                 token=token,
                 json=update_data,
             )
@@ -456,3 +473,43 @@ class AdminApiClient:
     def check_playwright(self, token: str) -> Any:
         """Check if Playwright + Chromium are available on the server."""
         return self._data(self._request("GET", "/admin/scrapers/playwright/check", token=token))
+
+
+# =============================================================================
+# LEGACY FUNCTIONS FOR BACKWARD COMPATIBILITY
+# =============================================================================
+
+def get_admin_headers(token: str) -> dict:
+    """Get admin headers for API requests"""
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+def make_api_request(
+    method: str,
+    endpoint: str,
+    token: str | None = None,
+    data: dict | None = None,
+    params: dict | None = None,
+) -> Any:
+    """
+    Legacy function for making API requests.
+    Uses the AdminApiClient internally for consistency.
+    """
+    from config import Settings
+    
+    settings = Settings()
+    client = AdminApiClient(settings)
+    
+    try:
+        kwargs = {}
+        if data:
+            kwargs["json"] = data
+        if params:
+            kwargs["params"] = params
+        
+        response = client._request(method, endpoint, token=token, **kwargs)
+        return response.data
+    finally:
+        client.close()
