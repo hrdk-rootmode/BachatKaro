@@ -5,6 +5,18 @@
 import { get, post } from './api';
 import { API } from '../utils/constants';
 
+const debugLog = (...args) => {
+  if (__DEV__) {
+    console.log(...args);
+  }
+};
+
+const debugError = (...args) => {
+  if (__DEV__) {
+    console.error(...args);
+  }
+};
+
 /**
  * Search API service
  * Handles all search-related API calls with proper request validation
@@ -17,7 +29,7 @@ export const searchAPI = {
    * @param {number} page - Page number (default 1)
    * @returns {Promise} Search results with products array
    */
-  searchProducts: async (query, filters = {}, page = 1) => {
+  searchProducts: async (query, filters = {}, page = 1, options = {}) => {
     try {
       // Validate query
       if (!query || query.trim().length < 2) {
@@ -35,9 +47,10 @@ export const searchAPI = {
         max_price: filters.maxPrice ? parseFloat(filters.maxPrice) : null,
         sort_by: filters.sortBy || 'relevance',
         page: Math.max(1, parseInt(page) || 1),
+        count_usage: options.countUsage !== false,
       };
 
-      console.log('Search API: Sending payload:', payload);
+      debugLog('Search API: Sending payload:', payload);
 
       // Call search endpoint
       const response = await post(API.ENDPOINTS.SEARCH, payload);
@@ -56,7 +69,7 @@ export const searchAPI = {
       //   "search_time_ms": 245
       // }
 
-      console.log('Search API Response:', {
+      debugLog('Search API Response:', {
         query: response.data.query,
         product_count: response.data.products?.length || 0,
         first_product_has_id: !!response.data.products?.[0]?.id,
@@ -75,7 +88,7 @@ export const searchAPI = {
         },
       };
     } catch (error) {
-      console.error('Search API Error:', error);
+      debugError('Search API Error:', error);
       return {
         success: false,
         error: error.error || 'Search failed',
@@ -99,18 +112,18 @@ export const searchAPI = {
 
       const payload = { url: url.trim() };
 
-      console.log('URL Search API: Sending:', payload);
+      debugLog('URL Search API: Sending:', payload);
 
       const response = await post(API.ENDPOINTS.SEARCH_BY_URL, payload);
 
-      console.log('URL Search API: Full response:', response);
+      debugLog('URL Search API: Full response:', response);
 
       if (!response.success) {
-        console.error('URL Search failed:', response.error);
+        debugError('URL Search failed:', response.error);
         return response;
       }
 
-      console.log('URL Search Success:', {
+      debugLog('URL Search Success:', {
         source_platform: response.data?.source?.platform,
         alternatives: response.data?.alternatives?.length || 0,
         origin: response.data?.response_origin
@@ -121,8 +134,8 @@ export const searchAPI = {
         data: response.data,
       };
     } catch (error) {
-      console.error('URL Search API Error:', error);
-      console.error('Error details:', {
+      debugError('URL Search API Error:', error);
+      debugError('Error details:', {
         message: error.message,
         response: error.response?.data,
         status: error.response?.status
@@ -140,7 +153,7 @@ export const searchAPI = {
    */
   getTrending: async () => {
     try {
-      console.log('Trending API: Fetching...');
+      debugLog('Trending API: Fetching...');
 
       const response = await get(API.ENDPOINTS.TRENDING);
 
@@ -167,7 +180,7 @@ export const searchAPI = {
         data: Array.isArray(response.data) ? response.data : [],
       };
     } catch (error) {
-      console.error('Trending API Error:', error);
+      debugError('Trending API Error:', error);
       return {
         success: false,
         error: error.error || 'Failed to fetch trending',
@@ -195,7 +208,7 @@ export const productAPI = {
         };
       }
 
-      console.log('Product API: Fetching details for:', productId);
+      debugLog('Product API: Fetching details for:', productId);
 
       const endpoint = `${API.ENDPOINTS.PRODUCT_DETAIL}/${productId}`;
       const response = await get(endpoint);
@@ -209,7 +222,7 @@ export const productAPI = {
         data: response.data,
       };
     } catch (error) {
-      console.error('Product Detail API Error:', error);
+      debugError('Product Detail API Error:', error);
       return {
         success: false,
         error: error.error || 'Failed to fetch product details',
@@ -240,8 +253,6 @@ export const productAPI = {
         };
       }
 
-      console.log(`Price History API: Fetching for ${productId}/${platform}`);
-
       const endpoint = `${API.ENDPOINTS.PRICE_HISTORY}/${productId}/price-history`;
       const params = {
         platform,
@@ -259,7 +270,7 @@ export const productAPI = {
         data: response.data,
       };
     } catch (error) {
-      console.error('Price History API Error:', error);
+      debugError('Price History API Error:', error);
       return {
         success: false,
         error: error.error || 'Failed to fetch price history',
@@ -281,7 +292,7 @@ export const productAPI = {
         };
       }
 
-      console.log(`Product API: Live refresh for ${productId}`);
+      debugLog(`Product API: Live refresh for ${productId}`);
 
       const endpoint = `${API.ENDPOINTS.PRODUCT_DETAIL}/${productId}/refresh-price`;
       const endpointWithQuery = platform ? `${endpoint}?platform=${encodeURIComponent(platform)}` : endpoint;
@@ -296,7 +307,7 @@ export const productAPI = {
         data: response.data,
       };
     } catch (error) {
-      console.error('Refresh Product Price API Error:', error);
+      debugError('Refresh Product Price API Error:', error);
       return {
         success: false,
         error: error.error || 'Failed to refresh product price',

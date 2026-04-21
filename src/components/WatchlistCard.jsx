@@ -19,7 +19,7 @@ import { useNavigation } from '@react-navigation/native';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { COLORS, FONTS, PLATFORMS } from '../utils/constants';
-import PriceChangeIndicator, { PriceChangeBadge } from './PriceChangeIndicator';
+import PriceChangeIndicator from './PriceChangeIndicator';
 import {
   removeFromWatchlist,
   selectIsRemovingFromWatchlist,
@@ -145,22 +145,24 @@ const WatchlistCard = ({
     product?.platform ||
     item?.platform ||
     product?.listings?.[0]?.platform;
-  const priceChange = Number(
-    product?.price_change_7d ?? item?.price_change_7d ?? product?.price_change ?? item?.price_change ?? 0
-  ) || 0;
-  const priceChangePercentage = Number(
-    product?.price_change_percentage ?? item?.price_change_percentage ?? 0
-  ) || 0;
-  const addedAt = item?.added_at;
-  
-  // Extract price history / previous price info
-  const previousPrice = priceChange && priceChange !== 0
-    ? Number(bestPrice || 0) - Number(priceChange || 0)
-    : null;
-  
-  // Determine if price went up or down
-  const priceWentUp = priceChange > 0;
-  const priceWentDown = priceChange < 0;
+   const addedAt = item?.added_at;
+   const previousPrice = Number(item?.previous_price ?? product?.previous_price) || null;
+   const bestPriceNum = Number(bestPrice) || 0;
+   
+   // Use EXACT SAME LOGIC AS NOTIFICATION SYSTEM: compare current price ONLY with last recorded price
+   const priceWentUp = previousPrice !== null && bestPriceNum > previousPrice + 0.01;
+   const priceWentDown = previousPrice !== null && bestPriceNum < previousPrice - 0.01;
+   
+   // Calculate actual price change values based on last price (not 7d average)
+   const priceChange = previousPrice !== null ? bestPriceNum - previousPrice : 0;
+   const priceChangePercentage = previousPrice !== null && previousPrice > 0 
+     ? ((bestPriceNum - previousPrice) / previousPrice) * 100 
+     : 0;
+  const priceTrendLabel = priceWentDown
+    ? 'Price dropped'
+    : priceWentUp
+      ? 'Price increased'
+      : 'No price change';
   
   // Format price
   const formatPrice = (price) => {
@@ -171,7 +173,32 @@ const WatchlistCard = ({
     if (!Number.isFinite(numPrice) || numPrice <= 0) return '—';
     return `₹${numPrice.toLocaleString('en-IN')}`;
   };
-  
+
+  // Determine background color based on price change direction
+  const getBackgroundColor = () => {
+    if (priceWentDown && priceChange !== 0) {
+      return '#DCFCE7'; // Light green for price drop (good for buyer)
+    }
+    if (priceWentUp && priceChange !== 0) {
+      return '#FEE2E2'; // Light red for price increase (bad for buyer)
+    }
+    return COLORS?.surface || '#FFFFFF'; // Default
+  };
+
+  // Determine border color based on price change direction
+  const getBorderColor = () => {
+    if (warningMode) return COLORS.warning;
+    if (priceWentDown && priceChange !== 0) return '#10B981'; // Green for price drop
+    if (priceWentUp && priceChange !== 0) return '#EF4444'; // Red for price increase
+    return COLORS?.surface || '#FFFFFF';
+  };
+
+  const getBorderWidth = () => {
+    if (warningMode) return 1.5;
+    if ((priceWentDown || priceWentUp) && priceChange !== 0) return 1;
+    return 0;
+  };
+
   // Handle card press - navigate to product detail
   const handlePress = useCallback(() => {
     // Press animation
@@ -285,8 +312,9 @@ const WatchlistCard = ({
             { scale: scaleAnim },
           ],
           opacity: opacityAnim,
-          borderColor: warningMode ? COLORS.warning : COLORS?.surface || '#FFFFFF',
-          borderWidth: warningMode ? 1.5 : 0,
+          backgroundColor: getBackgroundColor(),
+          borderColor: getBorderColor(),
+          borderWidth: getBorderWidth(),
           shadowOpacity: warningMode ? 0.15 : 0.08,
         },
       ]}
@@ -324,17 +352,36 @@ const WatchlistCard = ({
                 {formatPrice(bestPrice)}
               </Text>
               
+              {/* Change badge for drops / rises */}
+              {priceChange !== 0 ? (
+                <PriceChangeIndicator
+                  priceChange={priceChange}
+                  percentageChange={priceChangePercentage}
+                  size="small"
+                  showAmount={true}
+                  showPercentage={true}
+                  style={styles.priceChangeBadge}
+                />
+              ) : (
+                <View style={styles.noChangeBadge}>
+                  <Ionicons name="remove-outline" size={10} color={COLORS?.textSecondary || '#6B7280'} />
+                  <Text style={styles.noChangeBadgeText}>No price change</Text>
+                </View>
+              )}
+
               {/* Previous Price and Change info - shown if price has changed */}
               {previousPrice && previousPrice > 0 && (priceChange !== 0) && (
                 <View style={styles.priceChangeContainer}>
-                  <Text style={styles.priceChangeText}>
-                    {priceWentDown ? '↓' : priceWentUp ? '↑' : ''}
-                  </Text>
+                  <Ionicons
+                    name={priceWentDown ? 'arrow-down' : 'arrow-up'}
+                    size={12}
+                    color={priceWentDown ? '#10B981' : '#EF4444'}
+                  />
                   <Text style={[
-                    styles.priceChangeText,
+                    styles.priceTrendLabel,
                     priceWentDown ? styles.priceDropped : styles.priceIncreased
                   ]}>
-                    {formatPrice(Math.abs(priceChange))}
+                    {priceTrendLabel}
                   </Text>
                   <Text style={styles.previousPriceLabel}>
                     (was {formatPrice(previousPrice)})
@@ -506,7 +553,37 @@ const styles = StyleSheet.create({
     gap: 3,
   },
 
+  priceChangeBadge: {
+    marginTop: 4,
+    marginBottom: 2,
+  },
+
+  noChangeBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#F3F4F6',
+    alignSelf: 'flex-start',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    marginTop: 4,
+  },
+
+  noChangeBadgeText: {
+    fontSize: 10,
+    fontFamily: FONTS?.semiBold || 'System',
+    fontWeight: '600',
+    color: COLORS?.textSecondary || '#6B7280',
+  },
+
   priceChangeText: {
+    fontSize: 11,
+    fontFamily: FONTS?.semiBold || 'System',
+    fontWeight: '600',
+  },
+
+  priceTrendLabel: {
     fontSize: 11,
     fontFamily: FONTS?.semiBold || 'System',
     fontWeight: '600',

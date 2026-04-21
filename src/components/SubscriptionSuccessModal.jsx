@@ -19,7 +19,7 @@ import {
 import { COLORS, SUBSCRIPTION } from '../utils/constants';
 
 const AUTO_DISMISS_MS = 12000;
-const SUCCESS_SOUND_URL = 'https://actions.google.com/sounds/v1/cartoon/pop.ogg';
+const SUCCESS_SOUND_URL = 'https://actions.google.com/sounds/v1/alarms/beep_short.ogg';
 
 const SubscriptionSuccessModal = () => {
   const dispatch = useDispatch();
@@ -54,8 +54,11 @@ const SubscriptionSuccessModal = () => {
           }
         });
       } catch (error) {
-        Vibration.vibrate(120);
+        console.error('Sound playback error:', error);
       }
+      
+      // Always vibrate along with sound
+      Vibration.vibrate([100, 50, 100]);
     };
 
     playSuccessSound();

@@ -9,8 +9,11 @@ import { API } from '../utils/constants';
 const normalizePayload = (response) => {
   const payload = response?.data;
 
-  if (payload && typeof payload === 'object' && payload.data && typeof payload.data === 'object') {
+  if (payload && typeof payload === 'object' && !Array.isArray(payload) && payload.data && typeof payload.data === 'object') {
     return payload.data;
+  }
+  if (Array.isArray(payload)) {
+    return payload;
   }
 
   return payload && typeof payload === 'object' ? payload : {};
@@ -71,6 +74,11 @@ export const streakAPI = {
             null,
           // Additional fields the backend may provide
           nextMilestone: data.next_milestone || data.nextMilestone || null,
+          milestones: Array.isArray(data.milestones)
+            ? data.milestones
+            : Array.isArray(data.milestones_config)
+              ? data.milestones_config
+              : [],
           streakHistory: data.streak_history || data.streakHistory || [],
         },
       };
@@ -141,6 +149,7 @@ export const streakAPI = {
           message: data.message || 'Check-in successful!',
           isNewStreak: data.is_new_streak ?? data.isNewStreak ?? false,
           wasReset: data.was_reset ?? data.wasReset ?? false,
+          milestones: Array.isArray(data.milestones) ? data.milestones : [],
         },
       };
     } catch (error) {
@@ -192,11 +201,16 @@ export const streakAPI = {
       }
 
       const data = normalizePayload(response);
+      const milestoneList = Array.isArray(data)
+        ? data
+        : Array.isArray(data.milestones)
+          ? data.milestones
+          : [];
 
       return {
         success: true,
         data: {
-          milestones: data.milestones || [],
+          milestones: milestoneList,
           currentStreak: data.current_streak ?? data.currentStreak ?? 0,
           nextMilestone: data.next_milestone || data.nextMilestone || null,
         },

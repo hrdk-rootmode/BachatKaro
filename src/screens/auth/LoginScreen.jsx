@@ -13,11 +13,13 @@ import {
   TouchableOpacity,
   Alert,
   Keyboard,
+  Modal,
 } from 'react-native';
 
 import Button from '../../components/common/Button';
 import Input from '../../components/common/Input';
 import { useAuth } from '../../hooks/useAuth';
+import firebaseService from '../../services/firebase';
 import { COLORS, APP } from '../../utils/constants';
 import { SafeAreaView } from 'react-native-safe-area-context';
 // --------------------------------------------
@@ -36,6 +38,9 @@ const LoginScreen = () => {
   const [referralCodeInput, setReferralCodeInput] = useState('');
   const [errors, setErrors] = useState({});
   const [referralChecking, setReferralChecking] = useState(false);
+  const [forgotPasswordVisible, setForgotPasswordVisible] = useState(false);
+  const [forgotPasswordEmail, setForgotPasswordEmail] = useState('');
+  const [isSendingForgotPassword, setIsSendingForgotPassword] = useState(false);
 
   // --------------------------------------------
   // HOOKS
@@ -119,11 +124,42 @@ const LoginScreen = () => {
   };
 
   const handleForgotPassword = () => {
-    Alert.alert(
-      'Reset Password',
-      'Password reset will be available in the next update. For now, please create a new account.',
-      [{ text: 'OK' }]
-    );
+    setForgotPasswordEmail(String(email || '').trim());
+    setForgotPasswordVisible(true);
+  };
+
+  const closeForgotPasswordModal = () => {
+    setForgotPasswordVisible(false);
+    setIsSendingForgotPassword(false);
+  };
+
+  const sendForgotPasswordEmail = async () => {
+    const cleanEmail = String(forgotPasswordEmail || '').trim().toLowerCase();
+    if (!cleanEmail) {
+      Alert.alert('Email Required', 'Please enter your email address.');
+      return;
+    }
+
+    const looksLikeEmail = cleanEmail.includes('@') && cleanEmail.includes('.');
+    if (!looksLikeEmail) {
+      Alert.alert('Invalid Email', 'Please enter a valid email address.');
+      return;
+    }
+
+    setIsSendingForgotPassword(true);
+    try {
+      const result = await firebaseService.sendResetEmail(cleanEmail);
+      if (result?.success) {
+        Alert.alert('Reset Email Sent', `Password reset link sent to ${cleanEmail}.`);
+        closeForgotPasswordModal();
+      } else {
+        Alert.alert('Reset Failed', result?.error || 'Unable to send password reset email.');
+      }
+    } catch (error) {
+      Alert.alert('Reset Failed', 'Unable to send password reset email.');
+    } finally {
+      setIsSendingForgotPassword(false);
+    }
   };
 
   // --------------------------------------------
@@ -245,6 +281,15 @@ const LoginScreen = () => {
               </TouchableOpacity>
             )}
 
+            {isSignup && (
+              <TouchableOpacity
+                style={styles.forgotButton}
+                onPress={handleForgotPassword}
+              >
+                <Text style={styles.forgotText}>Forgot Password?</Text>
+              </TouchableOpacity>
+            )}
+
             {/* Submit Button */}
             <View style={styles.submitContainer}>
               <Button
@@ -288,6 +333,45 @@ const LoginScreen = () => {
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <Modal
+        visible={forgotPasswordVisible}
+        animationType="fade"
+        transparent
+        onRequestClose={closeForgotPasswordModal}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Forgot Password</Text>
+            <Text style={styles.modalSubtitle}>Enter your email and we will send a reset link.</Text>
+
+            <Input
+              label="Email"
+              value={forgotPasswordEmail}
+              onChangeText={setForgotPasswordEmail}
+              placeholder="Enter your email"
+              keyboardType="email-address"
+              autoCapitalize="none"
+            />
+
+            <View style={styles.modalActions}>
+              <Button
+                title="Cancel"
+                onPress={closeForgotPasswordModal}
+                variant="outline"
+                style={styles.modalButton}
+              />
+              <Button
+                title="Send Reset Link"
+                onPress={sendForgotPasswordEmail}
+                loading={isSendingForgotPassword}
+                disabled={isSendingForgotPassword}
+                style={styles.modalButton}
+              />
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -434,6 +518,42 @@ const styles = StyleSheet.create({
     color: COLORS.gray400,
     textAlign: 'center',
     marginTop: 24,
+  },
+
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'center',
+    padding: 20,
+  },
+
+  modalCard: {
+    backgroundColor: COLORS.white,
+    borderRadius: 16,
+    padding: 18,
+  },
+
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    marginBottom: 8,
+  },
+
+  modalSubtitle: {
+    fontSize: 14,
+    color: COLORS.gray600,
+    marginBottom: 14,
+  },
+
+  modalActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 6,
+  },
+
+  modalButton: {
+    flex: 1,
   },
 });
 

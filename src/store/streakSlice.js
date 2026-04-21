@@ -7,29 +7,18 @@ import { createSlice, createAsyncThunk, createSelector } from '@reduxjs/toolkit'
 import { streakAPI } from '../services/streakApi';
 import { activateProTrial, refreshUserData } from './authSlice';
 import { fetchWatchlist } from './watchlistSlice';
-import { STREAK_MILESTONES } from '../utils/constants';
+import { fetchSubscriptionStatus } from './subscriptionSlice';
 
-const milestoneDaysAsc = Object.keys(STREAK_MILESTONES)
-  .map(Number)
-  .sort((a, b) => a - b);
-
-const getNextMilestoneDay = (streakDays) => {
-  return milestoneDaysAsc.find((day) => day > streakDays) || null;
+const getMilestoneDays = (milestones = []) => {
+  return milestones
+    .map((m) => Number(m?.days ?? m?.streak_days ?? 0))
+    .filter((d) => Number.isFinite(d) && d > 0)
+    .sort((a, b) => a - b);
 };
 
-export const getWatchlistBonusForStreak = (streakDays) => {
-  const days = Math.max(0, Number(streakDays || 0));
-  let bonus = 0;
-
-  if (days >= 7) {
-    bonus += 1;
-  }
-
-  if (days >= 10) {
-    bonus += 2;
-  }
-
-  return bonus;
+const getNextMilestoneDayFromMilestones = (streakDays, milestones = []) => {
+  const days = getMilestoneDays(milestones);
+  return days.find((day) => day > Number(streakDays || 0)) || null;
 };
 
 // --------------------------------------------
@@ -45,6 +34,7 @@ const initialState = {
   
   // Additional data from backend
   nextMilestone: null,
+  milestones: [],
   streakHistory: [],
   
   // Loading states
@@ -89,13 +79,17 @@ export const checkAndMarkStreak = createAsyncThunk(
       
       // Step 2: If already checked in today, return status
       if (statusData.todayCompleted) {
+        const milestones = Array.isArray(statusData.milestones) ? statusData.milestones : [];
         console.log('[StreakSlice] Already checked in today. Current streak:', statusData.currentStreak);
         return {
           currentStreak: statusData.currentStreak,
           longestStreak: statusData.longestStreak,
           todayCompleted: statusData.todayCompleted,
           lastVisitDate: statusData.lastVisitDate,
-          nextMilestone: statusData.nextMilestone,
+          nextMilestone:
+            statusData.nextMilestone ??
+            getNextMilestoneDayFromMilestones(statusData.currentStreak, milestones),
+          milestones,
           streakHistory: statusData.streakHistory,
           streakMilestoneReward: statusData.streakMilestoneReward || null,
         };
@@ -121,6 +115,11 @@ export const checkAndMarkStreak = createAsyncThunk(
       
       // Step 4: Return updated data from check-in
       const checkInData = checkInResult.data;
+      const milestones = Array.isArray(checkInData.milestones)
+        ? checkInData.milestones
+        : Array.isArray(statusData.milestones)
+          ? statusData.milestones
+          : [];
       
       // Log streak events
       if (checkInData.isNewStreak) {
@@ -131,12 +130,17 @@ export const checkAndMarkStreak = createAsyncThunk(
       }
       if (checkInData.streakMilestoneReward) {
         console.log('[StreakSlice] 🎁 Milestone reward unlocked!', checkInData.streakMilestoneReward);
-        if (checkInData.streakMilestoneReward.reward_type === 'watchlist_slots') {
+        const rewardType = checkInData.streakMilestoneReward.reward_type;
+        if (rewardType === 'watchlist_slots') {
           dispatch(fetchWatchlist({ forceRefresh: true }));
+        }
+        if (rewardType === 'premium_days' || rewardType === 'free_month') {
+          dispatch(fetchSubscriptionStatus());
         }
       }
 
-      // Keep watchlist limit synced with backend after check-in updates usage stats.
+      // Keep user/watchlist state synced after check-in updates streak/usage stats.
+      dispatch(refreshUserData());
       dispatch(fetchWatchlist({ forceRefresh: true }));
       
       return {
@@ -144,7 +148,10 @@ export const checkAndMarkStreak = createAsyncThunk(
         longestStreak: checkInData.longestStreak,
         todayCompleted: checkInData.todayCompleted,
         lastVisitDate: checkInData.lastVisitDate,
-        nextMilestone: checkInData.nextMilestone || null,
+        nextMilestone:
+          checkInData.nextMilestone ??
+          getNextMilestoneDayFromMilestones(checkInData.currentStreak, milestones),
+        milestones,
         streakHistory: checkInData.streakHistory || [],
         streakMilestoneReward: checkInData.streakMilestoneReward || null,
         message: checkInData.message,
@@ -299,7 +306,7 @@ const streakSlice = createSlice({
       }
 
       state.longestStreak = Math.max(Number(state.longestStreak || 0), state.currentStreak);
-      state.nextMilestone = getNextMilestoneDay(state.currentStreak);
+      state.nextMilestone = getNextMilestoneDayFromMilestones(state.currentStreak, state.milestones);
       state.lastCheckedAt = new Date().toISOString();
       state.error = null;
       state.isLoading = false;
@@ -315,7 +322,7 @@ const streakSlice = createSlice({
       state.longestStreak = 0;
       state.todayCompleted = false;
       state.lastVisitDate = null;
-      state.nextMilestone = getNextMilestoneDay(0);
+      state.nextMilestone = getNextMilestoneDayFromMilestones(0, state.milestones);
       state.streakHistory = [];
       state.unlockedReward = null;
       state.isRewardModalVisible = false;
@@ -346,6 +353,9 @@ const streakSlice = createSlice({
       state.todayCompleted = payload.todayCompleted;
       state.lastVisitDate = payload.lastVisitDate;
       state.nextMilestone = payload.nextMilestone;
+      if (Array.isArray(payload.milestones)) {
+        state.milestones = payload.milestones;
+      }
       state.streakHistory = payload.streakHistory || [];
       state.lastCheckedAt = new Date().toISOString();
       state.error = null;
@@ -376,8 +386,10 @@ const streakSlice = createSlice({
     
     builder.addCase(fetchMilestones.fulfilled, (state, action) => {
       state.isLoading = false;
-      state.nextMilestone = action.payload.nextMilestone;
-      // Could store milestones array if needed for UI
+      state.milestones = Array.isArray(action.payload.milestones) ? action.payload.milestones : [];
+      state.nextMilestone =
+        action.payload.nextMilestone ??
+        getNextMilestoneDayFromMilestones(state.currentStreak, state.milestones);
     });
     
     builder.addCase(fetchMilestones.rejected, (state, action) => {
@@ -414,7 +426,7 @@ const streakSlice = createSlice({
       state.longestStreak = 0;
       state.todayCompleted = true;
       state.lastVisitDate = nowIso.split('T')[0];
-      state.nextMilestone = getNextMilestoneDay(0);
+      state.nextMilestone = getNextMilestoneDayFromMilestones(0, state.milestones);
       state.streakHistory = [];
       state.unlockedReward = null;
       state.isRewardModalVisible = false;
@@ -450,16 +462,13 @@ export const selectLongestStreak = (state) => state.streak.longestStreak;
 export const selectTodayCompleted = (state) => state.streak.todayCompleted;
 export const selectLastVisitDate = (state) => state.streak.lastVisitDate;
 export const selectNextMilestone = (state) => state.streak.nextMilestone;
+export const selectStreakMilestones = (state) => state.streak.milestones;
 export const selectStreakHistory = (state) => state.streak.streakHistory;
 export const selectStreakLoading = (state) => state.streak.isLoading;
 export const selectStreakError = (state) => state.streak.error;
 export const selectUnlockedReward = (state) => state.streak.unlockedReward;
 export const selectIsRewardModalVisible = (state) => state.streak.isRewardModalVisible;
 export const selectLastCheckedAt = (state) => state.streak.lastCheckedAt;
-export const selectWatchlistBonusForCurrentStreak = createSelector(
-  [selectCurrentStreak],
-  (currentStreak) => getWatchlistBonusForStreak(currentStreak)
-);
 
 // Composite selector for UI
 export const selectStreakData = createSelector(

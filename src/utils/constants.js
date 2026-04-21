@@ -65,6 +65,7 @@ export const API = {
     // Authentication
     ME: '/auth/me',
     ME_STATS: '/auth/me/stats',
+    ME_STATS_RESET_SEARCHES: '/auth/me/stats/reset-searches',
     LOGOUT: '/auth/logout',
     TOKEN_STATUS: '/auth/token-status',
     VERIFY_REFERRAL: '/auth/verify-referral-code',

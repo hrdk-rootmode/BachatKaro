@@ -3,6 +3,7 @@ import {
   View, Text, StyleSheet, FlatList, Dimensions, TouchableOpacity, ActivityIndicator,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import { Image } from 'expo-image';
 import { Ionicons } from '@expo/vector-icons';
 import { homeAPI } from '../../services/homeApi';
 import { COLORS } from '../../utils/constants';
@@ -12,6 +13,7 @@ const BANNER_HEIGHT = 180;
 const AUTO_SCROLL_INTERVAL = 5000;
 const ITEM_WIDTH = SCREEN_WIDTH - 32;
 const ITEM_SPACING = 16;
+const PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';
 
 // ✅ Fallback banners if API fails
 const FALLBACK_BANNERS = [
@@ -98,7 +100,21 @@ const BannerCarousel = ({ products, onBannerPress, isLoading }) => {
         end={{ x: 1, y: 1 }}
       >
         <View style={styles.bannerContent}>
-          <Text style={styles.bannerEmoji}>{item.emoji}</Text>
+          <View style={styles.bannerImageWrap}>
+            {item.image_url ? (
+              <Image
+                source={{ uri: item.image_url }}
+                placeholder={PLACEHOLDER}
+                style={styles.bannerImage}
+                contentFit="cover"
+                transition={200}
+              />
+            ) : (
+              <View style={styles.bannerEmojiFallback}>
+                <Text style={styles.bannerEmoji}>{item.emoji}</Text>
+              </View>
+            )}
+          </View>
           <View style={styles.bannerTextContainer}>
             <Text style={styles.bannerTitle} numberOfLines={2}>{item.title}</Text>
             <Text style={styles.bannerSubtitle} numberOfLines={1}>{item.subtitle}</Text>
@@ -181,9 +197,30 @@ const styles = StyleSheet.create({
     flexDirection: 'row', 
     alignItems: 'center' 
   },
-  bannerEmoji: { 
-    fontSize: 48, 
-    marginRight: 16 
+  bannerImageWrap: {
+    width: 72,
+    height: 72,
+    borderRadius: 18,
+    overflow: 'hidden',
+    marginRight: 14,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  bannerImage: {
+    width: '100%',
+    height: '100%',
+  },
+  bannerEmojiFallback: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  bannerEmoji: {
+    fontSize: 40,
   },
   bannerTextContainer: { 
     flex: 1 

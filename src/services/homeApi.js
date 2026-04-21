@@ -115,6 +115,23 @@ export const homeAPI = {
       };
     }
   },
+
+  getRecentlyPriceChanged: async (limit = 50, days = 7) => {
+    try {
+      const response = await get('/home/recently-price-changed', { limit, days });
+      if (!response.success) return response;
+
+      return {
+        success: true,
+        data: Array.isArray(response.data) ? response.data : [],
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.error || 'Failed to fetch recently price-changed products',
+      };
+    }
+  },
 };
 
 

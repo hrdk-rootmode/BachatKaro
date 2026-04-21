@@ -24,6 +24,7 @@ import {
 } from '../store/authSlice';
 
 import { validateLoginForm, validateSignupForm } from '../utils/validators';
+import { getSearchQuotaSnapshot } from '../utils/searchQuota';
 
 // --------------------------------------------
 // USE AUTH HOOK
@@ -165,9 +166,7 @@ export const useAuth = () => {
   // --------------------------------------------
   
   const userPlan = user?.plan || 'free';
-  const searchesRemaining = user?.searches_today !== undefined
-    ? (user?.daily_limit || 10) - user.searches_today
-    : null;
+  const searchesRemaining = getSearchQuotaSnapshot({ user }).remainingSearches;
   const watchlistCount = user?.watchlist_count || 0;
   const currentStreak = user?.current_streak || 0;
 

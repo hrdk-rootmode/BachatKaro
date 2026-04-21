@@ -17,6 +17,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Dimensions,
+  Alert,
 } from 'react-native';
 import { useDispatch, useSelector } from 'react-redux';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -34,8 +35,11 @@ import {
   selectTrendingProducts,
   selectTrendingStatus,
 } from '../../store/searchSlice';
+import { selectUser } from '../../store/authSlice';
+import { selectPlans } from '../../store/subscriptionSlice';
 import { selectThemePalette } from '../../store/themeSlice';
 import { COLORS, APP } from '../../utils/constants';
+import { getSearchQuotaSnapshot } from '../../utils/searchQuota';
 import { 
   formatPrice, 
   getPlatformBadge,
@@ -65,11 +69,48 @@ const SearchScreenPremium = ({ navigation, route }) => {
   const trendingProducts = useSelector(selectTrendingProducts) || [];
   const trendingStatus = useSelector(selectTrendingStatus) || 'idle';
   const themePalette = useSelector(selectThemePalette);
+  const user = useSelector(selectUser);
+  const plans = useSelector(selectPlans);
 
   // Local state
   const [searchQuery, setSearchQuery] = useState(route.params?.initialQuery || '');
   const [showResults, setShowResults] = useState(!!route.params?.initialQuery);
   const [isInputFocused, setIsInputFocused] = useState(false);
+  const lastAlertedErrorRef = React.useRef(null);
+
+  const currentPlan = String(user?.plan || 'free').toLowerCase();
+  const planInfo = useMemo(() => {
+    const planMap = {};
+    if (Array.isArray(plans)) {
+      plans.forEach((plan) => {
+        if (!plan?.id) return;
+        planMap[String(plan.id).toLowerCase()] = plan;
+      });
+    }
+
+    return planMap[currentPlan] || APP.PLANS[currentPlan.toUpperCase()] || APP.PLANS.FREE;
+  }, [plans, currentPlan]);
+
+  const searchQuota = useMemo(() => getSearchQuotaSnapshot({ user, planInfo }), [planInfo, user]);
+
+  const searchErrorText = useMemo(() => {
+    if (typeof searchError === 'string') return searchError;
+    if (searchError && typeof searchError === 'object') {
+      return searchError.message || searchError.detail || searchError.error || 'Search failed.';
+    }
+    return '';
+  }, [searchError]);
+
+  useEffect(() => {
+    if (searchStatus === 'failed' && searchErrorText && lastAlertedErrorRef.current !== searchErrorText) {
+      lastAlertedErrorRef.current = searchErrorText;
+      Alert.alert('Search unavailable', searchErrorText);
+    }
+
+    if (searchStatus !== 'failed') {
+      lastAlertedErrorRef.current = null;
+    }
+  }, [searchErrorText, searchStatus]);
 
   // ============================================
   // GET NEW PRODUCTS (Last 24h)
@@ -517,6 +558,15 @@ const SearchScreenPremium = ({ navigation, route }) => {
             ✨ Discover
           </Text>
         </View>
+
+        <View style={styles.quotaPillRow}>
+          <View style={[styles.quotaPill, { backgroundColor: themePalette.surfaceMuted || COLORS.gray100 }]}>
+            <Ionicons name="search" size={14} color={themePalette.primary || COLORS.primary} />
+            <Text style={[styles.quotaPillText, { color: themePalette.text || COLORS.textPrimary }]}>
+              {searchQuota.isUnlimited ? 'Unlimited searches' : `${searchQuota.remainingSearches} searches left today`}
+            </Text>
+          </View>
+        </View>
       </View>
 
       {/* BODY */}
@@ -552,7 +602,7 @@ const SearchScreenPremium = ({ navigation, route }) => {
                 <View style={styles.errorSection}>
                   <Ionicons name="alert-circle" size={48} color={COLORS.error} />
                   <Text style={[styles.errorText, { color: themePalette.text || COLORS.textPrimary }]}>
-                    {searchError}
+                    {searchErrorText}
                   </Text>
                   {searchQuery && URL_PATTERN.test(searchQuery.trim()) && (
                     <View>
@@ -743,6 +793,27 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+  },
+
+  quotaPillRow: {
+    marginTop: 12,
+    flexDirection: 'row',
+    justifyContent: 'flex-start',
+  },
+
+  quotaPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    alignSelf: 'flex-start',
+  },
+
+  quotaPillText: {
+    fontSize: 12,
+    fontWeight: '700',
   },
 
   backButtonIcon: {

@@ -13,6 +13,8 @@ import { Ionicons } from '@expo/vector-icons';
 import StreakTracker from '../components/StreakTracker';
 import {
   selectStreakData,
+  selectStreakMilestones,
+  fetchMilestones,
 } from '../store/streakSlice';
 import {
   activateProTrial,
@@ -21,6 +23,29 @@ import {
 } from '../store/authSlice';
 
 import { COLORS } from '../utils/constants';
+
+const formatRewardText = (rewardType, rewardValue, announcementText) => {
+  if (announcementText) {
+    return announcementText;
+  }
+  const amount = Number(rewardValue || 0);
+  switch (String(rewardType || '').toLowerCase()) {
+    case 'search_bonus':
+      return `+${amount} Extra Searches`;
+    case 'daily_search_bonus':
+      return `+${amount} Daily Searches`;
+    case 'watchlist_slots':
+      return `+${amount} Watchlist Slots`;
+    case 'premium_days':
+      return `${amount} Day Pro Access`;
+    case 'unlimited_hours':
+      return `${amount} Hours Unlimited Search`;
+    case 'free_month':
+      return '1 Free Month';
+    default:
+      return announcementText || 'Special Reward';
+  }
+};
 
 const formatTrialTimeRemaining = (expiresAt) => {
   if (!expiresAt) return null;
@@ -37,12 +62,22 @@ const formatTrialTimeRemaining = (expiresAt) => {
 const StreakScreen = () => {
   const dispatch = useDispatch();
   const streakData = useSelector(selectStreakData);
+  const milestoneConfig = useSelector(selectStreakMilestones);
   const proTrialInfo = useSelector(selectProTrialInfo);
   const [trialTimeRemaining, setTrialTimeRemaining] = React.useState(null);
 
   const currentStreak = streakData?.currentStreak || 0;
   const longestStreak = streakData?.longestStreak || 0;
   const todayCompleted = Boolean(streakData?.todayCompleted);
+  const milestones = React.useMemo(() => {
+    return (Array.isArray(milestoneConfig) ? milestoneConfig : [])
+      .map((m) => ({
+        days: Number(m?.days ?? m?.streak_days ?? 0),
+        reward: formatRewardText(m?.reward_type, m?.reward_value, m?.announcement_text),
+      }))
+      .filter((m) => Number.isFinite(m.days) && m.days > 0)
+      .sort((a, b) => a.days - b.days);
+  }, [milestoneConfig]);
 
   const handleActivateTrialForDev = () => {
     dispatch(activateProTrial({ durationHours: 1 }));
@@ -66,6 +101,10 @@ const StreakScreen = () => {
     const interval = setInterval(updateTimer, 1000);
     return () => clearInterval(interval);
   }, [proTrialInfo?.expiresAt, proTrialInfo?.isActive]);
+
+  React.useEffect(() => {
+    dispatch(fetchMilestones());
+  }, [dispatch]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -127,22 +166,12 @@ const StreakScreen = () => {
             <Ionicons name="gift" size={18} color="#8B5CF6" />
             <Text style={styles.guideTitle}>What You Get</Text>
           </View>
-          <View style={styles.guideItem}>
-            <Text style={styles.guideDay}>5 Days</Text>
-            <Text style={styles.guideReward}>+5 Extra Searches</Text>
-          </View>
-          <View style={styles.guideItem}>
-            <Text style={styles.guideDay}>7 Days</Text>
-            <Text style={styles.guideReward}>+1 Watchlist Slot</Text>
-          </View>
-          <View style={styles.guideItem}>
-            <Text style={styles.guideDay}>10 Days</Text>
-            <Text style={styles.guideReward}>+3 Watchlist Slots</Text>
-          </View>
-          <View style={styles.guideItem}>
-            <Text style={styles.guideDay}>15 Days</Text>
-            <Text style={styles.guideReward}>+6 Hours Unlimited Search</Text>
-          </View>
+          {milestones.map((milestone) => (
+            <View style={styles.guideItem} key={milestone.days}>
+              <Text style={styles.guideDay}>{milestone.days} Days</Text>
+              <Text style={styles.guideReward}>{milestone.reward}</Text>
+            </View>
+          ))}
         </View>
 
         {/* Dev Controls */}

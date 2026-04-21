@@ -5,6 +5,11 @@
 import api from './api';
 import { API } from '../utils/constants';
 
+const isValidUuid = (value) => {
+  if (!value) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value).trim());
+};
+
 // --------------------------------------------
 // PRODUCT API METHODS
 // --------------------------------------------
@@ -22,6 +27,13 @@ export const productAPI = {
         return {
           success: false,
           error: 'Product ID is required',
+        };
+      }
+
+      if (!isValidUuid(productId)) {
+        return {
+          success: false,
+          error: 'Invalid product reference',
         };
       }
       
@@ -70,6 +82,13 @@ export const productAPI = {
         return {
           success: false,
           error: 'Product ID is required',
+        };
+      }
+
+      if (!isValidUuid(productId)) {
+        return {
+          success: false,
+          error: 'Invalid product reference',
         };
       }
       

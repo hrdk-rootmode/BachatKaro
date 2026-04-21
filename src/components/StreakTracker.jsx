@@ -6,15 +6,52 @@ import { LinearGradient } from 'expo-linear-gradient';
 
 import {
   selectStreakData,
+  selectStreakMilestones,
 } from '../store/streakSlice';
 import { COLORS } from '../utils/constants';
 
-// Milestone rewards configuration
-const MILESTONE_REWARDS = {
-  5: { emoji: '🔍', title: '5-Day Champion', reward: '+5 Extra Searches', color: '#F59E0B' },
-  7: { emoji: '🎉', title: 'Week Warrior', reward: '+1 Watchlist Slot', color: '#10B981' },
-  10: { emoji: '⭐', title: '10-Day Legend', reward: '+3 Watchlist Slots', color: '#8B5CF6' },
-  15: { emoji: '🏆', title: '15-Day Hero', reward: '+6 Hours Unlimited', color: '#3B82F6' },
+const rewardTypeColor = {
+  search_bonus: '#F59E0B',
+  daily_search_bonus: '#FB923C',
+  watchlist_slots: '#10B981',
+  premium_days: '#3B82F6',
+  unlimited_hours: '#2563EB',
+  free_month: '#8B5CF6',
+};
+
+const formatRewardText = (rewardType, rewardValue, announcementText) => {
+  if (announcementText) {
+    return announcementText;
+  }
+  const amount = Number(rewardValue || 0);
+  switch (rewardType) {
+    case 'search_bonus':
+      return `+${amount} Extra Searches`;
+    case 'daily_search_bonus':
+      return `+${amount} Daily Searches`;
+    case 'watchlist_slots':
+      return `+${amount} Watchlist Slots`;
+    case 'premium_days':
+      return `${amount} Day Pro Access`;
+    case 'unlimited_hours':
+      return `${amount} Hours Unlimited Search`;
+    case 'free_month':
+      return '1 Free Month';
+    default:
+      return announcementText || 'Special Reward';
+  }
+};
+
+const normalizeMilestone = (milestone) => {
+  const days = Number(milestone?.days ?? milestone?.streak_days ?? 0);
+  const rewardType = String(milestone?.reward_type || '').toLowerCase();
+  return {
+    days,
+    emoji: milestone?.badge_emoji || '🎯',
+    title: milestone?.badge_name || `${days}-Day Milestone`,
+    reward: formatRewardText(rewardType, milestone?.reward_value, milestone?.announcement_text),
+    color: rewardTypeColor[rewardType] || '#6366F1',
+  };
 };
 
 // Day indicator for weekly view
@@ -79,6 +116,7 @@ const MilestoneCard = ({ days, milestone, isCompleted, isCurrent }) => (
 // Main streak tracker component
 const StreakTracker = () => {
   const streakData = useSelector(selectStreakData);
+  const milestoneConfig = useSelector(selectStreakMilestones);
 
   const {
     currentStreak = 0,
@@ -106,20 +144,26 @@ const StreakTracker = () => {
     });
   }, [currentStreak, todayCompleted]);
 
+  const milestones = useMemo(() => {
+    return (Array.isArray(milestoneConfig) ? milestoneConfig : [])
+      .map(normalizeMilestone)
+      .filter((item) => Number.isFinite(item.days) && item.days > 0)
+      .sort((a, b) => a.days - b.days);
+  }, [milestoneConfig]);
+
   // Get next milestone info
   const milestoneInfo = useMemo(() => {
-    const milestones = Object.keys(MILESTONE_REWARDS).map(Number).sort((a, b) => a - b);
-    const next = milestones.find(m => m > currentStreak);
+    const next = milestones.find((m) => m.days > currentStreak);
     
     if (next) {
       return {
-        days: next,
-        daysRemaining: next - currentStreak,
-        reward: MILESTONE_REWARDS[next],
+        days: next.days,
+        daysRemaining: next.days - currentStreak,
+        reward: next,
       };
     }
     return null;
-  }, [currentStreak]);
+  }, [currentStreak, milestones]);
 
   // Dynamic message
   const getMessage = () => {
@@ -130,8 +174,6 @@ const StreakTracker = () => {
     if (todayCompleted) return `${currentStreak} days strong!`;
     return `${currentStreak} days, check in to continue!`;
   };
-
-  const milestones = Object.keys(MILESTONE_REWARDS).map(Number).sort((a, b) => a - b);
 
   return (
     <View style={styles.container}>
@@ -196,15 +238,15 @@ const StreakTracker = () => {
           style={styles.milestoneScroll}
           contentContainerStyle={styles.milestoneScrollContent}
         >
-          {milestones.map((days) => {
-            const isCompleted = currentStreak >= days;
-            const isCurrent = currentStreak === days;
+          {milestones.map((milestone) => {
+            const isCompleted = currentStreak >= milestone.days;
+            const isCurrent = currentStreak === milestone.days;
             
             return (
               <MilestoneCard 
-                key={days}
-                days={days}
-                milestone={MILESTONE_REWARDS[days]}
+                key={milestone.days}
+                days={milestone.days}
+                milestone={milestone}
                 isCompleted={isCompleted}
                 isCurrent={isCurrent}
               />

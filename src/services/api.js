@@ -181,6 +181,20 @@ const handleApiError = (error) => {
     requestPath.includes('/home/cross-platform') ||
     requestPath.includes('/home/featured') ||
     requestPath.includes('/search/trending');
+
+  const normalizeMessage = (value, fallback) => {
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object') {
+      return value.message || value.detail || value.error || fallback;
+    }
+    return fallback;
+  };
+
+  const isDailySearchLimitEvent = () => {
+    if (statusCode !== 429) return false;
+    const lowerPath = String(requestPath || '').toLowerCase();
+    return lowerPath.includes('/search/search');
+  };
   
   if (error.response) {
     // Server responded with error
@@ -189,7 +203,7 @@ const handleApiError = (error) => {
     
     switch (statusCode) {
       case 400:
-        errorMessage = error.response.data?.detail || 'Invalid request.';
+        errorMessage = normalizeMessage(error.response.data?.detail, 'Invalid request.');
         break;
       case 401:
         errorMessage = ERROR_MESSAGES.TOKEN_EXPIRED;
@@ -222,7 +236,7 @@ const handleApiError = (error) => {
         errorMessage = 'Resource not found.';
         break;
       case 409:
-        errorMessage = error.response.data?.detail || 'Account already exists.';
+        errorMessage = normalizeMessage(error.response.data?.detail, 'Account already exists.');
         break;
       case 429: {
         const backendMessage = error.response.data?.detail || error.response.data?.message;
@@ -230,9 +244,9 @@ const handleApiError = (error) => {
 
         // Keep signup-specific copy only for auth/signup endpoints.
         if (requestUrl.includes('/auth/signup-public')) {
-          errorMessage = backendMessage || ERROR_MESSAGES.IP_LIMIT;
+          errorMessage = normalizeMessage(backendMessage, ERROR_MESSAGES.IP_LIMIT);
         } else {
-          errorMessage = backendMessage || 'Too many requests. Please try again shortly.';
+          errorMessage = normalizeMessage(backendMessage, 'Too many requests. Please try again shortly.');
         }
         break;
       }
@@ -240,7 +254,7 @@ const handleApiError = (error) => {
         errorMessage = ERROR_MESSAGES.SERVER_ERROR;
         break;
       default:
-        errorMessage = error.response.data?.detail || ERROR_MESSAGES.SERVER_ERROR;
+        errorMessage = normalizeMessage(error.response.data?.detail, ERROR_MESSAGES.SERVER_ERROR);
     }
   } else if (error.request) {
     // Request made but no response
@@ -258,7 +272,11 @@ const handleApiError = (error) => {
     errorMessage = error.message || ERROR_MESSAGES.UNKNOWN_ERROR;
   }
   
-  if (statusCode === 0 && isBackgroundFeedEndpoint) {
+  if (isDailySearchLimitEvent()) {
+    // This is an expected product-state event; UI should show it as alert/toast.
+    // Avoid noisy global console errors.
+    console.warn(`API Notice [${statusCode}] ${requestMethod} ${requestPath}:`, errorMessage);
+  } else if (statusCode === 0 && isBackgroundFeedEndpoint) {
     console.warn(`API Error [${statusCode}] ${requestMethod} ${requestPath}:`, errorMessage);
   } else {
     console.error(`API Error [${statusCode}] ${requestMethod} ${requestPath}:`, errorMessage);
@@ -365,6 +383,13 @@ export const authAPI = {
    */
   getStats: async () => {
     return await get(API.ENDPOINTS.ME_STATS);
+  },
+
+  /**
+   * Reset today's search usage counters (development only)
+   */
+  resetSearchUsage: async () => {
+    return await post(API.ENDPOINTS.ME_STATS_RESET_SEARCHES);
   },
   
   /**

@@ -15,11 +15,13 @@ import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useDispatch, useSelector } from 'react-redux';
 import { Ionicons } from '@expo/vector-icons';
 
-import { COLORS, SIZES } from '../utils/constants';
+import { COLORS, SIZES, APP } from '../utils/constants';
 import { selectThemePalette } from '../store/themeSlice';
 import { notificationApi } from '../services/notificationApi';
 import { selectUser, selectProTrialInfo } from '../store/authSlice';
 import { selectWatchlistCount, selectWatchlistLimit } from '../store/watchlistSlice';
+import { selectPlans } from '../store/subscriptionSlice';
+import { getSearchQuotaSnapshot } from '../utils/searchQuota';
 import {
   selectNotifications,
   setNotificationOwner,
@@ -43,6 +45,7 @@ const NotificationsScreen = () => {
   const proTrialInfo = useSelector(selectProTrialInfo);
   const watchlistCount = useSelector(selectWatchlistCount);
   const watchlistLimit = useSelector(selectWatchlistLimit);
+  const plans = useSelector(selectPlans);
   
   const notifications = useSelector(selectNotifications);
   const [loading, setLoading] = useState(true);
@@ -51,18 +54,23 @@ const NotificationsScreen = () => {
 
   const currentUserId = useMemo(() => String(user?.id || user?.firebase_uid || ''), [user?.id, user?.firebase_uid]);
 
-  const searchesToday = useMemo(
-    () => Number(user?.searches_today ?? user?.usage_stats?.searches_today ?? 0),
-    [user?.searches_today, user?.usage_stats?.searches_today]
-  );
-
-  const dailySearchLimit = useMemo(() => {
-    const directLimit = Number(user?.daily_limit ?? user?.usage_stats?.daily_limit ?? NaN);
-    if (Number.isFinite(directLimit) && directLimit !== 0) {
-      return directLimit;
+  const currentPlan = String(user?.plan || 'free').toLowerCase();
+  const planInfo = useMemo(() => {
+    const planMap = {};
+    if (Array.isArray(plans)) {
+      plans.forEach((plan) => {
+        if (!plan?.id) return;
+        planMap[String(plan.id).toLowerCase()] = plan;
+      });
     }
-    return -1;
-  }, [user?.daily_limit, user?.usage_stats?.daily_limit]);
+
+    return planMap[currentPlan] || APP.PLANS[currentPlan.toUpperCase()] || APP.PLANS.FREE;
+  }, [currentPlan, plans]);
+
+  const searchQuota = useMemo(() => getSearchQuotaSnapshot({ user, planInfo }), [planInfo, user]);
+  const searchesToday = searchQuota.searchesToday;
+  const dailySearchLimit = searchQuota.effectiveDailyLimit;
+  const remainingSearches = searchQuota.remainingSearches;
 
   const actionAlerts = useMemo(() => {
     const alerts = [];
@@ -75,12 +83,11 @@ const NotificationsScreen = () => {
         message: 'Upgrade your plan or wait until tomorrow to continue searching.',
       });
     } else if (dailySearchLimit > 0 && searchesToday / dailySearchLimit >= 0.8) {
-      const remaining = Math.max(0, dailySearchLimit - searchesToday);
       alerts.push({
         key: 'search-limit-near',
         type: 'streak_reminder',
         title: 'Search limit almost full',
-        message: `${remaining} searches left for today.`,
+        message: `${remainingSearches} searches left for today.`,
       });
     }
 
@@ -103,7 +110,7 @@ const NotificationsScreen = () => {
     }
 
     return alerts;
-  }, [dailySearchLimit, proTrialInfo?.expiresAt, proTrialInfo?.isActive, searchesToday, watchlistCount, watchlistLimit]);
+  }, [dailySearchLimit, proTrialInfo?.expiresAt, proTrialInfo?.isActive, remainingSearches, searchesToday, watchlistCount, watchlistLimit]);
 
   const mergedNotifications = useMemo(() => {
     const systemItems = actionAlerts.map((alert) => ({
@@ -117,26 +124,36 @@ const NotificationsScreen = () => {
       is_system: true,
     }));
 
-    // Filter price-related notifications to only show those with actual price changes
-    const filteredNotifications = notifications.filter(notif => {
-      // Keep system alerts and non-price notifications
-      if (notif.is_system || notif.type !== 'price_drop') {
-        return true;
-      }
+     // Filter notifications to only show those with actual price changes
+     const filteredNotifications = notifications.filter(notif => {
+       // Keep system alerts
+       if (notif.is_system) {
+         return true;
+       }
+       
+       // ONLY SHOW UNREAD NOTIFICATIONS - never show already read ones
+       if (notif.is_read) {
+         return false;
+       }
 
-      // For price notifications, check if there's an actual price change
-      const notifData = notif.data || {};
-      const currentPrice = notifData.price;
-      const previousPrice = notifData.previous_price;
+       // For price notifications, check if there's an actual price change
+       if (notif.type === 'price_drop' || notif.type === 'price_rise') {
+         const notifData = notif.data || {};
+         const currentPrice = notifData.price;
+         const previousPrice = notifData.previous_price;
 
-      // Only show if we have both prices and they're different
-      if (typeof currentPrice === 'number' && typeof previousPrice === 'number') {
-        return Math.abs(currentPrice - previousPrice) > 0.01;
-      }
+         // Only show if we have both prices and they're different
+         if (typeof currentPrice === 'number' && typeof previousPrice === 'number') {
+           return Math.abs(currentPrice - previousPrice) > 0.01;
+         }
 
-      // If we don't have previous price, show the notification (new price alert)
-      return true;
-    });
+         // If we don't have previous price, don't show the notification (no change to compare)
+         return false;
+       }
+
+       // For other notification types, show all unread ones
+       return true;
+     });
 
     return [...systemItems, ...filteredNotifications];
   }, [actionAlerts, notifications]);
@@ -259,26 +276,38 @@ const NotificationsScreen = () => {
     const hasPrice = typeof notifData.price === 'number';
     const hasTarget = typeof notifData.target_price === 'number';
     const showWatchlistMeta = !isSystemAlert && (item.type === 'price_drop' || item.type === 'back_in_stock');
+    const currentPrice = Number(notifData.price);
+    const previousPrice = Number(notifData.previous_price);
+    const priceChangedUp = Number.isFinite(currentPrice) && Number.isFinite(previousPrice) && currentPrice > previousPrice;
+    const priceChangedDown = Number.isFinite(currentPrice) && Number.isFinite(previousPrice) && currentPrice < previousPrice;
+    const derivedTitle = (() => {
+      if (item.type !== 'price_drop') {
+        return item.title;
+      }
+
+            
+      if (priceChangedDown) {
+        return 'Price Dropped';
+      }else{
+        return 'Price Increased';
+      }
+
+      return item.title || 'Price Alert';
+    })();
 
     // Determine price change direction for background color
-    const currentPrice = notifData.price;
-    const previousPrice = notifData.previous_price;
-    let priceChangeType = null;
     let cardBackgroundColor = isUnread ? themePalette.accent || '#f3f4f6' : themePalette.surface || '#ffffff';
     
-    if (!isSystemAlert && item.type === 'price_drop' && typeof currentPrice === 'number' && typeof previousPrice === 'number') {
+    if (!isSystemAlert && (item.type === 'price_drop' || item.type === 'price_rise') && Number.isFinite(currentPrice) && Number.isFinite(previousPrice)) {
       if (currentPrice < previousPrice) {
-        priceChangeType = 'drop';
-        cardBackgroundColor = isUnread ? '#dcfce7' : '#f0fdf4'; // Green background
+        cardBackgroundColor = isUnread ? '#dcfce7' : '#f0fdf4'; // Green background for price drop
       } else if (currentPrice > previousPrice) {
-        priceChangeType = 'rise';
-        cardBackgroundColor = isUnread ? '#fee2e2' : '#fef2f2'; // Red background
+        cardBackgroundColor = isUnread ? '#fee2e2' : '#fef2f2'; // Red background for price increase
       }
     }
 
     const watchlistMeta = showWatchlistMeta
       ? [
-          productTitle ? `Product: ${productTitle}` : null,
           hasPrice ? `Now: INR ${formatPrice(notifData.price)}` : null,
           hasTarget ? `Target: INR ${formatPrice(notifData.target_price)}` : null,
           previousPrice ? `Previous: INR ${formatPrice(previousPrice)}` : null,

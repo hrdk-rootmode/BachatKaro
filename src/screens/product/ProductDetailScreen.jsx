@@ -42,8 +42,6 @@ import {
   parseApiDate,
   toEpochMs,
 } from '../../utils/formatters';
-import PriceAccuracyDisclaimer from '../../components/PriceAccuracyDisclaimer';
-import FreshnessIndicator from '../../components/FreshnessIndicator';
 import PriceComparisonTable from '../../components/PriceComparisonTable';
 import productAPI from '../../services/productApi';
 import { searchAPI } from '../../services/searchApi';
@@ -265,7 +263,7 @@ const ProductDetailScreen = ({ navigation, route }) => {
 
       try {
         if (isMounted) setSimilarLoading(true);
-        const result = await searchAPI.searchProducts(keywords, {}, 1);
+        const result = await searchAPI.searchProducts(keywords, {}, 1, { countUsage: false });
         if (!result?.success) {
           if (isMounted) setSimilarProducts([]);
           return;
@@ -406,17 +404,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
       .sort((a, b) => Number(a?.price || 0) - Number(b?.price || 0))
       .slice(0, 12);
   }, [crossPlatformListings, selectedPlatform]);
-
-  const getFreshnessStatus = (updatedAt) => {
-    if (!updatedAt) return 'very_stale';
-    const updatedEpoch = toEpochMs(updatedAt);
-    if (!updatedEpoch) return 'very_stale';
-    const ageMs = Date.now() - updatedEpoch;
-    const ageHours = ageMs / (1000 * 60 * 60);
-    if (ageHours <= 2) return 'fresh';
-    if (ageHours <= 12) return 'stale';
-    return 'very_stale';
-  };
 
   if (productStatus === 'loading' || (product && !isRouteProductLoaded)) {
     return (
@@ -689,7 +676,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
   })();
 
   const latestKnownUpdateAt = latestHistoryPoint?.date || latestListingForSelectedPlatform?.last_scraped_at || null;
-  const freshnessStatus = getFreshnessStatus(latestKnownUpdateAt);
 
   const selectedPlatformLivePrice = latestListingForSelectedPlatform?.current_price ?? null;
 
@@ -998,18 +984,6 @@ const ProductDetailScreen = ({ navigation, route }) => {
             </TouchableOpacity>
           </View>
         <View style={styles.productSection}>
-          {/* Price Accuracy Disclaimer */}
-          <PriceAccuracyDisclaimer 
-            lastUpdatedAt={latestKnownUpdateAt}
-            freshness_status={freshnessStatus}
-          />
-
-          {/* Freshness Indicator */}
-          <FreshnessIndicator 
-            freshness_status={freshnessStatus}
-            lastUpdatedAt={latestKnownUpdateAt}
-          />
-
           {/* Price Comparison Table */}
           {Array.isArray(product?.listings) && product.listings.length > 0 && (
             <View style={{ marginVertical: 12 }}>

@@ -198,6 +198,11 @@ const getCategoryMatchStrength = (product, category) => {
   return score;
 };
 
+const isValidUuid = (value) => {
+  if (!value) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value).trim());
+};
+
 const HomeScreenV2 = () => {
   const navigation = useNavigation();
   const dispatch = useDispatch();
@@ -218,6 +223,7 @@ const HomeScreenV2 = () => {
   const [homeDeals, setHomeDeals] = React.useState([]);
   const [homeCategoryCounts, setHomeCategoryCounts] = React.useState({});
   const [crossPlatformHighlights, setCrossPlatformHighlights] = React.useState([]);
+  const [recentlyPriceChanged, setRecentlyPriceChanged] = React.useState([]);
   const [homeDataLoading, setHomeDataLoading] = React.useState(true);
 
   // Fetch trending on mount
@@ -231,22 +237,25 @@ const HomeScreenV2 = () => {
   const fetchHomeData = useCallback(async () => {
     setHomeDataLoading(true);
     try {
-      const [featuredRes, dealsRes, categoriesRes, crossPlatformRes] = await Promise.all([
+      const [featuredRes, dealsRes, categoriesRes, crossPlatformRes, recentPriceRes] = await Promise.all([
         homeAPI.getFeatured(24),
         homeAPI.getDeals(36),
         homeAPI.getCategories(),
         homeAPI.getCrossPlatformHighlights(CROSS_PLATFORM_HIGHLIGHT_LIMIT, 2),
+        homeAPI.getRecentlyPriceChanged(50, 7),
       ]);
 
       setHomeFeatured(featuredRes?.success ? (featuredRes.data || []) : []);
       setHomeDeals(dealsRes?.success ? (dealsRes.data || []) : []);
       setHomeCategoryCounts(categoriesRes?.success ? (categoriesRes.data || {}) : {});
       setCrossPlatformHighlights(crossPlatformRes?.success ? (crossPlatformRes.data || []) : []);
+      setRecentlyPriceChanged(recentPriceRes?.success ? (recentPriceRes.data || []) : []);
     } catch {
       setHomeFeatured([]);
       setHomeDeals([]);
       setHomeCategoryCounts({});
       setCrossPlatformHighlights([]);
+      setRecentlyPriceChanged([]);
     } finally {
       setHomeDataLoading(false);
     }
@@ -345,21 +354,15 @@ const HomeScreenV2 = () => {
   }, [homeDeals, trending]);
 
   const recentPriceChanges = useMemo(() => {
-    const source = mergedFeedProducts.length > 0 ? mergedFeedProducts : (homeDeals.length > 0 ? homeDeals : trending);
+    return recentlyPriceChanged;
+  }, [recentlyPriceChanged]);
+
+  const bannerProducts = useMemo(() => {
+    const source = [...bestDeals, ...recentPriceChanges, ...crossPlatformProducts, ...mergedFeedProducts];
     return dedupeProducts(source)
-      .filter((p) => Boolean(p?.last_price_change_at || p?.last_updated_at || (p?.discount_percentage || 0) >= 5))
-      .sort((a, b) => {
-        const changeA = toEpoch(a?.last_price_change_at);
-        const changeB = toEpoch(b?.last_price_change_at);
-        if (changeB !== changeA) return changeB - changeA;
-
-        const freshA = toEpoch(a?.last_updated_at);
-        const freshB = toEpoch(b?.last_updated_at);
-        if (freshB !== freshA) return freshB - freshA;
-
-        return (Number(b?.discount_percentage || 0) - Number(a?.discount_percentage || 0));
-      });
-  }, [homeDeals, mergedFeedProducts, trending]);
+      .filter((product) => isValidUuid(product?.product_id || product?.id))
+      .slice(0, 6);
+  }, [bestDeals, crossPlatformProducts, mergedFeedProducts, recentPriceChanges]);
 
   const budgetPicks = useMemo(() =>
     [...mergedFeedProducts]
@@ -542,7 +545,10 @@ const HomeScreenV2 = () => {
   // Navigation handlers
   const handleProductPress = useCallback((product) => {
     const pid = product?.id || product?.product_id;
-    if (!pid) return;
+    if (!isValidUuid(pid)) {
+      navigation.navigate('SearchTab', { screen: 'SearchMain' });
+      return;
+    }
 
     // Always open ProductDetail so users get full title/specs/price history
     // plus platform-wise comparison in one consistent screen.
@@ -581,7 +587,7 @@ const HomeScreenV2 = () => {
   // ✅ Banner press should navigate to product detail, not search
   const handleBannerPress = useCallback((product) => {
     const pid = product?.product_id || product?.id;
-    if (!pid) {
+    if (!isValidUuid(pid)) {
       // If no product_id, just go to search
       navigation.navigate('SearchTab', { screen: 'SearchMain' });
       return;
@@ -655,7 +661,7 @@ const HomeScreenV2 = () => {
         }
       >
         {/* Banner Carousel */}
-        <BannerCarousel onBannerPress={handleBannerPress} />
+        <BannerCarousel products={bannerProducts} onBannerPress={handleBannerPress} />
 
         {/* Quick Categories */}
         <QuickCategories onCategoryPress={handleCategoryPress} categories={topCategories} />

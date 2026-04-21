@@ -1,6 +1,14 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import { searchAPI, productAPI } from '../services/searchApi';
 
+const normalizeErrorPayload = (payload, fallback) => {
+  if (typeof payload === 'string') return payload;
+  if (payload && typeof payload === 'object') {
+    return payload.message || payload.detail || payload.error || fallback;
+  }
+  return fallback;
+};
+
 // ============================================
 // ASYNC THUNKS
 // ============================================
@@ -244,7 +252,7 @@ const searchSlice = createSlice({
       .addCase(searchProducts.rejected, (state, action) => {
         state.statusSearch = 'failed';
         state.isSearching = false;
-        state.searchError = action.payload;
+        state.searchError = normalizeErrorPayload(action.payload, 'Search failed.');
       });
 
     // FETCH TRENDING
@@ -259,7 +267,7 @@ const searchSlice = createSlice({
       })
       .addCase(fetchTrending.rejected, (state, action) => {
         state.statusTrending = 'failed';
-        state.trendingError = action.payload;
+        state.trendingError = normalizeErrorPayload(action.payload, 'Failed to fetch trending.');
       });
 
     // SEARCH BY URL
@@ -280,7 +288,7 @@ const searchSlice = createSlice({
       .addCase(searchByUrl.rejected, (state, action) => {
         state.statusSearch = 'failed';
         state.isSearching = false;
-        state.searchError = action.payload;
+        state.searchError = normalizeErrorPayload(action.payload, 'URL search failed.');
       });
 
     // PRODUCT DETAILS
@@ -307,7 +315,7 @@ const searchSlice = createSlice({
           return;
         }
         state.statusProductDetail = 'failed';
-        state.productError = action.payload;
+        state.productError = normalizeErrorPayload(action.payload, 'Failed to fetch product.');
         state.selectedProduct = null;
       });
 
@@ -333,7 +341,7 @@ const searchSlice = createSlice({
           return;
         }
         state.statusPriceHistory = 'failed';
-        state.priceHistoryError = action.payload;
+        state.priceHistoryError = normalizeErrorPayload(action.payload, 'Failed to fetch price history.');
       })
 
       // LIVE PRODUCT REFRESH
@@ -352,7 +360,7 @@ const searchSlice = createSlice({
       })
       .addCase(refreshProductPrice.rejected, (state, action) => {
         state.statusProductDetail = 'failed';
-        state.productError = action.payload;
+        state.productError = normalizeErrorPayload(action.payload, 'Failed to refresh product price.');
       });
   },
 });

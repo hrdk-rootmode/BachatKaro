@@ -30,9 +30,6 @@ import {
   selectIsAddingToWatchlist,
   selectIsRemovingFromWatchlist,
 } from '../store/watchlistSlice';
-import {
-  selectWatchlistBonusForCurrentStreak,
-} from '../store/streakSlice';
 
 const isNotFoundLikeError = (err) => {
   const msg = String(err?.error || err?.message || err || '').toLowerCase();
@@ -80,7 +77,6 @@ export const useWatchlist = () => {
   const items = useSelector(selectWatchlistItems);
   const totalCount = useSelector(selectWatchlistCount);
   const baseLimit = useSelector(selectWatchlistLimit);
-  const streakBonus = useSelector(selectWatchlistBonusForCurrentStreak);
   const isGracePeriod = useSelector(selectWatchlistGracePeriod);
   const graceDaysRemaining = useSelector(selectWatchlistGraceDaysRemaining);
   const overLimitCount = useSelector(selectWatchlistOverLimitCount);
@@ -294,7 +290,6 @@ export const useWatchlist = () => {
     isAtLimit,
     remainingSlots,
     baseLimit,
-    streakBonus,
     isEmpty: items.length === 0,
     
     // Actions

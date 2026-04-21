@@ -76,6 +76,27 @@ const PriceComparisonTable = ({ listings, bestPlatform, onBuyPress, product }) =
     return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
   };
 
+  // Format price change date - prioritize last_price_change_at over last_scraped_at
+  const formatPriceChangeDate = (listing) => {
+    const priceChangeDate = listing.last_price_change_at || listing.last_scraped_at || listing.last_scraped;
+    if (!priceChangeDate) return 'Unknown';
+    
+    const date = parseApiDate(priceChangeDate);
+    if (!date) return 'Unknown';
+    
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMins / 60);
+    const diffDays = Math.floor(diffHours / 24);
+    
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
+  };
+
   // Get confidence level text
   const getConfidenceLevel = (confidence) => {
     if (!confidence) return null;
@@ -321,7 +342,7 @@ const PriceComparisonTable = ({ listings, bestPlatform, onBuyPress, product }) =
                   <View style={styles.updatedInfo}>
                     <Ionicons name="refresh" size={12} color={COLORS.gray500} />
                     <Text style={styles.updatedText}>
-                      {formatLastScraped(listing.last_scraped_at || listing.last_scraped)}
+                      {formatPriceChangeDate(listing)}
                     </Text>
                   </View>
                   {confidence && (
